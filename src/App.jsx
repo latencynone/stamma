@@ -34,6 +34,38 @@ const HARMONY_COLORS = {
 };
 const MELODY_COLOR = { line: '#FFB454', glow: 'rgba(255,180,84,0.65)' };
 
+// Schedules a channel's fade-in/fade-out gain envelope starting from an
+// arbitrary point mid-window rather than always from the window's start —
+// needed because resuming from a paused/seeked position should reflect
+// whatever the fade curve's value already was at that instant, not restart
+// the ramp from 0. `elapsedIntoWindow` is how far `playFrom` already is
+// past the window's start; the three branches are "still ramping in",
+// "already ramping out", and "flat in between" (each also schedules the
+// still-upcoming fade-out event, if any).
+function scheduleFadeGain(gainParam, now, windowDur, elapsedIntoWindow, fadeInDur, fadeOutDur) {
+  const fadeOutStartElapsed = windowDur - fadeOutDur;
+  if (fadeInDur > 0 && elapsedIntoWindow < fadeInDur) {
+    const startGain = elapsedIntoWindow / fadeInDur;
+    gainParam.setValueAtTime(startGain, now);
+    gainParam.linearRampToValueAtTime(1, now + (fadeInDur - elapsedIntoWindow));
+    if (fadeOutDur > 0) {
+      gainParam.setValueAtTime(1, now + Math.max(0, fadeOutStartElapsed - elapsedIntoWindow));
+      gainParam.linearRampToValueAtTime(0, now + (windowDur - elapsedIntoWindow));
+    }
+  } else if (fadeOutDur > 0 && elapsedIntoWindow >= fadeOutStartElapsed) {
+    const intoFadeOut = elapsedIntoWindow - fadeOutStartElapsed;
+    const startGain = Math.max(0, 1 - intoFadeOut / fadeOutDur);
+    gainParam.setValueAtTime(startGain, now);
+    gainParam.linearRampToValueAtTime(0, now + Math.max(0.001, fadeOutDur - intoFadeOut));
+  } else {
+    gainParam.setValueAtTime(1, now);
+    if (fadeOutDur > 0) {
+      gainParam.setValueAtTime(1, now + Math.max(0, fadeOutStartElapsed - elapsedIntoWindow));
+      gainParam.linearRampToValueAtTime(0, now + (windowDur - elapsedIntoWindow));
+    }
+  }
+}
+
 /* ---------- Formant "voice" synthesis ---------- */
 
 // Builds a small vowel-ish resonance filter bank ("oo") fed by `source`
@@ -738,6 +770,21 @@ export default function App() {
     setExpandedChannels((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
+  // Expand/collapse every channel's volume+pan panel at once. Standard
+  // expand-all/collapse-all toggle: if any panel is currently collapsed,
+  // the button expands everything; only flips to "collapse all" once
+  // every panel is already open.
+  const mixerChannelKeys = ['melody', ...HARMONY_KEYS];
+  const allChannelsExpanded = mixerChannelKeys.every((k) => expandedChannels[k]);
+  function toggleAllChannelsExpanded() {
+    const next = !allChannelsExpanded;
+    setExpandedChannels((prev) => {
+      const updated = { ...prev };
+      mixerChannelKeys.forEach((k) => { updated[k] = next; });
+      return updated;
+    });
+  }
+
   // Renders (or returns the cached render of) a pitch-corrected copy of the
   // recording at the currently selected autotune strength. Cached per
   // level index — switching between lätt/medel/hård keeps each one's
@@ -1140,7 +1187,11 @@ export default function App() {
     return ctx;
   }
 
-  function stopPlayback() {
+  // `keepPosition`: true for pause (freeze playheadTime so Play resumes
+  // from here); false/omitted for a real stop — clears playheadTime, which
+  // every "position" reader (the seek slider, startMix's default offset)
+  // treats as "start of the trim window", i.e. back to the beginning.
+  function stopPlayback({ keepPosition } = {}) {
     if (playTimeoutRef.current) {
       clearTimeout(playTimeoutRef.current);
       playTimeoutRef.current = null;
@@ -1161,7 +1212,7 @@ export default function App() {
     mixNodesRef.current = {};
     Object.values(meterRefs.current).forEach((el) => { if (el) el.style.width = '0%'; });
     setIsPlaying(false);
-    setPlayheadTime(null);
+    if (!keepPosition) setPlayheadTime(null);
     setPreviewingKey(null);
   }
 
@@ -1303,11 +1354,12 @@ export default function App() {
   // separate from resolving its content (which can involve an offline
   // render taking a couple hundred ms) — see startMix for why.
   // `rangeStart`/`rangeEnd` are the trim window (seconds, on the
-  // recording's own timeline) that playback should be clipped to.
+  // recording's own timeline); `playFrom` is where within it playback
+  // actually starts (equal to rangeStart unless resuming from a pause/seek).
   // `fadeInDur`/`fadeOutDur` (seconds) drive a separate automation-only
   // gain stage — kept apart from `gainNode` (the user's live volume
   // fader) so a fader drag never collides with a scheduled fade ramp.
-  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur) {
+  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur, playFrom) {
     const gainNode = ctx.createGain();
     gainNode.gain.value = channelState.volume;
 
@@ -1315,17 +1367,8 @@ export default function App() {
     const windowDur = Math.max(0.05, rangeEnd - rangeStart);
     const fi = Math.max(0, Math.min(fadeInDur, windowDur));
     const fo = Math.max(0, Math.min(fadeOutDur, windowDur - fi));
-    if (fi > 0) {
-      fadeGainNode.gain.setValueAtTime(0, now);
-      fadeGainNode.gain.linearRampToValueAtTime(1, now + fi);
-    } else {
-      fadeGainNode.gain.setValueAtTime(1, now);
-    }
-    if (fo > 0) {
-      const fadeOutStart = now + Math.max(fi, windowDur - fo);
-      fadeGainNode.gain.setValueAtTime(1, fadeOutStart);
-      fadeGainNode.gain.linearRampToValueAtTime(0, now + windowDur);
-    }
+    const elapsedIntoWindow = Math.max(0, playFrom - rangeStart);
+    scheduleFadeGain(fadeGainNode.gain, now, windowDur, elapsedIntoWindow, fi, fo);
     gainNode.connect(fadeGainNode);
 
     const analyserNode = ctx.createAnalyser();
@@ -1341,11 +1384,11 @@ export default function App() {
     let sourceNode;
     if (content.kind === 'buffer') {
       const buf = content.buffer;
-      const offset = Math.max(0, Math.min(rangeStart, buf.duration));
+      const offset = Math.max(0, Math.min(playFrom, buf.duration));
       const duration = Math.max(0, Math.min(rangeEnd, buf.duration) - offset);
       sourceNode = playBufferSource(ctx, gainNode, now, buf, offset, duration);
     } else {
-      sourceNode = makeVoice(ctx, gainNode, now, content.notes, soundType, rangeStart, rangeEnd);
+      sourceNode = makeVoice(ctx, gainNode, now, content.notes, soundType, playFrom, rangeEnd);
     }
 
     mixNodesRef.current[key] = { gainNode, fadeGainNode, analyserNode, pannerNode, sourceNode };
@@ -1384,7 +1427,11 @@ export default function App() {
   // `keysOverride` lets a single channel's own play button preview just
   // that one track without touching anyone's enabled/solo state — same
   // resolve-then-start machinery, just scoped to one key.
-  async function startMix(channelsState, keysOverride) {
+  // `startOffset` (absolute seconds on the recording's timeline) lets Play
+  // resume from a paused/seeked position instead of always the window's
+  // start — defaults to the window start, which is also what a loop
+  // restart and a fresh channel preview want.
+  async function startMix(channelsState, keysOverride, startOffset) {
     stopPlayback();
     const activeKeys = keysOverride || Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
     if (!activeKeys.length) return;
@@ -1400,15 +1447,16 @@ export default function App() {
     // the same [rangeStart, rangeEnd) span on the recording's timeline.
     const rangeStart = Math.max(0, Math.min(trimStart, recordingDuration));
     const rangeEnd = Math.max(rangeStart + 0.05, Math.min(effectiveTrimEnd, recordingDuration));
+    const playFrom = Math.max(rangeStart, Math.min(startOffset ?? rangeStart, rangeEnd - 0.05));
 
     const now = ctx.currentTime + 0.05;
-    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut));
+    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom));
 
     activeSourcesRef.current = started;
     setIsPlaying(true);
     setPreviewingKey(keysOverride && keysOverride.length === 1 ? keysOverride[0] : null);
 
-    const totalDur = rangeEnd - rangeStart;
+    const totalDur = rangeEnd - playFrom;
     playTimeoutRef.current = setTimeout(() => {
       // Read via a ref, not the `loopEnabled` closed over at schedule time —
       // this timeout was set up to (totalDur + 0.4)s ago, and a toggle
@@ -1422,7 +1470,7 @@ export default function App() {
 
     const tickPlayhead = () => {
       const elapsed = ctx.currentTime - now;
-      setPlayheadTime(Math.max(0, rangeStart + elapsed));
+      setPlayheadTime(Math.max(0, playFrom + elapsed));
       updateMeters();
       if (elapsed < totalDur + 0.1) {
         playheadRafRef.current = requestAnimationFrame(tickPlayhead);
@@ -1439,6 +1487,24 @@ export default function App() {
   // its current enabled/solo state in the mixer.
   function previewChannel(key) {
     startMix(channels, [key]);
+  }
+
+  // Combined play/pause: pausing freezes playheadTime so the next press
+  // resumes from there instead of restarting at the window's start.
+  function togglePlayPause() {
+    if (isPlaying) {
+      stopPlayback({ keepPosition: true });
+    } else {
+      startMix(channels, undefined, playheadTime !== null ? playheadTime : trimStart);
+    }
+  }
+
+  // Dragging the waveform's seek slider pauses (if playing) and moves the
+  // resume position — the same playheadTime the play/pause button reads.
+  function seekTo(t) {
+    const clamped = Math.max(trimStart, Math.min(t, effectiveTrimEnd));
+    if (isPlaying) stopPlayback({ keepPosition: true });
+    setPlayheadTime(clamped);
   }
 
   const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
@@ -1675,11 +1741,21 @@ export default function App() {
             <div>
               <div className="flex items-center justify-between mb-2">
                 <h2 className="font-display text-lg font-semibold">Mixer</h2>
-                {isPlaying && (
-                  <button onClick={stopPlayback} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
-                    Stoppa
+                <div className="flex items-center gap-3">
+                  {isPlaying && (
+                    <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
+                      Stoppa
+                    </button>
+                  )}
+                  <button
+                    onClick={toggleAllChannelsExpanded}
+                    className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
+                    style={{ color: '#C7CBDA' }}
+                  >
+                    {allChannelsExpanded ? 'Göm alla' : 'Expandera alla'}
+                    <span style={{ display: 'inline-block', transform: allChannelsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
                   </button>
-                )}
+                </div>
               </div>
               <p className="text-sm leading-relaxed mb-3" style={{ color: '#C7CBDA' }}>
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
@@ -1704,8 +1780,75 @@ export default function App() {
                       setFadeOut(fo);
                       if (isPlaying) stopPlayback();
                     }}
-                    playheadTime={isPlaying ? playheadTime : null}
+                    playheadTime={playheadTime}
                   />
+
+                  <div className="flex items-center gap-2 mt-3">
+                    <button
+                      onClick={() => setLoopEnabled((v) => !v)}
+                      className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
+                      style={{
+                        width: 40,
+                        height: 40,
+                        backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                        color: loopEnabled ? '#55D6C0' : '#C7CBDA',
+                        border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                      }}
+                      aria-pressed={loopEnabled}
+                      aria-label="Loopa uppspelning"
+                      title="Loopa uppspelning"
+                    >
+                      <LoopIcon size={18} />
+                    </button>
+                    <button
+                      onClick={() => stopPlayback()}
+                      disabled={!anyChannelEnabled}
+                      className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
+                      style={{
+                        width: 40,
+                        height: 40,
+                        backgroundColor: 'rgba(241,237,228,0.06)',
+                        color: anyChannelEnabled ? '#C7CBDA' : 'rgba(241,237,228,0.25)',
+                        border: '1px solid rgba(241,237,228,0.12)',
+                        cursor: anyChannelEnabled ? 'pointer' : 'not-allowed',
+                      }}
+                      aria-label="Stoppa och gå till start"
+                      title="Stoppa och gå till start"
+                    >
+                      <StopIcon size={15} />
+                    </button>
+                    <button
+                      onClick={togglePlayPause}
+                      disabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
+                      className="stamma-btn flex-1 rounded-xl py-2.5 flex items-center justify-center gap-2 font-body font-medium text-sm"
+                      style={{
+                        backgroundColor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.06)' : '#FFB454',
+                        color: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.3)' : '#10131A',
+                        cursor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      {isPlaying ? <PauseIcon size={18} /> : <PlayIcon size={18} />}
+                      {isPlaying ? 'Pausa' : (anyHarmonyBusy || autotuneRendering) ? 'Bygger …' : 'Spela mix'}
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2 mt-2">
+                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
+                      {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
+                    </span>
+                    <input
+                      type="range"
+                      min={trimStart}
+                      max={effectiveTrimEnd}
+                      step="0.01"
+                      value={playheadTime !== null ? playheadTime : trimStart}
+                      onChange={(e) => seekTo(parseFloat(e.target.value))}
+                      className="stamma-fader w-full"
+                      style={{ accentColor: '#FFB454' }}
+                      aria-label="Spola i vågformen"
+                    />
+                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{effectiveTrimEnd.toFixed(1)}s</span>
+                  </div>
                 </div>
               )}
 
@@ -1926,11 +2069,11 @@ function MixerChannel({
 
       {direction !== undefined && (
         <div className="flex gap-1 mt-1.5 ml-[64px]">
-          {[{ v: -1, label: 'Under' }, { v: 1, label: 'Över' }].map((opt) => (
+          {[{ v: -1, label: 'Understämma' }, { v: 1, label: 'Överstämma' }].map((opt) => (
             <button
               key={opt.v}
               onClick={() => onSetDirection(opt.v)}
-              className="stamma-btn flex-1 rounded-md py-0.5 text-[11px] font-medium"
+              className="stamma-btn flex-1 rounded-md py-0.5 text-[10px] font-medium leading-tight"
               style={{
                 backgroundColor: direction === opt.v ? `${accentColor}26` : 'transparent',
                 color: direction === opt.v ? accentColor : '#C7CBDA',
@@ -2017,6 +2160,14 @@ function PauseIcon({ size = 20 }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
       <rect x="6" y="4.5" width="4.2" height="15" rx="1.2" />
       <rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2" />
+    </svg>
+  );
+}
+
+function StopIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+      <rect x="5" y="5" width="14" height="14" rx="2.5" />
     </svg>
   );
 }
