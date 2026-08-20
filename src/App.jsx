@@ -282,12 +282,20 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTi
 /* ---------- Waveform trim view (Original channel) ---------- */
 
 const TRIM_HANDLE_MIN_GAP = 0.15;
+const FADE_MIN_GAP = 0.05;
+const FADE_COLOR = '#FFD84D';
 
 // A waveform of the raw recording with two draggable handles marking the
 // [trimStart, trimEnd) window every mixer channel's playback gets clipped
-// to (see startMix). Not zoomable like PitchCanvas — fullscreen here is
-// purely about giving the drag handles more pixels to land precisely on.
-function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, playheadTime }) {
+// to (see startMix), plus a pair of Tracktion-Waveform-style fade handles
+// — small triangular flags at the top of the clip that you drag inward to
+// set fade-in/fade-out length. The diagonal "cut" from the trim edge
+// (silence) to the fade's end point (full volume) mirrors that convention,
+// adapted for a bipolar (mirrored top/bottom) waveform by drawing the cut
+// from the centerline rather than from one corner.
+// Not zoomable like PitchCanvas — fullscreen here is purely about giving
+// the drag handles more pixels to land precisely on.
+function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -325,6 +333,47 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, pl
       if (trimStart > 0) ctx.fillRect(0, 0, xFor(trimStart), height);
       if (trimEnd < duration) ctx.fillRect(xFor(trimEnd), 0, width - xFor(trimEnd), height);
 
+      const windowDur = Math.max(0.001, trimEnd - trimStart);
+      const fi = Math.max(0, Math.min(fadeIn, windowDur));
+      const fo = Math.max(0, Math.min(fadeOut, windowDur - fi));
+
+      if (fi > 0) {
+        const x0 = xFor(trimStart);
+        const x1 = xFor(trimStart + fi);
+        const grad = ctx.createLinearGradient(x0, 0, x1, 0);
+        grad.addColorStop(0, 'rgba(16,19,26,0.65)');
+        grad.addColorStop(1, 'rgba(16,19,26,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x0, 0, x1 - x0, height);
+
+        ctx.strokeStyle = FADE_COLOR;
+        ctx.lineWidth = 1.75;
+        ctx.beginPath();
+        ctx.moveTo(x0, midY);
+        ctx.lineTo(x1, 0);
+        ctx.moveTo(x0, midY);
+        ctx.lineTo(x1, height);
+        ctx.stroke();
+      }
+      if (fo > 0) {
+        const x1 = xFor(trimEnd);
+        const x0 = xFor(trimEnd - fo);
+        const grad = ctx.createLinearGradient(x0, 0, x1, 0);
+        grad.addColorStop(0, 'rgba(16,19,26,0)');
+        grad.addColorStop(1, 'rgba(16,19,26,0.65)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x0, 0, x1 - x0, height);
+
+        ctx.strokeStyle = FADE_COLOR;
+        ctx.lineWidth = 1.75;
+        ctx.beginPath();
+        ctx.moveTo(x0, 0);
+        ctx.lineTo(x1, midY);
+        ctx.moveTo(x0, height);
+        ctx.lineTo(x1, midY);
+        ctx.stroke();
+      }
+
       if (playheadTime !== null && playheadTime !== undefined) {
         const x = xFor(Math.min(playheadTime, duration));
         ctx.strokeStyle = '#FFFFFF';
@@ -341,7 +390,7 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, pl
 
     drawRef.current = draw;
     draw();
-  }, [peaks, duration, trimStart, trimEnd, playheadTime, isFullscreen]);
+  }, [peaks, duration, trimStart, trimEnd, fadeIn, fadeOut, playheadTime, isFullscreen]);
 
   // Same reasoning as PitchCanvas's ResizeObserver: the fullscreen overlay's
   // real size settles a moment after isFullscreen flips, so redraw on
@@ -378,8 +427,40 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, pl
     };
   }
 
+  function beginFadeDrag(which) {
+    return (e) => {
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        const rect = wrapRef.current.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+        const t = frac * duration;
+        const windowDur = Math.max(0.001, trimEnd - trimStart);
+        if (which === 'in') {
+          const next = Math.min(Math.max(0, t - trimStart), windowDur - fadeOut - FADE_MIN_GAP);
+          onFadeChange(Math.max(0, next), fadeOut);
+        } else {
+          const next = Math.min(Math.max(0, trimEnd - t), windowDur - fadeIn - FADE_MIN_GAP);
+          onFadeChange(fadeIn, Math.max(0, next));
+        }
+      };
+      const up = () => {
+        handle.releasePointerCapture(e.pointerId);
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    };
+  }
+
   const startPct = duration > 0 ? Math.min(100, (trimStart / duration) * 100) : 0;
   const endPct = duration > 0 ? Math.min(100, (trimEnd / duration) * 100) : 100;
+  const windowDurForHandles = Math.max(0.001, trimEnd - trimStart);
+  const fadeInClamped = Math.max(0, Math.min(fadeIn, windowDurForHandles));
+  const fadeOutClamped = Math.max(0, Math.min(fadeOut, windowDurForHandles - fadeInClamped));
+  const fadeInPct = duration > 0 ? Math.min(100, ((trimStart + fadeInClamped) / duration) * 100) : 0;
+  const fadeOutPct = duration > 0 ? Math.min(100, ((trimEnd - fadeOutClamped) / duration) * 100) : 100;
 
   const handleStyle = (pct) => ({
     position: 'absolute',
@@ -391,10 +472,33 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, pl
     touchAction: 'none',
   });
 
+  const fadeHandleStyle = (pct) => ({
+    position: 'absolute',
+    top: 0,
+    left: `calc(${pct}% - 9px)`,
+    width: 18,
+    height: 18,
+    cursor: 'ew-resize',
+    touchAction: 'none',
+  });
+
+  const fadeFlag = (pointRight) => (
+    <div
+      style={{
+        width: 0,
+        height: 0,
+        borderTop: `11px solid ${FADE_COLOR}`,
+        borderLeft: pointRight ? '2px solid transparent' : '16px solid transparent',
+        borderRight: pointRight ? '16px solid transparent' : '2px solid transparent',
+        filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.5))',
+      }}
+    />
+  );
+
   return (
     <div className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
       <div className="flex items-center justify-between mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
-        <span>Vågform — beskär start &amp; slut</span>
+        <span>Vågform — beskär &amp; tona in/ut</span>
         <button
           onClick={() => setIsFullscreen((v) => !v)}
           className="stamma-btn px-2.5 py-1 rounded-md"
@@ -416,11 +520,21 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, pl
           <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: '#FB7185' }} />
           <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: '#FB7185' }} />
         </div>
+        <div onPointerDown={beginFadeDrag('in')} style={fadeHandleStyle(fadeInPct)} title="Tona in">
+          {fadeFlag(true)}
+        </div>
+        <div onPointerDown={beginFadeDrag('out')} style={fadeHandleStyle(fadeOutPct)} title="Tona ut">
+          {fadeFlag(false)}
+        </div>
       </div>
       <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>
         <span style={{ color: '#55D6C0' }}>{trimStart.toFixed(1)}s</span>
         <span>{(trimEnd - trimStart).toFixed(1)}s vald</span>
         <span style={{ color: '#FB7185' }}>{trimEnd.toFixed(1)}s</span>
+      </div>
+      <div className="flex justify-between mt-1 font-mono-ui text-[10px]" style={{ color: FADE_COLOR }}>
+        <span>Tona in: {fadeInClamped.toFixed(1)}s</span>
+        <span>Tona ut: {fadeOutClamped.toFixed(1)}s</span>
       </div>
     </div>
   );
@@ -486,6 +600,8 @@ export default function App() {
   const [trimEnd, setTrimEnd] = useState(null); // null = full recordingDuration
   const [loopEnabled, setLoopEnabled] = useState(false);
   const [waveformPeaks, setWaveformPeaks] = useState(null);
+  const [fadeIn, setFadeIn] = useState(0);
+  const [fadeOut, setFadeOut] = useState(0);
   const autotuneEnabled = autotuneLevelIndex > 0;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -717,6 +833,8 @@ export default function App() {
     setTrimEnd(null);
     setLoopEnabled(false);
     setWaveformPeaks(null);
+    setFadeIn(0);
+    setFadeOut(0);
     stopPlayback();
   }
 
@@ -1026,6 +1144,7 @@ export default function App() {
     activeSourcesRef.current = [];
     Object.values(mixNodesRef.current).forEach((nodes) => {
       try { nodes.gainNode.disconnect(); } catch (e) { /* already disconnected */ }
+      try { nodes.fadeGainNode.disconnect(); } catch (e) { /* already disconnected */ }
       try { nodes.pannerNode.disconnect(); } catch (e) { /* already disconnected */ }
     });
     mixNodesRef.current = {};
@@ -1174,17 +1293,38 @@ export default function App() {
   // render taking a couple hundred ms) — see startMix for why.
   // `rangeStart`/`rangeEnd` are the trim window (seconds, on the
   // recording's own timeline) that playback should be clipped to.
-  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd) {
+  // `fadeInDur`/`fadeOutDur` (seconds) drive a separate automation-only
+  // gain stage — kept apart from `gainNode` (the user's live volume
+  // fader) so a fader drag never collides with a scheduled fade ramp.
+  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur) {
     const gainNode = ctx.createGain();
     gainNode.gain.value = channelState.volume;
+
+    const fadeGainNode = ctx.createGain();
+    const windowDur = Math.max(0.05, rangeEnd - rangeStart);
+    const fi = Math.max(0, Math.min(fadeInDur, windowDur));
+    const fo = Math.max(0, Math.min(fadeOutDur, windowDur - fi));
+    if (fi > 0) {
+      fadeGainNode.gain.setValueAtTime(0, now);
+      fadeGainNode.gain.linearRampToValueAtTime(1, now + fi);
+    } else {
+      fadeGainNode.gain.setValueAtTime(1, now);
+    }
+    if (fo > 0) {
+      const fadeOutStart = now + Math.max(fi, windowDur - fo);
+      fadeGainNode.gain.setValueAtTime(1, fadeOutStart);
+      fadeGainNode.gain.linearRampToValueAtTime(0, now + windowDur);
+    }
+    gainNode.connect(fadeGainNode);
+
     const analyserNode = ctx.createAnalyser();
     analyserNode.fftSize = 256;
-    // Meter reads post-fader, pre-pan — panning splits energy left/right
-    // but shouldn't itself move the level reading.
-    gainNode.connect(analyserNode);
+    // Meter reads post-fader/fade, pre-pan — panning splits energy
+    // left/right but shouldn't itself move the level reading.
+    fadeGainNode.connect(analyserNode);
     const pannerNode = ctx.createStereoPanner();
     pannerNode.pan.value = channelState.pan || 0;
-    gainNode.connect(pannerNode);
+    fadeGainNode.connect(pannerNode);
     pannerNode.connect(ctx.destination);
 
     let sourceNode;
@@ -1197,7 +1337,7 @@ export default function App() {
       sourceNode = makeVoice(ctx, gainNode, now, content.notes, soundType, rangeStart, rangeEnd);
     }
 
-    mixNodesRef.current[key] = { gainNode, analyserNode, pannerNode, sourceNode };
+    mixNodesRef.current[key] = { gainNode, fadeGainNode, analyserNode, pannerNode, sourceNode };
     return sourceNode;
   }
 
@@ -1251,7 +1391,7 @@ export default function App() {
     const rangeEnd = Math.max(rangeStart + 0.05, Math.min(effectiveTrimEnd, recordingDuration));
 
     const now = ctx.currentTime + 0.05;
-    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd));
+    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut));
 
     activeSourcesRef.current = started;
     setIsPlaying(true);
@@ -1533,6 +1673,13 @@ export default function App() {
                     onTrimChange={(start, end) => {
                       setTrimStart(start);
                       setTrimEnd(end);
+                      if (isPlaying) stopPlayback();
+                    }}
+                    fadeIn={fadeIn}
+                    fadeOut={fadeOut}
+                    onFadeChange={(fi, fo) => {
+                      setFadeIn(fi);
+                      setFadeOut(fo);
                       if (isPlaying) stopPlayback();
                     }}
                     playheadTime={isPlaying ? playheadTime : null}
