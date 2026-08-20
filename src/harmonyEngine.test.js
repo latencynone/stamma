@@ -62,6 +62,57 @@ describe('renderHarmonyOffline — sömlöshet', () => {
   });
 });
 
+describe('renderHarmonyOffline — energimedveten paus vs. luckor med ljud', () => {
+  const keyInfo = { tonic: 0, mode: 'major' };
+
+  it('skiftar fortfarande ljud i en lång lucka som notdetekteringen missade, istället för att spela upp originalet oskiftat', async () => {
+    // Only one detected note, but the singer audibly keeps going for 1.5s
+    // after it — as if the pitch tracker lost the note without the singer
+    // actually going quiet. A real silent gap would (correctly) fall back to
+    // "no shift"; here there's real signal, so it must not.
+    const melodyNotes = [{ step: 0, start: 0.3, end: 1.0 }];
+    const harmonyNotes = [{ step: 0, start: 0.3, end: 1.0, hStep: -2 }];
+    const synthNotes = [
+      { step: 0, start: 0.3, end: 1.0, freq: midiToFreq(scaleStepToMidi(0, 0, 'major')) },
+      { step: 0, start: 1.0, end: 2.5, freq: midiToFreq(scaleStepToMidi(0, 0, 'major')) }, // undetected continuation
+    ];
+    const totalDur = 3.0;
+    const { outData } = await renderAndMeasure(melodyNotes, harmonyNotes, keyInfo, synthNotes, totalDur);
+
+    const measure = (centerT) => {
+      const winLen = 2048;
+      const c = Math.round(centerT * SR);
+      const s = Math.max(0, c - winLen / 2);
+      return autoCorrelate(outData.slice(s, s + winLen), SR).freq;
+    };
+    const originalFreq = midiToFreq(scaleStepToMidi(0, 0, 'major'));
+    const expectedHarmonyFreq = midiToFreq(scaleStepToMidi(-2, 0, 'major'));
+
+    const measured = measure(2.0);
+    expect(measured).toBeGreaterThan(0);
+    // It should read as the harmony pitch, not a bare pass-through of the
+    // original (which is what "leaking through" looked like in practice).
+    expect(Math.abs(measured - expectedHarmonyFreq) / expectedHarmonyFreq).toBeLessThan(0.02);
+    expect(Math.abs(measured - originalFreq) / originalFreq).toBeGreaterThan(0.05);
+  });
+
+  it('faller fortfarande tillbaka till ingen skiftning i en riktigt tyst paus', async () => {
+    const melodyNotes = [
+      { step: 0, start: 0.3, end: 1.0 },
+      { step: 2, start: 2.5, end: 3.2 }, // genuinely silent 1.5s gap in between
+    ];
+    const harmonyNotes = melodyNotes.map((n) => ({ ...n, hStep: n.step - 2 }));
+    const synthNotes = melodyNotes.map((n) => ({ ...n, freq: midiToFreq(scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode)) }));
+    const totalDur = 3.6;
+    const { inData, outData } = await renderAndMeasure(melodyNotes, harmonyNotes, keyInfo, synthNotes, totalDur);
+
+    const s0 = Math.round(1.3 * SR);
+    const s1 = Math.round(2.2 * SR);
+    expect(rmsOf(outData, s0, s1)).toBeLessThan(0.01);
+    expect(rmsOf(inData, s0, s1)).toBeLessThan(0.001); // sanity: the gap really is silent in the source too
+  });
+});
+
 describe('renderHarmonyOffline — tonhöjdsnoggrannhet', () => {
   const combos = [];
   Object.keys(HARMONY_TYPES).forEach((type) => {

@@ -3,19 +3,58 @@ import { scaleStepToMidi, midiToFreq } from './musicTheory.js';
 
 // Short gaps (a consonant, a quick breath) are bridged smoothly into the
 // neighboring note's ratio instead of ever dropping to "no shift" — this is
-// what used to produce audible seams. Only gaps longer than this are treated
-// as a real pause between phrases.
+// what used to produce audible seams. Gaps longer than this are only treated
+// as a real pause if the original recording is actually quiet there (see
+// hasAudibleEnergy) — a long stretch the note detector couldn't confidently
+// pin down is not the same thing as silence, and playing it back unshifted
+// is exactly as audible a defect as the seams this was built to avoid.
 const GAP_BRIDGE_SEC = 0.15;
 // How long the curve takes to ease to/from ratio=1.0 around a real pause,
 // so even that transition is never a hard step.
 const SILENCE_FADE_SEC = 0.04;
 // Resolution of the ramp keyframes fed into the pitch-shift schedule.
 const KEYFRAME_HOP_SEC = 0.02;
+// RMS level above which a window of the original recording counts as
+// "has content" rather than silence, and the fraction of windows within a
+// gap that must clear it for the whole gap to count as non-silent.
+const ENERGY_RMS_THRESHOLD = 0.01;
+const ENERGY_VOICED_FRACTION = 0.15;
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// A coarse RMS-over-time envelope of the original recording, used to tell a
+// real pause apart from a stretch the note detector just couldn't confidently
+// pin a pitch to (quiet consonants, breathy or poorly-tracked singing, a
+// vocal run that briefly confused the pitch tracker). Energy, not elapsed
+// time, is what should decide whether a gap plays back unshifted.
+export function computeEnergyEnvelope(channelData, sampleRate, hopSec = 0.02) {
+  const hop = Math.max(1, Math.round(hopSec * sampleRate));
+  const envelope = [];
+  for (let i = 0; i < channelData.length; i += hop) {
+    const end = Math.min(channelData.length, i + hop);
+    let sum = 0;
+    for (let k = i; k < end; k++) sum += channelData[k] * channelData[k];
+    envelope.push({ t: i / sampleRate, rms: Math.sqrt(sum / (end - i)) });
+  }
+  return envelope;
+}
+
+// Whether a [fromT, toT) span has real, sustained signal rather than
+// silence. Excludes a small margin at each edge so the attack of the note
+// that follows (or the tail of the one before) doesn't get misread as
+// content inside the gap itself.
+function hasAudibleEnergy(envelope, fromT, toT, edgePad = 0.03) {
+  const innerFrom = fromT + edgePad;
+  const innerTo = toT - edgePad;
+  if (innerTo <= innerFrom) return false;
+  const inRange = envelope.filter((e) => e.t >= innerFrom && e.t < innerTo);
+  if (inRange.length === 0) return false;
+  const voiced = inRange.filter((e) => e.rms > ENERGY_RMS_THRESHOLD).length;
+  return voiced / inRange.length >= ENERGY_VOICED_FRACTION;
 }
 
 // Builds a continuous ratio(t) curve, expressed as keyframes {t, ratio},
@@ -35,7 +74,7 @@ function median(values) {
 // doesn't have — pitch-shifting the real audio by a constant factor already
 // carries the singer's actual vibrato through mechanically, without needing
 // per-frame tracking accuracy we don't have at this window size.
-export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration) {
+export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope = []) {
   const segments = melodyNotes.map((mn, i) => {
     const hn = harmonyNotes[i];
     const melodyFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
@@ -63,7 +102,8 @@ export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuratio
 
   segments.forEach((seg) => {
     const gap = seg.start - cursorT;
-    if (gap > GAP_BRIDGE_SEC) {
+    const isRealPause = gap > GAP_BRIDGE_SEC && !hasAudibleEnergy(energyEnvelope, cursorT, seg.start);
+    if (isRealPause) {
       const fadeOutEnd = Math.min(cursorT + SILENCE_FADE_SEC, seg.start);
       pushRamp(cursorT, fadeOutEnd, cursorRatio, 1);
       const fadeInStart = Math.max(fadeOutEnd, seg.start - SILENCE_FADE_SEC);
@@ -77,8 +117,17 @@ export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuratio
     cursorRatio = seg.ratio;
   });
 
-  pushRamp(cursorT, Math.min(totalDuration, cursorT + SILENCE_FADE_SEC), cursorRatio, 1);
-  keyframes.push({ t: totalDuration, ratio: 1 });
+  const tailIsRealPause = !hasAudibleEnergy(energyEnvelope, cursorT, totalDuration);
+  if (tailIsRealPause) {
+    pushRamp(cursorT, Math.min(totalDuration, cursorT + SILENCE_FADE_SEC), cursorRatio, 1);
+    keyframes.push({ t: totalDuration, ratio: 1 });
+  } else {
+    // The singer is still audibly going after the last note we could pin
+    // down — hold the last known-good ratio through to the end rather than
+    // fading to "no shift", which would otherwise play back a chunk of the
+    // original, un-harmonized voice.
+    keyframes.push({ t: totalDuration, ratio: cursorRatio });
+  }
 
   // Collapse any non-increasing timestamps (can happen at very short notes).
   const cleaned = [];
@@ -103,7 +152,8 @@ export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyN
   const totalLen = recordedBuffer.length;
   const totalDuration = totalLen / sr;
 
-  const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration);
+  const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), sr);
+  const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope);
 
   // Rough singer fundamental, used by the library to analyse/compensate
   // formants so larger intervals don't get a "chipmunk" timbre.
