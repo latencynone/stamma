@@ -1237,8 +1237,8 @@ export default function App() {
 
             <button
               onClick={resetAll}
-              className="stamma-btn w-full rounded-xl py-3 text-sm font-medium"
-              style={{ backgroundColor: 'transparent', color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.12)' }}
+              className="stamma-btn w-full rounded-xl py-3 font-body font-medium text-base transition-transform active:scale-[0.98]"
+              style={{ backgroundColor: '#FF6B6B', color: '#10131A' }}
             >
               Spela in igen
             </button>
