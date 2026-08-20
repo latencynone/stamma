@@ -1251,6 +1251,33 @@ export default function App() {
   );
 }
 
+function DownloadIcon({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3.5v11.5" />
+      <path d="M7.5 11l4.5 4.5L16.5 11" />
+      <path d="M4.5 18.5h15" />
+    </svg>
+  );
+}
+
+function PlayIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+      <path d="M7.5 4.8v14.4c0 .77.85 1.24 1.5.83l11.3-7.2c.62-.4.62-1.3 0-1.7L9 3.97c-.65-.4-1.5.07-1.5.84Z" />
+    </svg>
+  );
+}
+
+function PauseIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+      <rect x="6" y="4.5" width="4.2" height="15" rx="1.2" />
+      <rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2" />
+    </svg>
+  );
+}
+
 function ExportButton({ label, onClick, disabled, busy }) {
   return (
     <button
@@ -1265,7 +1292,14 @@ function ExportButton({ label, onClick, disabled, busy }) {
       }}
     >
       <span>{label}</span>
-      <span className="font-mono-ui text-xs">{busy ? '…' : '⬇'}</span>
+      {busy ? (
+        <span
+          className="inline-block w-4 h-4 rounded-full animate-spin shrink-0"
+          style={{ border: '2px solid rgba(85,214,192,0.25)', borderTopColor: 'currentColor' }}
+        />
+      ) : (
+        <DownloadIcon />
+      )}
     </button>
   );
 }
@@ -1284,7 +1318,7 @@ function PlaybackButton({ label, onClick, disabled, active, primary }) {
       }}
     >
       <span>{label}</span>
-      <span className="font-mono-ui text-xs">{active ? '❚❚' : '▶'}</span>
+      <span className="shrink-0 flex items-center">{active ? <PauseIcon /> : <PlayIcon />}</span>
     </button>
   );
 }
