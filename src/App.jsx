@@ -1382,7 +1382,7 @@ export default function App() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="audio/*"
+              accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
