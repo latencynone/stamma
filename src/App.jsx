@@ -22,6 +22,18 @@ import {
 import { renderHarmonyOffline, renderAutotunedMelody } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 
+const HARMONY_KEYS = Object.keys(HARMONY_TYPES);
+
+// One accent color per harmony type, reused consistently between the note
+// graph and the mixer channel rows, so the same color always means the same
+// interval — needed now that more than one can be on screen/audible at once.
+const HARMONY_COLORS = {
+  ters: { line: '#55D6C0', glow: 'rgba(85,214,192,0.65)' },
+  kvint: { line: '#A78BFA', glow: 'rgba(167,139,250,0.65)' },
+  sext: { line: '#FB7185', glow: 'rgba(251,113,133,0.65)' },
+};
+const MELODY_COLOR = { line: '#FFB454', glow: 'rgba(255,180,84,0.65)' };
+
 /* ---------- Formant "voice" synthesis ---------- */
 
 // Builds a small vowel-ish resonance filter bank ("oo") fed by `source`
@@ -51,7 +63,9 @@ function createFormantSum(ctx, source) {
 
 /* ---------- Pitch-contour visualization (signature element) ---------- */
 
-function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTime }) {
+// `harmonyLayers`: array of { key, notes, color, glow } — one per currently
+// active (mixer-enabled) harmony type, drawn simultaneously in its own color.
+function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTime }) {
   const canvasRef = useRef(null);
   const scrollWrapRef = useRef(null);
   const outerRef = useRef(null);
@@ -123,10 +137,11 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTim
       }
 
       const melodyMidis = melodyNotes.map((n) => scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode));
-      const harmonyMidis = harmonyNotes && harmonyNotes.length
-        ? harmonyNotes.map((n) => scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode))
-        : [];
-      const all = melodyMidis.concat(harmonyMidis);
+      const layers = (harmonyLayers || []).map((layer) => ({
+        ...layer,
+        midis: layer.notes.map((n) => scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode)),
+      }));
+      const all = melodyMidis.concat(layers.flatMap((l) => l.midis));
       const minMidi = Math.min(...all) - 2;
       const maxMidi = Math.max(...all) + 2;
       const topPad = 20;
@@ -172,10 +187,10 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTim
         });
       };
 
-      drawLine(melodyNotes, melodyMidis, '#FFB454', 'rgba(255,180,84,0.65)', -10);
-      if (harmonyNotes && harmonyNotes.length) {
-        drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)', 17);
-      }
+      drawLine(melodyNotes, melodyMidis, MELODY_COLOR.line, MELODY_COLOR.glow, -10);
+      layers.forEach((layer) => {
+        drawLine(layer.notes, layer.midis, layer.color, layer.glow, 17);
+      });
 
       if (playheadTime !== null && playheadTime !== undefined) {
         const x = xFor(Math.min(playheadTime, duration));
@@ -210,7 +225,7 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTim
 
     drawRef.current = draw;
     draw();
-  }, [melodyNotes, harmonyNotes, keyInfo, duration, playheadTime, zoom, isFullscreen]);
+  }, [melodyNotes, harmonyLayers, keyInfo, duration, playheadTime, zoom, isFullscreen]);
 
   // A layout change can arrive later than the props/state change that
   // triggered it — most notably entering the CSS-driven fullscreen overlay
@@ -268,24 +283,31 @@ function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTim
 
 const DURATION = 10;
 
+function defaultChannels() {
+  return {
+    original: { enabled: false, volume: 0.8 },
+    melody: { enabled: true, volume: 0.9 },
+    ters: { enabled: false, volume: 0.8, direction: HARMONY_TYPES.ters.defaultDirection },
+    kvint: { enabled: false, volume: 0.8, direction: HARMONY_TYPES.kvint.defaultDirection },
+    sext: { enabled: false, volume: 0.8, direction: HARMONY_TYPES.sext.defaultDirection },
+  };
+}
+
 export default function App() {
   const [phase, setPhase] = useState('idle'); // idle | recording | analyzing | ready | error
   const [errorMsg, setErrorMsg] = useState('');
   const [countdown, setCountdown] = useState(DURATION);
   const [keyInfo, setKeyInfo] = useState(null);
   const [melodyNotes, setMelodyNotes] = useState([]);
-  const [recordedUrl, setRecordedUrl] = useState(null);
-  const [harmonyType, setHarmonyType] = useState(null);
-  const [direction, setDirection] = useState(-1);
+  const [channels, setChannels] = useState(defaultChannels);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [nowPlaying, setNowPlaying] = useState(null);
   const [soundType, setSoundType] = useState('sine');
   const [voiceReady, setVoiceReady] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(DURATION);
   const [playheadTime, setPlayheadTime] = useState(null);
   const [exporting, setExporting] = useState(null);
-  const [harmonyRendering, setHarmonyRendering] = useState(false);
-  const [harmonyRenderError, setHarmonyRenderError] = useState('');
+  const [harmonyRenderingByType, setHarmonyRenderingByType] = useState({});
+  const [harmonyRenderErrorsByType, setHarmonyRenderErrorsByType] = useState({});
   const [autotuneEnabled, setAutotuneEnabled] = useState(false);
   const [autotuneRendering, setAutotuneRendering] = useState(false);
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
@@ -297,22 +319,21 @@ export default function App() {
   const chunksRef = useRef([]);
   const framesRef = useRef([]);
   const rafRef = useRef(null);
-  const audioElRef = useRef(null);
   const playCtxRef = useRef(null);
   const activeSourcesRef = useRef([]);
-  const recordedUrlRef = useRef(null);
+  const mixNodesRef = useRef({});
+  const meterRefs = useRef({});
+  const meterScratchRef = useRef(null);
   const recordedBufferRef = useRef(null);
   const playTimeoutRef = useRef(null);
   const recordingStartRef = useRef(0);
   const playheadRafRef = useRef(null);
   const finishedRef = useRef(false);
-  const harmonyBufferRef = useRef(null);
-  const harmonyBufferKeyRef = useRef(null);
-  const harmonyRenderPromiseRef = useRef(null);
+  const harmonyBuffersRef = useRef({});
+  const harmonyRenderPromisesRef = useRef({});
   const autotunedBufferRef = useRef(null);
   const autotuneRenderPromiseRef = useRef(null);
   const fileInputRef = useRef(null);
-  const directionTouchedRef = useRef(false);
 
   // The browser remembers a granted/denied microphone permission on its own
   // (that's an origin-level browser decision, not something a site can
@@ -337,36 +358,54 @@ export default function App() {
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') audioCtxRef.current.close().catch(() => {});
       if (playCtxRef.current && playCtxRef.current.state !== 'closed') playCtxRef.current.close().catch(() => {});
-      if (recordedUrlRef.current) URL.revokeObjectURL(recordedUrlRef.current);
     };
   }, []);
 
-  const harmonyNotes = useMemo(() => {
-    if (!harmonyType || !melodyNotes.length) return [];
-    const steps = HARMONY_TYPES[harmonyType].steps;
-    return melodyNotes.map((n) => ({ ...n, hStep: n.step + direction * steps }));
-  }, [harmonyType, direction, melodyNotes]);
+  function harmonyNotesFor(type) {
+    if (!melodyNotes.length) return [];
+    const steps = HARMONY_TYPES[type].steps;
+    const dir = channels[type].direction;
+    return melodyNotes.map((n) => ({ ...n, hStep: n.step + dir * steps }));
+  }
+
+  function harmonyPlaybackNotesFor(type) {
+    if (!keyInfo) return [];
+    return harmonyNotesFor(type).map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode) }));
+  }
 
   const melodyPlaybackNotes = useMemo(() => {
     if (!keyInfo) return [];
     return melodyNotes.map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode) }));
   }, [melodyNotes, keyInfo]);
 
-  const harmonyPlaybackNotes = useMemo(() => {
-    if (!keyInfo || !harmonyNotes.length) return [];
-    return harmonyNotes.map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode) }));
-  }, [harmonyNotes, keyInfo]);
+  // What the note graph should draw: one layer per harmony channel that's
+  // currently turned on in the mixer, each in its own color.
+  const harmonyLayers = useMemo(() => {
+    if (!melodyNotes.length) return [];
+    return HARMONY_KEYS.filter((type) => channels[type].enabled).map((type) => ({
+      key: type,
+      notes: harmonyNotesFor(type),
+      color: HARMONY_COLORS[type].line,
+      glow: HARMONY_COLORS[type].glow,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [melodyNotes, channels.ters.enabled, channels.ters.direction, channels.kvint.enabled, channels.kvint.direction, channels.sext.enabled, channels.sext.direction]);
 
-  // A harmony type's default direction is only a suggestion for before the
-  // user has picked one explicitly. Once they've tapped "Under"/"Över"
-  // themselves, that choice is a preference, not a per-type setting — it
-  // should survive switching between ters/kvint/sext, not just surviving a
-  // re-tap of the already-selected type.
-  function selectHarmony(type) {
-    if (type !== harmonyType && !directionTouchedRef.current) {
-      setDirection(HARMONY_TYPES[type].defaultDirection);
-    }
-    setHarmonyType(type);
+  function setChannelVolume(key, volume) {
+    setChannels((prev) => ({ ...prev, [key]: { ...prev[key], volume } }));
+    const nodes = mixNodesRef.current[key];
+    if (nodes?.gainNode) nodes.gainNode.gain.value = volume;
+  }
+
+  function setChannelDirection(key, direction) {
+    setChannels((prev) => ({ ...prev, [key]: { ...prev[key], direction } }));
+    if (isPlaying) restartMix({ ...channels, [key]: { ...channels[key], direction } });
+  }
+
+  function toggleChannel(key) {
+    const next = { ...channels, [key]: { ...channels[key], enabled: !channels[key].enabled } };
+    setChannels(next);
+    if (isPlaying) restartMix(next);
   }
 
   // Renders (or returns the cached render of) a lightly pitch-corrected copy
@@ -406,41 +445,40 @@ export default function App() {
     return buffer || recordedBufferRef.current;
   }
 
-  // Renders (or returns the cached render of) the harmony as a real,
+  // Renders (or returns the cached render of) one harmony type's real,
   // pitch-shifted copy of the singer's own recording (or its autotuned
-  // version). Cached per harmonyType+direction+autotune combination since
-  // it's expensive to recompute on every play/export and neither the
-  // recording nor the melody notes change without a full re-record.
-  async function getHarmonyBuffer() {
-    if (!recordedBufferRef.current || !harmonyType || !harmonyNotes.length || !keyInfo) return null;
+  // version). Cached per type, keyed by that type's own direction+autotune
+  // combination — each of ters/kvint/sext can be active at once, each with
+  // its own direction, so each needs its own independent cache slot.
+  async function getHarmonyBufferFor(type) {
+    if (!recordedBufferRef.current || !melodyNotes.length || !keyInfo) return null;
     const sourceBuffer = await getSourceBuffer();
     if (!sourceBuffer) return null;
-    const key = `${harmonyType}-${direction}-${autotuneEnabled ? 'at' : 'raw'}`;
-    if (harmonyBufferKeyRef.current === key && harmonyBufferRef.current) {
-      return harmonyBufferRef.current;
+    const key = `${channels[type].direction}-${autotuneEnabled ? 'at' : 'raw'}`;
+    const cached = harmonyBuffersRef.current[type];
+    if (cached && cached.key === key) return cached.buffer;
+    if (harmonyRenderPromisesRef.current[type] && cached?.key === `pending-${key}`) {
+      return harmonyRenderPromisesRef.current[type];
     }
-    if (harmonyRenderPromiseRef.current && harmonyBufferKeyRef.current === `pending-${key}`) {
-      return harmonyRenderPromiseRef.current;
-    }
-    harmonyBufferKeyRef.current = `pending-${key}`;
-    setHarmonyRendering(true);
-    setHarmonyRenderError('');
-    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, harmonyNotes, keyInfo)
+    harmonyBuffersRef.current[type] = { key: `pending-${key}`, buffer: null };
+    setHarmonyRenderingByType((s) => ({ ...s, [type]: true }));
+    setHarmonyRenderErrorsByType((s) => ({ ...s, [type]: '' }));
+    const hNotes = harmonyNotesFor(type);
+    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, hNotes, keyInfo)
       .then((buffer) => {
-        harmonyBufferRef.current = buffer;
-        harmonyBufferKeyRef.current = key;
+        harmonyBuffersRef.current[type] = { key, buffer };
         return buffer;
       })
       .catch((err) => {
-        harmonyBufferKeyRef.current = null;
-        setHarmonyRenderError('Kunde inte bygga stämman av din inspelning. Testa igen, eller välj ett syntetiskt ljud istället.');
+        harmonyBuffersRef.current[type] = null;
+        setHarmonyRenderErrorsByType((s) => ({ ...s, [type]: `Kunde inte bygga ${HARMONY_TYPES[type].label.toLowerCase()}-stämman.` }));
         throw err;
       })
       .finally(() => {
-        setHarmonyRendering(false);
-        harmonyRenderPromiseRef.current = null;
+        setHarmonyRenderingByType((s) => ({ ...s, [type]: false }));
+        delete harmonyRenderPromisesRef.current[type];
       });
-    harmonyRenderPromiseRef.current = promise;
+    harmonyRenderPromisesRef.current[type] = promise;
     return promise;
   }
 
@@ -450,23 +488,18 @@ export default function App() {
   function resetSourceState() {
     setKeyInfo(null);
     setMelodyNotes([]);
-    setHarmonyType(null);
+    setChannels(defaultChannels());
     setSoundType('sine');
     setVoiceReady(false);
     setAutotuneEnabled(false);
-    directionTouchedRef.current = false;
     recordedBufferRef.current = null;
-    harmonyBufferRef.current = null;
-    harmonyBufferKeyRef.current = null;
+    harmonyBuffersRef.current = {};
+    harmonyRenderPromisesRef.current = {};
+    setHarmonyRenderingByType({});
+    setHarmonyRenderErrorsByType({});
     autotunedBufferRef.current = null;
-    setHarmonyRenderError('');
     setAutotuneRenderError('');
     stopPlayback();
-    if (recordedUrlRef.current) {
-      URL.revokeObjectURL(recordedUrlRef.current);
-      recordedUrlRef.current = null;
-      setRecordedUrl(null);
-    }
   }
 
   async function startRecording() {
@@ -554,9 +587,6 @@ export default function App() {
     if (mr && mr.state !== 'inactive') {
       mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: (chunksRef.current[0] && chunksRef.current[0].type) || 'audio/webm' });
-        const url = URL.createObjectURL(blob);
-        recordedUrlRef.current = url;
-        setRecordedUrl(url);
 
         try {
           const arrayBuf = await blob.arrayBuffer();
@@ -668,11 +698,6 @@ export default function App() {
       setVoiceReady(true);
       setRecordingDuration(Math.max(0.3, buffer.duration));
 
-      const blob = audioBufferToWavBlob(buffer);
-      const url = URL.createObjectURL(blob);
-      recordedUrlRef.current = url;
-      setRecordedUrl(url);
-
       const frames = extractFramesFromBuffer(buffer.getChannelData(0), buffer.sampleRate);
       const result = analyzeFrames(frames);
       if (result.error) {
@@ -705,8 +730,7 @@ export default function App() {
   // page may have open — Safari in particular — and creating-then-closing
   // one on every playback click burns through that budget fast: after
   // enough plays, new contexts stop producing sound at all (silently, no
-  // error), while the "Original" button kept working because it plays
-  // through a plain <audio> element that never touches the Web Audio API.
+  // error).
   async function getPlaybackContext() {
     let ctx = playCtxRef.current;
     if (!ctx || ctx.state === 'closed') {
@@ -733,19 +757,26 @@ export default function App() {
       try { node.stop(); } catch (e) { /* already stopped/ended */ }
     });
     activeSourcesRef.current = [];
-    if (audioElRef.current) audioElRef.current.pause();
+    Object.values(mixNodesRef.current).forEach((nodes) => {
+      try { nodes.gainNode.disconnect(); } catch (e) { /* already disconnected */ }
+    });
+    mixNodesRef.current = {};
+    Object.values(meterRefs.current).forEach((el) => { if (el) el.style.width = '0%'; });
     setIsPlaying(false);
-    setNowPlaying(null);
     setPlayheadTime(null);
   }
 
-  function makeVoice(ctx, now, notesArr, gainLevel, voiceSoundType) {
+  // `outputNode` is the channel's own gain node — every source (whether a
+  // real recording buffer or a synthesized voice) ends up there instead of
+  // going straight to the speakers, so the channel's fader and meter apply
+  // no matter what kind of source it is.
+  function makeVoice(ctx, outputNode, now, notesArr, voiceSoundType) {
     const osc = ctx.createOscillator();
     osc.type = voiceSoundType === 'voice' ? 'sawtooth' : 'sine';
-    const gain = ctx.createGain();
-    gain.gain.value = 0;
+    const envGain = ctx.createGain();
+    envGain.gain.value = 0;
     const outNode = voiceSoundType === 'voice' ? createFormantSum(ctx, osc) : osc;
-    outNode.connect(gain).connect(ctx.destination);
+    outNode.connect(envGain).connect(outputNode);
     osc.start(now);
     notesArr.forEach((n) => {
       const freq = midiToFreq(n.midi);
@@ -754,22 +785,20 @@ export default function App() {
       const attack = 0.02;
       const release = Math.min(0.06, (end - start) / 3);
       osc.frequency.setValueAtTime(freq, start);
-      gain.gain.setValueAtTime(0, start);
-      gain.gain.linearRampToValueAtTime(gainLevel, start + attack);
-      gain.gain.setValueAtTime(gainLevel, Math.max(start + attack, end - release));
-      gain.gain.linearRampToValueAtTime(0, end);
+      envGain.gain.setValueAtTime(0, start);
+      envGain.gain.linearRampToValueAtTime(1, start + attack);
+      envGain.gain.setValueAtTime(1, Math.max(start + attack, end - release));
+      envGain.gain.linearRampToValueAtTime(0, end);
     });
     const lastEnd = notesArr.length ? notesArr[notesArr.length - 1].end : 0;
     osc.stop(now + lastEnd + 0.3);
     return osc;
   }
 
-  function playBufferSource(ctx, now, buffer, gainLevel) {
+  function playBufferSource(ctx, outputNode, now, buffer) {
     const src = ctx.createBufferSource();
     src.buffer = buffer;
-    const g = ctx.createGain();
-    g.gain.value = gainLevel;
-    src.connect(g).connect(ctx.destination);
+    src.connect(outputNode);
     src.start(now);
     return src;
   }
@@ -778,7 +807,7 @@ export default function App() {
     const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
     const totalDur = (notesArr.length ? notesArr[notesArr.length - 1].end : 0) + 0.4;
     const offlineCtx = new OfflineCtx(1, Math.max(1, Math.ceil(totalDur * sampleRate)), sampleRate);
-    makeVoice(offlineCtx, 0.05, notesArr, 0.6, renderSoundType);
+    makeVoice(offlineCtx, offlineCtx.destination, 0.05, notesArr, renderSoundType);
     return offlineCtx.startRendering();
   }
 
@@ -813,83 +842,135 @@ export default function App() {
     }
   }
 
-  async function exportHarmony() {
-    if (!harmonyType || !harmonyPlaybackNotes.length || exporting) return;
-    setExporting('harmony');
+  async function exportHarmonyType(type) {
+    if (!melodyNotes.length || exporting) return;
+    setExporting(`harmony-${type}`);
     try {
       let buffer;
       if (soundType === 'recording' && recordedBufferRef.current) {
-        buffer = await getHarmonyBuffer();
+        buffer = await getHarmonyBufferFor(type);
         if (!buffer) return;
       } else {
-        buffer = await renderSynthOffline(harmonyPlaybackNotes, soundType, exportSampleRate());
+        buffer = await renderSynthOffline(harmonyPlaybackNotesFor(type), soundType, exportSampleRate());
       }
-      const suffix = `${harmonyType}-${direction === -1 ? 'under' : 'over'}`;
+      const suffix = `${type}-${channels[type].direction === -1 ? 'under' : 'over'}`;
       downloadBlob(audioBufferToWavBlob(buffer), `stamma-stamma-${suffix}.wav`);
     } finally {
       setExporting(null);
     }
   }
 
-  async function playSynth(which) {
-    // Pre-render (or fetch the cached) real-voice buffers before opening the
-    // playback context, so the AudioContext clock only starts once they're
-    // actually ready to schedule.
-    let sourceBuf = null;
-    let hBuf = null;
-    if (soundType === 'recording' && recordedBufferRef.current) {
-      sourceBuf = await getSourceBuffer();
-      if (!sourceBuf) return;
-      if (which === 'harmony' || which === 'both') {
-        hBuf = await getHarmonyBuffer();
-        if (!hBuf) return;
-      }
+  // Resolves what a channel should actually play right now: a ready-made
+  // buffer (the real recording, its autotuned version, or a rendered
+  // harmony), or a note list for the synthesizer, depending on the current
+  // "Ljud" mode. Returns null if the channel has nothing to play yet.
+  async function resolveChannelContent(key) {
+    if (key === 'original') {
+      if (soundType !== 'recording' || !recordedBufferRef.current) return null;
+      return { kind: 'buffer', buffer: recordedBufferRef.current };
     }
+    if (key === 'melody') {
+      if (soundType === 'recording') {
+        if (!recordedBufferRef.current) return null;
+        const buffer = await getSourceBuffer();
+        return buffer ? { kind: 'buffer', buffer } : null;
+      }
+      return melodyPlaybackNotes.length ? { kind: 'notes', notes: melodyPlaybackNotes } : null;
+    }
+    // ters / kvint / sext
+    if (soundType === 'recording') {
+      if (!recordedBufferRef.current) return null;
+      const buffer = await getHarmonyBufferFor(key);
+      return buffer ? { kind: 'buffer', buffer } : null;
+    }
+    const notes = harmonyPlaybackNotesFor(key);
+    return notes.length ? { kind: 'notes', notes } : null;
+  }
 
+  // Node creation + actually starting a channel is kept synchronous and
+  // separate from resolving its content (which can involve an offline
+  // render taking a couple hundred ms) — see startMix for why.
+  function startMixChannelWithContent(ctx, key, now, channelState, content) {
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = channelState.volume;
+    const analyserNode = ctx.createAnalyser();
+    analyserNode.fftSize = 256;
+    gainNode.connect(analyserNode);
+    gainNode.connect(ctx.destination);
+
+    const sourceNode = content.kind === 'buffer'
+      ? playBufferSource(ctx, gainNode, now, content.buffer)
+      : makeVoice(ctx, gainNode, now, content.notes, soundType);
+
+    mixNodesRef.current[key] = { gainNode, analyserNode, sourceNode };
+    return sourceNode;
+  }
+
+  function computeMixTotalDuration() {
+    if (soundType === 'recording' && recordedBufferRef.current) return recordedBufferRef.current.duration;
+    let maxEnd = melodyPlaybackNotes.length ? melodyPlaybackNotes[melodyPlaybackNotes.length - 1].end : 0;
+    HARMONY_KEYS.forEach((type) => {
+      const notes = harmonyPlaybackNotesFor(type);
+      if (notes.length) maxEnd = Math.max(maxEnd, notes[notes.length - 1].end);
+    });
+    return maxEnd + 0.4;
+  }
+
+  function updateMeters() {
+    const scratch = meterScratchRef.current || (meterScratchRef.current = new Uint8Array(256));
+    Object.entries(mixNodesRef.current).forEach(([key, nodes]) => {
+      if (!nodes?.analyserNode) return;
+      nodes.analyserNode.getByteTimeDomainData(scratch);
+      let sumSq = 0;
+      for (let i = 0; i < scratch.length; i++) {
+        const v = (scratch[i] - 128) / 128;
+        sumSq += v * v;
+      }
+      const rms = Math.sqrt(sumSq / scratch.length);
+      const level = Math.min(1, rms * 3.2); // headroom so a normal singing level visibly fills the bar
+      const el = meterRefs.current[key];
+      if (el) el.style.width = `${Math.round(level * 100)}%`;
+    });
+  }
+
+  // Starts every enabled channel at once, live-mixed through its own
+  // fader. Toggling a channel or changing a harmony's direction while
+  // already playing just restarts the whole mix from the top rather than
+  // trying to splice a new source in mid-playback in sync — simpler and
+  // more robust for a few seconds of preview audio.
+  //
+  // Every channel's content is resolved first, *then* they're all started
+  // together at the same timestamp — a channel needing a fresh harmony
+  // render (a couple hundred ms) would otherwise still be awaited while the
+  // already-cached channels had already started on schedule, so it'd join
+  // audibly late and out of sync with them.
+  async function startMix(channelsState) {
     stopPlayback();
+    const activeKeys = Object.keys(channelsState).filter((k) => channelsState[k].enabled);
+    if (!activeKeys.length) return;
+
     const ctx = await getPlaybackContext();
-    const now = ctx.currentTime + 0.05;
-    setIsPlaying(true);
-    setNowPlaying(which);
-
-    let totalDur = Math.max(
-      melodyPlaybackNotes.length ? melodyPlaybackNotes[melodyPlaybackNotes.length - 1].end : 0,
-      harmonyPlaybackNotes.length ? harmonyPlaybackNotes[harmonyPlaybackNotes.length - 1].end : 0
+    const resolved = await Promise.all(
+      activeKeys.map(async (key) => ({ key, content: await resolveChannelContent(key) }))
     );
+    const usable = resolved.filter((r) => r.content);
+    if (!usable.length) return;
 
-    const started = [];
-    if (soundType === 'recording' && recordedBufferRef.current) {
-      totalDur = sourceBuf.duration;
-      if (which === 'melody') {
-        started.push(playBufferSource(ctx, now, sourceBuf, 0.9));
-      } else if (which === 'harmony') {
-        started.push(playBufferSource(ctx, now, hBuf, 0.9));
-      } else if (which === 'both') {
-        started.push(playBufferSource(ctx, now, sourceBuf, 0.7));
-        started.push(playBufferSource(ctx, now, hBuf, 0.7));
-      }
-    } else {
-      if (which === 'melody') {
-        started.push(makeVoice(ctx, now, melodyPlaybackNotes, 0.22, soundType));
-      } else if (which === 'harmony') {
-        started.push(makeVoice(ctx, now, harmonyPlaybackNotes, 0.22, soundType));
-      } else if (which === 'both') {
-        started.push(makeVoice(ctx, now, melodyPlaybackNotes, 0.16, soundType));
-        started.push(makeVoice(ctx, now, harmonyPlaybackNotes, 0.16, soundType));
-      }
-    }
+    const now = ctx.currentTime + 0.05;
+    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content));
+
     activeSourcesRef.current = started;
+    setIsPlaying(true);
 
+    const totalDur = computeMixTotalDuration();
     playTimeoutRef.current = setTimeout(() => {
-      setIsPlaying(false);
-      setNowPlaying(null);
-      setPlayheadTime(null);
-      playTimeoutRef.current = null;
+      stopPlayback();
     }, (totalDur + 0.4) * 1000);
 
     const tickPlayhead = () => {
       const elapsed = ctx.currentTime - now;
       setPlayheadTime(Math.max(0, elapsed));
+      updateMeters();
       if (elapsed < totalDur + 0.1) {
         playheadRafRef.current = requestAnimationFrame(tickPlayhead);
       }
@@ -897,29 +978,13 @@ export default function App() {
     playheadRafRef.current = requestAnimationFrame(tickPlayhead);
   }
 
-  function playOriginal() {
-    stopPlayback();
-    if (audioElRef.current) {
-      audioElRef.current.currentTime = 0;
-      audioElRef.current.play();
-      setIsPlaying(true);
-      setNowPlaying('original');
-
-      const tickPlayhead = () => {
-        const el = audioElRef.current;
-        if (!el) return;
-        setPlayheadTime(el.currentTime);
-        if (!el.paused && !el.ended) {
-          playheadRafRef.current = requestAnimationFrame(tickPlayhead);
-        } else {
-          setPlayheadTime(null);
-        }
-      };
-      playheadRafRef.current = requestAnimationFrame(tickPlayhead);
-    }
+  function restartMix(channelsState) {
+    startMix(channelsState);
   }
 
   const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
+  const anyChannelEnabled = Object.values(channels).some((c) => c.enabled);
+  const anyHarmonyBusy = Object.values(harmonyRenderingByType).some(Boolean);
 
   return (
     <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
@@ -932,6 +997,9 @@ export default function App() {
         .rec-dot { animation: pulseRec 1.4s ease-in-out infinite; }
         @media (prefers-reduced-motion: reduce) { .rec-dot { animation: none; } }
         .stamma-btn:focus-visible { outline: 2px solid #FFB454; outline-offset: 2px; }
+        .stamma-fader { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px; background: rgba(241,237,228,0.15); outline: none; }
+        .stamma-fader::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #F1EDE4; cursor: pointer; }
+        .stamma-fader::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #F1EDE4; border: none; cursor: pointer; }
       `}</style>
 
       <div className="w-full max-w-md px-5 py-8 font-body">
@@ -941,25 +1009,25 @@ export default function App() {
             Stämifier
           </h1>
           <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
-            Sjung in en melodi (max 10 sekunder), eller ladda upp en ljudfil. Appen känner av tonarten och bygger en stämma i ters, kvint eller sext som du kan träna in.
+            Sjung in en melodi (max 10 sekunder), eller ladda upp en ljudfil. Appen känner av tonarten och bygger stämmor i ters, kvint och sext som du kan mixa och träna in.
           </p>
         </header>
 
         {/* Signature visualization */}
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-          <PitchCanvas melodyNotes={melodyNotes} harmonyNotes={harmonyNotes} keyInfo={keyInfo} duration={recordingDuration} playheadTime={playheadTime} />
+          <PitchCanvas melodyNotes={melodyNotes} harmonyLayers={harmonyLayers} keyInfo={keyInfo} duration={recordingDuration} playheadTime={playheadTime} />
           {melodyNotes.length > 0 && (
-            <div className="flex items-center gap-4 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#FFB454' }} />
+                <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: MELODY_COLOR.line }} />
                 melodi
               </span>
-              {harmonyType && (
-                <span className="flex items-center gap-1.5">
-                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#55D6C0' }} />
-                  stämma
+              {harmonyLayers.map((layer) => (
+                <span key={layer.key} className="flex items-center gap-1.5">
+                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: layer.color }} />
+                  {HARMONY_TYPES[layer.key].label.toLowerCase()}
                 </span>
-              )}
+              ))}
               {playheadTime !== null && (
                 <span className="ml-auto" style={{ color: '#F1EDE4' }}>
                   {playheadTime.toFixed(1)}s / {recordingDuration.toFixed(1)}s
@@ -975,16 +1043,16 @@ export default function App() {
             {errorMsg}
           </div>
         )}
-        {harmonyRenderError && (
-          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
-            {harmonyRenderError}
-          </div>
-        )}
         {autotuneRenderError && (
           <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
             {autotuneRenderError}
           </div>
         )}
+        {Object.entries(harmonyRenderErrorsByType).map(([type, msg]) => msg && (
+          <div key={type} className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+            {msg}
+          </div>
+        ))}
 
         {/* Idle: start button + upload */}
         {(phase === 'idle' || phase === 'error') && (
@@ -1053,59 +1121,12 @@ export default function App() {
           </div>
         )}
 
-        {/* Ready: key readout, harmony selection, playback */}
+        {/* Ready: key readout, sound mode, mixer, export */}
         {phase === 'ready' && (
           <div className="space-y-5">
             <div className="rounded-2xl p-4 flex items-center justify-between" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
               <span className="text-base" style={{ color: '#C7CBDA' }}>Uppfattad tonart</span>
               <span className="font-mono-ui text-lg" style={{ color: '#FFB454' }}>{keyLabel}</span>
-            </div>
-
-            <div>
-              <h2 className="font-display text-lg font-semibold mb-2">Välj stämma</h2>
-              <div className="grid grid-cols-3 gap-2">
-                {Object.keys(HARMONY_TYPES).map((type) => {
-                  const active = harmonyType === type;
-                  return (
-                    <button
-                      key={type}
-                      onClick={() => selectHarmony(type)}
-                      className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
-                      style={{
-                        backgroundColor: active ? '#55D6C0' : 'rgba(241,237,228,0.06)',
-                        color: active ? '#10131A' : '#F1EDE4',
-                        border: active ? '1px solid #55D6C0' : '1px solid rgba(241,237,228,0.12)',
-                      }}
-                    >
-                      {HARMONY_TYPES[type].label}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {harmonyType && (
-                <>
-                  <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
-                    {HARMONY_TYPES[harmonyType].description}
-                  </p>
-                  <div className="mt-3 flex gap-2">
-                    {[{ v: -1, label: 'Under melodin' }, { v: 1, label: 'Över melodin' }].map((opt) => (
-                      <button
-                        key={opt.v}
-                        onClick={() => { directionTouchedRef.current = true; setDirection(opt.v); }}
-                        className="stamma-btn flex-1 rounded-lg py-2 text-xs font-medium"
-                        style={{
-                          backgroundColor: direction === opt.v ? 'rgba(85,214,192,0.15)' : 'transparent',
-                          color: direction === opt.v ? '#55D6C0' : '#C7CBDA',
-                          border: direction === opt.v ? '1px solid rgba(85,214,192,0.4)' : '1px solid rgba(241,237,228,0.12)',
-                        }}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
             </div>
 
             <div>
@@ -1117,7 +1138,7 @@ export default function App() {
                   return (
                     <button
                       key={type}
-                      onClick={() => !disabled && setSoundType(type)}
+                      onClick={() => { if (!disabled) { setSoundType(type); if (isPlaying) stopPlayback(); } }}
                       disabled={disabled}
                       className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
                       style={{
@@ -1144,85 +1165,92 @@ export default function App() {
                       Rättar lätt falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
                     </div>
                   </div>
-                  <button
-                    onClick={() => setAutotuneEnabled((v) => !v)}
-                    className="stamma-btn shrink-0"
-                    style={{ width: 44, height: 26, borderRadius: 13, backgroundColor: autotuneEnabled ? '#55D6C0' : 'rgba(241,237,228,0.15)', position: 'relative' }}
-                    aria-pressed={autotuneEnabled}
-                    aria-label="Autotune"
-                  >
-                    <span
-                      style={{
-                        position: 'absolute',
-                        top: 3,
-                        left: autotuneEnabled ? 21 : 3,
-                        width: 20,
-                        height: 20,
-                        borderRadius: 10,
-                        backgroundColor: '#10131A',
-                        transition: 'left 150ms ease',
-                      }}
-                    />
-                  </button>
+                  <ToggleSwitch
+                    checked={autotuneEnabled}
+                    onChange={() => { setAutotuneEnabled((v) => !v); if (isPlaying) stopPlayback(); }}
+                    accentColor="#55D6C0"
+                  />
                 </div>
               )}
             </div>
 
             <div>
-              <h2 className="font-display text-lg font-semibold mb-2">Lyssna</h2>
-              <div className="grid grid-cols-1 gap-2">
-                {recordedUrl && (
-                  <PlaybackButton
-                    label="Original (din inspelning)"
-                    active={isPlaying && nowPlaying === 'original'}
-                    onClick={playOriginal}
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="font-display text-lg font-semibold">Mixer</h2>
+                {isPlaying && (
+                  <button onClick={stopPlayback} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
+                    Stoppa
+                  </button>
+                )}
+              </div>
+              <p className="text-sm leading-relaxed mb-3" style={{ color: '#C7CBDA' }}>
+                Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
+              </p>
+
+              <div className="space-y-2">
+                {voiceReady && soundType === 'recording' && (
+                  <MixerChannel
+                    label="Original (rå inspelning)"
+                    accentColor="#F1EDE4"
+                    enabled={channels.original.enabled}
+                    onToggle={() => toggleChannel('original')}
+                    volume={channels.original.volume}
+                    onVolumeChange={(v) => setChannelVolume('original', v)}
+                    meterRef={(el) => { meterRefs.current.original = el; }}
                   />
                 )}
-                <PlaybackButton
-                  label={
-                    soundType === 'recording'
-                      ? autotuneRendering
-                        ? 'Din inspelade melodi (autotunar …)'
-                        : autotuneEnabled
-                          ? 'Din inspelade melodi (autotunad)'
-                          : 'Din inspelade melodi'
-                      : 'Melodislinga (ren ton)'
-                  }
-                  disabled={soundType === 'recording' && autotuneRendering}
-                  active={isPlaying && nowPlaying === 'melody'}
-                  onClick={() => playSynth('melody')}
+                <MixerChannel
+                  label={soundType === 'recording' ? (autotuneEnabled ? 'Melodi (autotunad)' : 'Melodi (din röst)') : 'Melodi (ren ton)'}
+                  accentColor={MELODY_COLOR.line}
+                  enabled={channels.melody.enabled}
+                  onToggle={() => toggleChannel('melody')}
+                  volume={channels.melody.volume}
+                  onVolumeChange={(v) => setChannelVolume('melody', v)}
+                  meterRef={(el) => { meterRefs.current.melody = el; }}
+                  busy={autotuneRendering}
                 />
-                <PlaybackButton
-                  label={soundType === 'recording' ? ((harmonyRendering || autotuneRendering) ? 'Stämma (bygger …)' : 'Stämma (din röst, formantbevarande)') : 'Stämma'}
-                  primary
-                  disabled={!harmonyType || harmonyRendering || autotuneRendering}
-                  active={isPlaying && nowPlaying === 'harmony'}
-                  onClick={() => playSynth('harmony')}
-                />
-                <PlaybackButton
-                  label={soundType === 'recording' ? ((harmonyRendering || autotuneRendering) ? 'Melodi + stämma (bygger …)' : 'Melodi + stämma (din röst)') : 'Melodi + stämma tillsammans'}
-                  disabled={!harmonyType || harmonyRendering || autotuneRendering}
-                  active={isPlaying && nowPlaying === 'both'}
-                  onClick={() => playSynth('both')}
-                />
+                {HARMONY_KEYS.map((type) => (
+                  <MixerChannel
+                    key={type}
+                    label={HARMONY_TYPES[type].label}
+                    accentColor={HARMONY_COLORS[type].line}
+                    enabled={channels[type].enabled}
+                    onToggle={() => toggleChannel(type)}
+                    volume={channels[type].volume}
+                    onVolumeChange={(v) => setChannelVolume(type, v)}
+                    meterRef={(el) => { meterRefs.current[type] = el; }}
+                    busy={harmonyRenderingByType[type]}
+                    direction={channels[type].direction}
+                    onSetDirection={(d) => setChannelDirection(type, d)}
+                  />
+                ))}
               </div>
-              {isPlaying && (
-                <button onClick={stopPlayback} className="stamma-btn mt-2 text-xs underline" style={{ color: '#C7CBDA' }}>
-                  Stoppa uppspelning
-                </button>
-              )}
+
+              <button
+                onClick={() => (isPlaying ? stopPlayback() : startMix(channels))}
+                disabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
+                className="stamma-btn w-full mt-4 rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98] flex items-center justify-center gap-2"
+                style={{
+                  backgroundColor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.06)' : '#FFB454',
+                  color: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.3)' : '#10131A',
+                  cursor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {isPlaying ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
+                {isPlaying ? 'Stoppa mixen' : (anyHarmonyBusy || autotuneRendering) ? 'Bygger …' : 'Spela mixen'}
+              </button>
             </div>
 
             <div>
               <h2 className="font-display text-lg font-semibold mb-2">Exportera</h2>
               <p className="text-sm leading-relaxed mb-2" style={{ color: '#C7CBDA' }}>
-                Ladda ner sång och stämma som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
+                Ladda ner sång och stämmor som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
               </p>
               <div className="grid grid-cols-1 gap-2">
                 <ExportButton
                   label="Sång (original)"
                   busy={exporting === 'song'}
-                  disabled={!recordedUrl || !!exporting}
+                  disabled={!voiceReady || soundType !== 'recording' || !!exporting}
                   onClick={exportSong}
                 />
                 <ExportButton
@@ -1235,12 +1263,15 @@ export default function App() {
                   disabled={!melodyNotes.length || !!exporting || autotuneRendering}
                   onClick={exportMelody}
                 />
-                <ExportButton
-                  label="Stämma"
-                  busy={exporting === 'harmony' || harmonyRendering || autotuneRendering}
-                  disabled={!harmonyType || !!exporting || harmonyRendering || autotuneRendering}
-                  onClick={exportHarmony}
-                />
+                {HARMONY_KEYS.map((type) => (
+                  <ExportButton
+                    key={type}
+                    label={`${HARMONY_TYPES[type].label} (${channels[type].direction === -1 ? 'under' : 'över'})`}
+                    busy={exporting === `harmony-${type}` || harmonyRenderingByType[type]}
+                    disabled={!melodyNotes.length || !!exporting || harmonyRenderingByType[type]}
+                    onClick={() => exportHarmonyType(type)}
+                  />
+                ))}
               </div>
             </div>
 
@@ -1251,11 +1282,99 @@ export default function App() {
             >
               Spela in igen
             </button>
-
-            {recordedUrl && <audio ref={audioElRef} src={recordedUrl} onEnded={() => { setIsPlaying(false); setNowPlaying(null); setPlayheadTime(null); }} className="hidden" />}
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled }) {
+  return (
+    <button
+      onClick={onChange}
+      disabled={disabled}
+      className="stamma-btn shrink-0"
+      style={{
+        width: 40,
+        height: 24,
+        borderRadius: 12,
+        backgroundColor: checked ? accentColor : 'rgba(241,237,228,0.15)',
+        position: 'relative',
+        opacity: disabled ? 0.4 : 1,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+      }}
+      aria-pressed={checked}
+    >
+      <span
+        style={{
+          position: 'absolute',
+          top: 2.5,
+          left: checked ? 18 : 2.5,
+          width: 19,
+          height: 19,
+          borderRadius: 10,
+          backgroundColor: '#10131A',
+          transition: 'left 150ms ease',
+        }}
+      />
+    </button>
+  );
+}
+
+function MixerChannel({ label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy, direction, onSetDirection }) {
+  return (
+    <div
+      className="rounded-xl p-3"
+      style={{
+        backgroundColor: 'rgba(241,237,228,0.04)',
+        border: enabled ? `1px solid ${accentColor}55` : '1px solid rgba(241,237,228,0.1)',
+      }}
+    >
+      <div className="flex items-center gap-3">
+        <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} />
+        <span className="flex-1 text-sm font-medium truncate">
+          {label}
+          {busy ? <span style={{ color: '#C7CBDA' }}> (bygger …)</span> : null}
+        </span>
+        <span className="font-mono-ui text-xs shrink-0" style={{ color: enabled ? accentColor : '#C7CBDA' }}>
+          {Math.round(volume * 100)}%
+        </span>
+      </div>
+
+      {direction !== undefined && (
+        <div className="flex gap-1.5 mt-2 ml-[52px]">
+          {[{ v: -1, label: 'Under' }, { v: 1, label: 'Över' }].map((opt) => (
+            <button
+              key={opt.v}
+              onClick={() => onSetDirection(opt.v)}
+              className="stamma-btn flex-1 rounded-md py-1 text-xs font-medium"
+              style={{
+                backgroundColor: direction === opt.v ? `${accentColor}26` : 'transparent',
+                color: direction === opt.v ? accentColor : '#C7CBDA',
+                border: direction === opt.v ? `1px solid ${accentColor}66` : '1px solid rgba(241,237,228,0.12)',
+              }}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-2.5 ml-[52px] h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.08)' }}>
+        <div ref={meterRef} style={{ width: '0%', height: '100%', backgroundColor: accentColor, transition: 'width 60ms linear' }} />
+      </div>
+
+      <input
+        type="range"
+        min="0"
+        max="1"
+        step="0.01"
+        value={volume}
+        onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
+        className="stamma-fader w-full mt-2 ml-0"
+        style={{ accentColor }}
+      />
     </div>
   );
 }
@@ -1309,25 +1428,6 @@ function ExportButton({ label, onClick, disabled, busy }) {
       ) : (
         <DownloadIcon />
       )}
-    </button>
-  );
-}
-
-function PlaybackButton({ label, onClick, disabled, active, primary }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className="stamma-btn w-full rounded-xl py-3 px-4 flex items-center justify-between text-sm font-medium transition-colors"
-      style={{
-        backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : primary ? 'rgba(255,180,84,0.12)' : 'rgba(241,237,228,0.06)',
-        color: disabled ? 'rgba(241,237,228,0.25)' : primary ? '#FFB454' : '#F1EDE4',
-        border: active ? '1px solid #FFB454' : '1px solid rgba(241,237,228,0.1)',
-        cursor: disabled ? 'not-allowed' : 'pointer',
-      }}
-    >
-      <span>{label}</span>
-      <span className="shrink-0 flex items-center">{active ? <PauseIcon /> : <PlayIcon />}</span>
     </button>
   );
 }
