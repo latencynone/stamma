@@ -15,6 +15,7 @@ import {
   fillShortGaps,
   framesToNotes,
   filterTransientArtifacts,
+  filterOutlierNotes,
 } from './pitchAnalysis.js';
 import { renderHarmonyOffline } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
@@ -426,7 +427,7 @@ export default function App() {
     });
     const bridged = fillShortGaps(qFrames);
     const rawNotes = framesToNotes(bridged);
-    const notes = filterTransientArtifacts(rawNotes, key.tonic, key.mode);
+    const notes = filterOutlierNotes(filterTransientArtifacts(rawNotes, key.tonic, key.mode));
 
     if (notes.length === 0) {
       setPhase('error');

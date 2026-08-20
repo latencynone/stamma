@@ -24,6 +24,17 @@ function median(values) {
 // are eased directly from one note's ratio to the next; real pauses ease
 // down to ratio=1 (no shift) and back up, so there is never an instant jump
 // anywhere in the curve.
+//
+// An earlier version of this function instead followed the singer's raw
+// measured pitch within each note (to carry vibrato through more literally),
+// using the note's quantized ratio only as a fallback/clamp. Measured on a
+// real recording, that made the output *more* jittery than this flat-ratio
+// version, not less: our ~35ms/2048-sample autocorrelation pitch tracker has
+// enough frame-to-frame estimation noise on its own that feeding it straight
+// into the shift ratio injected audible roughness the flat-per-note ratio
+// doesn't have — pitch-shifting the real audio by a constant factor already
+// carries the singer's actual vibrato through mechanically, without needing
+// per-frame tracking accuracy we don't have at this window size.
 export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration) {
   const segments = melodyNotes.map((mn, i) => {
     const hn = harmonyNotes[i];

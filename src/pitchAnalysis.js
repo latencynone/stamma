@@ -130,3 +130,27 @@ export function filterTransientArtifacts(notes, tonicPC, mode, maxArtifactDur = 
     return true;
   });
 }
+
+// Drops short notes that sit in register far from where the singer has
+// otherwise been singing, even when they're too isolated (silence on both
+// sides) or too mutually-consistent with a neighboring artifact for
+// filterTransientArtifacts's local jump check to catch them. A brief
+// pitch-tracker misfire — a mic pop before singing starts, an octave/
+// subharmonic lock on a breath or sibilant — produces exactly this shape: a
+// short note more than an octave from the melody's home register, with nothing
+// nearby to compare it against. Long notes are exempt: a real, sustained leap
+// of an octave or more is plausible; a 70ms one essentially never is.
+export function filterOutlierNotes(notes, maxDeviationSteps = 7, maxOutlierDur = 0.15) {
+  if (notes.length < 3) return notes;
+  // Duration-weighted median step, in centiseconds of resolution — the
+  // melody's "home" register, robust to a handful of short artifacts
+  // skewing a simple unweighted average or median.
+  const weighted = [];
+  notes.forEach((n) => {
+    const weight = Math.max(1, Math.round((n.end - n.start) * 100));
+    for (let i = 0; i < weight; i++) weighted.push(n.step);
+  });
+  weighted.sort((a, b) => a - b);
+  const homeStep = weighted[Math.floor(weighted.length / 2)];
+  return notes.filter((n) => (n.end - n.start) > maxOutlierDur || Math.abs(n.step - homeStep) <= maxDeviationSteps);
+}
