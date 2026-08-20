@@ -356,9 +356,16 @@ export default function App() {
     return harmonyNotes.map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode) }));
   }, [harmonyNotes, keyInfo]);
 
+  // Only reset direction to the type's default when actually switching to a
+  // different harmony type — re-tapping the already-selected type (easy to
+  // do by habit, or right above the under/over buttons) used to silently
+  // snap direction back to default, discarding whatever the user had
+  // explicitly chosen there.
   function selectHarmony(type) {
+    if (type !== harmonyType) {
+      setDirection(HARMONY_TYPES[type].defaultDirection);
+    }
     setHarmonyType(type);
-    setDirection(HARMONY_TYPES[type].defaultDirection);
   }
 
   // Renders (or returns the cached render of) a lightly pitch-corrected copy
