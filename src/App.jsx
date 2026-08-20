@@ -312,6 +312,7 @@ export default function App() {
   const autotunedBufferRef = useRef(null);
   const autotuneRenderPromiseRef = useRef(null);
   const fileInputRef = useRef(null);
+  const directionTouchedRef = useRef(false);
 
   // The browser remembers a granted/denied microphone permission on its own
   // (that's an origin-level browser decision, not something a site can
@@ -356,13 +357,13 @@ export default function App() {
     return harmonyNotes.map((n) => ({ start: n.start, end: n.end, midi: scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode) }));
   }, [harmonyNotes, keyInfo]);
 
-  // Only reset direction to the type's default when actually switching to a
-  // different harmony type — re-tapping the already-selected type (easy to
-  // do by habit, or right above the under/over buttons) used to silently
-  // snap direction back to default, discarding whatever the user had
-  // explicitly chosen there.
+  // A harmony type's default direction is only a suggestion for before the
+  // user has picked one explicitly. Once they've tapped "Under"/"Över"
+  // themselves, that choice is a preference, not a per-type setting — it
+  // should survive switching between ters/kvint/sext, not just surviving a
+  // re-tap of the already-selected type.
   function selectHarmony(type) {
-    if (type !== harmonyType) {
+    if (type !== harmonyType && !directionTouchedRef.current) {
       setDirection(HARMONY_TYPES[type].defaultDirection);
     }
     setHarmonyType(type);
@@ -453,6 +454,7 @@ export default function App() {
     setSoundType('sine');
     setVoiceReady(false);
     setAutotuneEnabled(false);
+    directionTouchedRef.current = false;
     recordedBufferRef.current = null;
     harmonyBufferRef.current = null;
     harmonyBufferKeyRef.current = null;
@@ -1090,7 +1092,7 @@ export default function App() {
                     {[{ v: -1, label: 'Under melodin' }, { v: 1, label: 'Över melodin' }].map((opt) => (
                       <button
                         key={opt.v}
-                        onClick={() => setDirection(opt.v)}
+                        onClick={() => { directionTouchedRef.current = true; setDirection(opt.v); }}
                         className="stamma-btn flex-1 rounded-lg py-2 text-xs font-medium"
                         style={{
                           backgroundColor: direction === opt.v ? 'rgba(85,214,192,0.15)' : 'transparent',
