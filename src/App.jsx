@@ -283,6 +283,17 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTi
 
 const DURATION = 10;
 
+// Discrete stops for the autotune slider — index 0 is always "off" (no
+// render, no correction). The other three are the "tre nivåer" of partial
+// correction strength requested, expressed as the same 0..1 amount
+// buildAutotuneRatioCurve already accepted (see harmonyEngine.js).
+const AUTOTUNE_LEVELS = [
+  { key: 'off', label: 'Av', amount: 0 },
+  { key: 'light', label: 'Lätt', amount: 0.25 },
+  { key: 'medium', label: 'Medel', amount: 0.45 },
+  { key: 'hard', label: 'Hård', amount: 0.7 },
+];
+
 function defaultChannels() {
   return {
     original: { enabled: false, volume: 0.8, pan: 0, solo: false },
@@ -316,13 +327,15 @@ export default function App() {
   const [voiceReady, setVoiceReady] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(DURATION);
   const [playheadTime, setPlayheadTime] = useState(null);
+  const [previewingKey, setPreviewingKey] = useState(null);
   const [exporting, setExporting] = useState(null);
   const [harmonyRenderingByType, setHarmonyRenderingByType] = useState({});
   const [harmonyRenderErrorsByType, setHarmonyRenderErrorsByType] = useState({});
-  const [autotuneEnabled, setAutotuneEnabled] = useState(false);
+  const [autotuneLevelIndex, setAutotuneLevelIndex] = useState(0);
   const [autotuneRendering, setAutotuneRendering] = useState(false);
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
   const [micPermission, setMicPermission] = useState('unknown');
+  const autotuneEnabled = autotuneLevelIndex > 0;
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -342,7 +355,7 @@ export default function App() {
   const finishedRef = useRef(false);
   const harmonyBuffersRef = useRef({});
   const harmonyRenderPromisesRef = useRef({});
-  const autotunedBufferRef = useRef(null);
+  const autotunedBuffersRef = useRef({}); // keyed by autotuneLevelIndex
   const autotuneRenderPromiseRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -441,20 +454,28 @@ export default function App() {
     });
   }
 
-  // Renders (or returns the cached render of) a lightly pitch-corrected copy
-  // of the recording. Cached per-recording (there's only ever one amount),
-  // and reused as the *source* for harmony rendering too when autotune is on
-  // — so the two voices stay in tune with each other, not just with an
+  // Renders (or returns the cached render of) a pitch-corrected copy of the
+  // recording at the currently selected autotune strength. Cached per
+  // level index — switching between lätt/medel/hård keeps each one's
+  // render around instead of re-rendering on every slider move — and
+  // reused as the *source* for harmony rendering too when autotune is on,
+  // so the two voices stay in tune with each other, not just with an
   // idealized target neither of them actually sings.
   async function getAutotunedBuffer() {
     if (!recordedBufferRef.current || !melodyNotes.length || !keyInfo) return null;
-    if (autotunedBufferRef.current) return autotunedBufferRef.current;
-    if (autotuneRenderPromiseRef.current) return autotuneRenderPromiseRef.current;
+    const levelIndex = autotuneLevelIndex;
+    const level = AUTOTUNE_LEVELS[levelIndex];
+    if (!level || level.amount === 0) return null;
+    const cached = autotunedBuffersRef.current[levelIndex];
+    if (cached) return cached;
+    if (autotuneRenderPromiseRef.current?.levelIndex === levelIndex) {
+      return autotuneRenderPromiseRef.current.promise;
+    }
     setAutotuneRendering(true);
     setAutotuneRenderError('');
-    const promise = renderAutotunedMelody(recordedBufferRef.current, melodyNotes, keyInfo)
+    const promise = renderAutotunedMelody(recordedBufferRef.current, melodyNotes, keyInfo, level.amount)
       .then((buffer) => {
-        autotunedBufferRef.current = buffer;
+        autotunedBuffersRef.current[levelIndex] = buffer;
         return buffer;
       })
       .catch((err) => {
@@ -465,7 +486,7 @@ export default function App() {
         setAutotuneRendering(false);
         autotuneRenderPromiseRef.current = null;
       });
-    autotuneRenderPromiseRef.current = promise;
+    autotuneRenderPromiseRef.current = { levelIndex, promise };
     return promise;
   }
 
@@ -487,7 +508,7 @@ export default function App() {
     if (!recordedBufferRef.current || !melodyNotes.length || !keyInfo) return null;
     const sourceBuffer = await getSourceBuffer();
     if (!sourceBuffer) return null;
-    const key = `${channels[type].direction}-${autotuneEnabled ? 'at' : 'raw'}`;
+    const key = `${channels[type].direction}-${autotuneEnabled ? `at${autotuneLevelIndex}` : 'raw'}`;
     const cached = harmonyBuffersRef.current[type];
     if (cached && cached.key === key) return cached.buffer;
     if (harmonyRenderPromisesRef.current[type] && cached?.key === `pending-${key}`) {
@@ -524,13 +545,13 @@ export default function App() {
     setChannels(defaultChannels());
     setSoundType('sine');
     setVoiceReady(false);
-    setAutotuneEnabled(false);
+    setAutotuneLevelIndex(0);
     recordedBufferRef.current = null;
     harmonyBuffersRef.current = {};
     harmonyRenderPromisesRef.current = {};
     setHarmonyRenderingByType({});
     setHarmonyRenderErrorsByType({});
-    autotunedBufferRef.current = null;
+    autotunedBuffersRef.current = {};
     setAutotuneRenderError('');
     stopPlayback();
   }
@@ -553,6 +574,13 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+      // Belt-and-suspenders: a previous recording's context should already
+      // be closed by finishRecording, but never leave a live one behind
+      // before opening another — see the finally block there for why this
+      // matters (mobile browsers cap concurrent AudioContexts).
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
+      }
       const AC = window.AudioContext || window.webkitAudioContext;
       const audioCtx = new AC();
       audioCtxRef.current = audioCtx;
@@ -621,9 +649,10 @@ export default function App() {
       mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: (chunksRef.current[0] && chunksRef.current[0].type) || 'audio/webm' });
 
+        let decodeCtx = null;
         try {
           const arrayBuf = await blob.arrayBuffer();
-          const decodeCtx = audioCtxRef.current && audioCtxRef.current.state !== 'closed'
+          decodeCtx = audioCtxRef.current && audioCtxRef.current.state !== 'closed'
             ? audioCtxRef.current
             : new (window.AudioContext || window.webkitAudioContext)();
           const audioBuffer = await decodeCtx.decodeAudioData(arrayBuf);
@@ -632,12 +661,25 @@ export default function App() {
         } catch (e) {
           recordedBufferRef.current = null;
           setVoiceReady(false);
+        } finally {
+          // This context (the live recording one, reused for decode, or a
+          // fresh fallback) has no further use — close it instead of
+          // leaving it open forever. Every recording used to leak one of
+          // these, and mobile browsers cap concurrent AudioContexts, so
+          // after a few recordings new contexts (including the playback
+          // one) would silently stop producing sound.
+          if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
+          audioCtxRef.current = null;
         }
 
         runAnalysis();
       };
       mr.stop();
     } else {
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
+      }
+      audioCtxRef.current = null;
       runAnalysis();
     }
   }
@@ -713,10 +755,11 @@ export default function App() {
     resetSourceState();
     setPhase('analyzing');
 
+    let decodeCtx = null;
     try {
       const arrayBuf = await file.arrayBuffer();
       const AC = window.AudioContext || window.webkitAudioContext;
-      const decodeCtx = new AC();
+      decodeCtx = new AC();
       let buffer;
       try {
         buffer = await decodeCtx.decodeAudioData(arrayBuf);
@@ -748,6 +791,11 @@ export default function App() {
     } catch (e) {
       setPhase('error');
       setErrorMsg('Kunde inte läsa ljudfilen. Kontrollera att det är en vanlig ljudfil (t.ex. WAV, MP3 eller M4A).');
+    } finally {
+      // Same leak risk as the recording context: an upload's decode
+      // context has no use after this function returns, so it must be
+      // closed rather than left open for the rest of the session.
+      if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
     }
   }
 
@@ -798,6 +846,7 @@ export default function App() {
     Object.values(meterRefs.current).forEach((el) => { if (el) el.style.width = '0%'; });
     setIsPlaying(false);
     setPlayheadTime(null);
+    setPreviewingKey(null);
   }
 
   // `outputNode` is the channel's own gain node — every source (whether a
@@ -983,9 +1032,13 @@ export default function App() {
   // render (a couple hundred ms) would otherwise still be awaited while the
   // already-cached channels had already started on schedule, so it'd join
   // audibly late and out of sync with them.
-  async function startMix(channelsState) {
+  //
+  // `keysOverride` lets a single channel's own play button preview just
+  // that one track without touching anyone's enabled/solo state — same
+  // resolve-then-start machinery, just scoped to one key.
+  async function startMix(channelsState, keysOverride) {
     stopPlayback();
-    const activeKeys = Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
+    const activeKeys = keysOverride || Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
     if (!activeKeys.length) return;
 
     const ctx = await getPlaybackContext();
@@ -1000,6 +1053,7 @@ export default function App() {
 
     activeSourcesRef.current = started;
     setIsPlaying(true);
+    setPreviewingKey(keysOverride && keysOverride.length === 1 ? keysOverride[0] : null);
 
     const totalDur = computeMixTotalDuration();
     playTimeoutRef.current = setTimeout(() => {
@@ -1019,6 +1073,12 @@ export default function App() {
 
   function restartMix(channelsState) {
     startMix(channelsState);
+  }
+
+  // A channel's own play button: preview just that track, regardless of
+  // its current enabled/solo state in the mixer.
+  function previewChannel(key) {
+    startMix(channels, [key]);
   }
 
   const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
@@ -1197,18 +1257,39 @@ export default function App() {
               </p>
 
               {soundType === 'recording' && (
-                <div className="mt-3 flex items-center justify-between gap-3 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
-                  <div>
-                    <div className="text-sm font-medium">Autotune</div>
-                    <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
-                      Rättar lätt falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
+                <div className="mt-3 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium">Autotune</div>
+                      <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                        Rättar falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
+                      </div>
                     </div>
+                    <span className="font-mono-ui text-xs shrink-0" style={{ color: autotuneEnabled ? '#55D6C0' : '#C7CBDA' }}>
+                      {AUTOTUNE_LEVELS[autotuneLevelIndex].label}
+                    </span>
                   </div>
-                  <ToggleSwitch
-                    checked={autotuneEnabled}
-                    onChange={() => { setAutotuneEnabled((v) => !v); if (isPlaying) stopPlayback(); }}
-                    accentColor="#55D6C0"
+                  <input
+                    type="range"
+                    min="0"
+                    max={AUTOTUNE_LEVELS.length - 1}
+                    step="1"
+                    value={autotuneLevelIndex}
+                    onChange={(e) => {
+                      setAutotuneLevelIndex(parseInt(e.target.value, 10));
+                      if (isPlaying) stopPlayback();
+                    }}
+                    className="stamma-fader w-full mt-3"
+                    style={{ accentColor: '#55D6C0' }}
+                    aria-label="Autotune-styrka"
                   />
+                  <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>
+                    {AUTOTUNE_LEVELS.map((lvl, i) => (
+                      <span key={lvl.key} style={i === autotuneLevelIndex ? { color: '#55D6C0', fontWeight: 600 } : undefined}>
+                        {lvl.label}
+                      </span>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
@@ -1240,6 +1321,8 @@ export default function App() {
                     solo={channels.original.solo}
                     onToggleSolo={() => toggleChannelSolo('original')}
                     meterRef={(el) => { meterRefs.current.original = el; }}
+                    previewing={isPlaying && previewingKey === 'original'}
+                    onPreview={() => previewChannel('original')}
                   />
                 )}
                 <MixerChannel
@@ -1255,6 +1338,8 @@ export default function App() {
                   onToggleSolo={() => toggleChannelSolo('melody')}
                   meterRef={(el) => { meterRefs.current.melody = el; }}
                   busy={autotuneRendering}
+                  previewing={isPlaying && previewingKey === 'melody'}
+                  onPreview={() => previewChannel('melody')}
                 />
                 {HARMONY_KEYS.map((type) => (
                   <MixerChannel
@@ -1273,6 +1358,8 @@ export default function App() {
                     busy={harmonyRenderingByType[type]}
                     direction={channels[type].direction}
                     onSetDirection={(d) => setChannelDirection(type, d)}
+                    previewing={isPlaying && previewingKey === type}
+                    onPreview={() => previewChannel(type)}
                   />
                 ))}
               </div>
@@ -1377,7 +1464,7 @@ const SOLO_COLOR = '#FFD84D';
 
 function MixerChannel({
   label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy,
-  direction, onSetDirection, solo, onToggleSolo, pan, onPanChange,
+  direction, onSetDirection, solo, onToggleSolo, pan, onPanChange, previewing, onPreview,
 }) {
   const panLabel = Math.abs(pan) < 0.04 ? 'C' : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
@@ -1413,6 +1500,23 @@ function MixerChannel({
         <span className="font-mono-ui text-xs shrink-0" style={{ color: enabled ? accentColor : '#C7CBDA' }}>
           {Math.round(volume * 100)}%
         </span>
+        <button
+          onClick={onPreview}
+          disabled={busy}
+          className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
+          style={{
+            width: 24,
+            height: 24,
+            backgroundColor: previewing ? `${accentColor}26` : 'transparent',
+            color: busy ? 'rgba(241,237,228,0.25)' : accentColor,
+            border: `1px solid ${previewing ? `${accentColor}66` : 'rgba(241,237,228,0.15)'}`,
+            cursor: busy ? 'not-allowed' : 'pointer',
+          }}
+          aria-label={previewing ? 'Stoppa förhandslyssning' : 'Spela upp bara den här kanalen'}
+          title="Spela upp bara den här kanalen"
+        >
+          {previewing ? <PauseIcon size={12} /> : <PlayIcon size={12} />}
+        </button>
       </div>
 
       {direction !== undefined && (
