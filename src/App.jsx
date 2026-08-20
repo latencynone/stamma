@@ -285,12 +285,23 @@ const DURATION = 10;
 
 function defaultChannels() {
   return {
-    original: { enabled: false, volume: 0.8 },
-    melody: { enabled: true, volume: 0.9 },
-    ters: { enabled: false, volume: 0.8, direction: HARMONY_TYPES.ters.defaultDirection },
-    kvint: { enabled: false, volume: 0.8, direction: HARMONY_TYPES.kvint.defaultDirection },
-    sext: { enabled: false, volume: 0.8, direction: HARMONY_TYPES.sext.defaultDirection },
+    original: { enabled: false, volume: 0.8, pan: 0, solo: false },
+    melody: { enabled: true, volume: 0.9, pan: 0, solo: false },
+    ters: { enabled: false, volume: 0.8, pan: 0, solo: false, direction: HARMONY_TYPES.ters.defaultDirection },
+    kvint: { enabled: false, volume: 0.8, pan: 0, solo: false, direction: HARMONY_TYPES.kvint.defaultDirection },
+    sext: { enabled: false, volume: 0.8, pan: 0, solo: false, direction: HARMONY_TYPES.sext.defaultDirection },
   };
+}
+
+// A channel is actually audible if it's on, *and* — whenever one or more
+// channels are soloed — it's one of the soloed ones. Solo only narrows the
+// mix down temporarily; it doesn't change anyone's own enabled/mute state,
+// so un-soloing restores exactly what was playing before.
+function isChannelAudible(channelsState, key) {
+  const ch = channelsState[key];
+  if (!ch.enabled) return false;
+  const anySolo = Object.values(channelsState).some((c) => c.solo);
+  return anySolo ? ch.solo : true;
 }
 
 export default function App() {
@@ -397,15 +408,37 @@ export default function App() {
     if (nodes?.gainNode) nodes.gainNode.gain.value = volume;
   }
 
+  function setChannelPan(key, pan) {
+    setChannels((prev) => ({ ...prev, [key]: { ...prev[key], pan } }));
+    const nodes = mixNodesRef.current[key];
+    if (nodes?.pannerNode) nodes.pannerNode.pan.value = pan;
+  }
+
   function setChannelDirection(key, direction) {
-    setChannels((prev) => ({ ...prev, [key]: { ...prev[key], direction } }));
-    if (isPlaying) restartMix({ ...channels, [key]: { ...channels[key], direction } });
+    setChannels((prev) => {
+      const next = { ...prev, [key]: { ...prev[key], direction } };
+      if (isPlaying) restartMix(next);
+      return next;
+    });
   }
 
   function toggleChannel(key) {
-    const next = { ...channels, [key]: { ...channels[key], enabled: !channels[key].enabled } };
-    setChannels(next);
-    if (isPlaying) restartMix(next);
+    setChannels((prev) => {
+      const next = { ...prev, [key]: { ...prev[key], enabled: !prev[key].enabled } };
+      if (isPlaying) restartMix(next);
+      return next;
+    });
+  }
+
+  // Soloing doesn't touch enabled/mute state, just which of the currently-
+  // enabled channels actually make it into the mix (see isChannelAudible)
+  // — restarting is the only way to apply that live, same as toggling.
+  function toggleChannelSolo(key) {
+    setChannels((prev) => {
+      const next = { ...prev, [key]: { ...prev[key], solo: !prev[key].solo } };
+      if (isPlaying) restartMix(next);
+      return next;
+    });
   }
 
   // Renders (or returns the cached render of) a lightly pitch-corrected copy
@@ -759,6 +792,7 @@ export default function App() {
     activeSourcesRef.current = [];
     Object.values(mixNodesRef.current).forEach((nodes) => {
       try { nodes.gainNode.disconnect(); } catch (e) { /* already disconnected */ }
+      try { nodes.pannerNode.disconnect(); } catch (e) { /* already disconnected */ }
     });
     mixNodesRef.current = {};
     Object.values(meterRefs.current).forEach((el) => { if (el) el.style.width = '0%'; });
@@ -895,14 +929,19 @@ export default function App() {
     gainNode.gain.value = channelState.volume;
     const analyserNode = ctx.createAnalyser();
     analyserNode.fftSize = 256;
+    // Meter reads post-fader, pre-pan — panning splits energy left/right
+    // but shouldn't itself move the level reading.
     gainNode.connect(analyserNode);
-    gainNode.connect(ctx.destination);
+    const pannerNode = ctx.createStereoPanner();
+    pannerNode.pan.value = channelState.pan || 0;
+    gainNode.connect(pannerNode);
+    pannerNode.connect(ctx.destination);
 
     const sourceNode = content.kind === 'buffer'
       ? playBufferSource(ctx, gainNode, now, content.buffer)
       : makeVoice(ctx, gainNode, now, content.notes, soundType);
 
-    mixNodesRef.current[key] = { gainNode, analyserNode, sourceNode };
+    mixNodesRef.current[key] = { gainNode, analyserNode, pannerNode, sourceNode };
     return sourceNode;
   }
 
@@ -946,7 +985,7 @@ export default function App() {
   // audibly late and out of sync with them.
   async function startMix(channelsState) {
     stopPlayback();
-    const activeKeys = Object.keys(channelsState).filter((k) => channelsState[k].enabled);
+    const activeKeys = Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
     if (!activeKeys.length) return;
 
     const ctx = await getPlaybackContext();
@@ -1196,6 +1235,10 @@ export default function App() {
                     onToggle={() => toggleChannel('original')}
                     volume={channels.original.volume}
                     onVolumeChange={(v) => setChannelVolume('original', v)}
+                    pan={channels.original.pan}
+                    onPanChange={(p) => setChannelPan('original', p)}
+                    solo={channels.original.solo}
+                    onToggleSolo={() => toggleChannelSolo('original')}
                     meterRef={(el) => { meterRefs.current.original = el; }}
                   />
                 )}
@@ -1206,6 +1249,10 @@ export default function App() {
                   onToggle={() => toggleChannel('melody')}
                   volume={channels.melody.volume}
                   onVolumeChange={(v) => setChannelVolume('melody', v)}
+                  pan={channels.melody.pan}
+                  onPanChange={(p) => setChannelPan('melody', p)}
+                  solo={channels.melody.solo}
+                  onToggleSolo={() => toggleChannelSolo('melody')}
                   meterRef={(el) => { meterRefs.current.melody = el; }}
                   busy={autotuneRendering}
                 />
@@ -1218,6 +1265,10 @@ export default function App() {
                     onToggle={() => toggleChannel(type)}
                     volume={channels[type].volume}
                     onVolumeChange={(v) => setChannelVolume(type, v)}
+                    pan={channels[type].pan}
+                    onPanChange={(p) => setChannelPan(type, p)}
+                    solo={channels[type].solo}
+                    onToggleSolo={() => toggleChannelSolo(type)}
                     meterRef={(el) => { meterRefs.current[type] = el; }}
                     busy={harmonyRenderingByType[type]}
                     direction={channels[type].direction}
@@ -1322,17 +1373,39 @@ function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled }) 
   );
 }
 
-function MixerChannel({ label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy, direction, onSetDirection }) {
+const SOLO_COLOR = '#FFD84D';
+
+function MixerChannel({
+  label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy,
+  direction, onSetDirection, solo, onToggleSolo, pan, onPanChange,
+}) {
+  const panLabel = Math.abs(pan) < 0.04 ? 'C' : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
     <div
       className="rounded-xl p-3"
       style={{
         backgroundColor: 'rgba(241,237,228,0.04)',
-        border: enabled ? `1px solid ${accentColor}55` : '1px solid rgba(241,237,228,0.1)',
+        border: solo ? `1px solid ${SOLO_COLOR}88` : enabled ? `1px solid ${accentColor}55` : '1px solid rgba(241,237,228,0.1)',
       }}
     >
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2">
         <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} />
+        <button
+          onClick={onToggleSolo}
+          className="stamma-btn shrink-0 rounded-md font-mono-ui text-xs font-semibold"
+          style={{
+            width: 24,
+            height: 24,
+            backgroundColor: solo ? SOLO_COLOR : 'transparent',
+            color: solo ? '#10131A' : '#C7CBDA',
+            border: solo ? `1px solid ${SOLO_COLOR}` : '1px solid rgba(241,237,228,0.15)',
+          }}
+          aria-pressed={solo}
+          aria-label="Solo"
+          title="Solo"
+        >
+          S
+        </button>
         <span className="flex-1 text-sm font-medium truncate">
           {label}
           {busy ? <span style={{ color: '#C7CBDA' }}> (bygger …)</span> : null}
@@ -1343,7 +1416,7 @@ function MixerChannel({ label, accentColor, enabled, onToggle, volume, onVolumeC
       </div>
 
       {direction !== undefined && (
-        <div className="flex gap-1.5 mt-2 ml-[52px]">
+        <div className="flex gap-1.5 mt-2 ml-[64px]">
           {[{ v: -1, label: 'Under' }, { v: 1, label: 'Över' }].map((opt) => (
             <button
               key={opt.v}
@@ -1361,7 +1434,7 @@ function MixerChannel({ label, accentColor, enabled, onToggle, volume, onVolumeC
         </div>
       )}
 
-      <div className="mt-2.5 ml-[52px] h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.08)' }}>
+      <div className="mt-2.5 ml-[64px] h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.08)' }}>
         <div ref={meterRef} style={{ width: '0%', height: '100%', backgroundColor: accentColor, transition: 'width 60ms linear' }} />
       </div>
 
@@ -1375,6 +1448,23 @@ function MixerChannel({ label, accentColor, enabled, onToggle, volume, onVolumeC
         className="stamma-fader w-full mt-2 ml-0"
         style={{ accentColor }}
       />
+
+      <div className="flex items-center gap-2 mt-1.5">
+        <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>L</span>
+        <input
+          type="range"
+          min="-1"
+          max="1"
+          step="0.01"
+          value={pan}
+          onChange={(e) => onPanChange(parseFloat(e.target.value))}
+          className="stamma-fader w-full"
+          style={{ accentColor, height: 3 }}
+          aria-label="Panorering"
+        />
+        <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>R</span>
+        <span className="font-mono-ui text-[10px] shrink-0 w-6 text-right" style={{ color: '#C7CBDA' }}>{panLabel}</span>
+      </div>
     </div>
   );
 }
