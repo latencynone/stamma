@@ -16,9 +16,16 @@ const SILENCE_FADE_SEC = 0.04;
 const KEYFRAME_HOP_SEC = 0.02;
 // RMS level above which a window of the original recording counts as
 // "has content" rather than silence, and the fraction of windows within a
-// gap that must clear it for the whole gap to count as non-silent.
-const ENERGY_RMS_THRESHOLD = 0.01;
+// gap that must clear it for the whole gap to count as non-silent. Set just
+// above the ~0.002 noise floor measured on a real quiet room/mic — high
+// enough to not mistake room tone for singing, low enough to still catch
+// genuinely soft/breathy vocalizing (which sits around 0.003-0.008 and was
+// still slipping past a 0.01 threshold as an unshifted "pause").
+const ENERGY_RMS_THRESHOLD = 0.0035;
 const ENERGY_VOICED_FRACTION = 0.15;
+// How far back from a note's detected start to look for where its audible
+// onset actually began, when ramping in from a real pause.
+const ONSET_LOOKBACK_SEC = 0.2;
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -55,6 +62,26 @@ function hasAudibleEnergy(envelope, fromT, toT, edgePad = 0.03) {
   if (inRange.length === 0) return false;
   const voiced = inRange.filter((e) => e.rms > ENERGY_RMS_THRESHOLD).length;
   return voiced / inRange.length >= ENERGY_VOICED_FRACTION;
+}
+
+// Finds where the audible run leading into `beforeT` actually began, within
+// a bounded lookback. Pitch detection only recognizes a note once it's a few
+// stable frames in, so a note's nominal start typically lags the real
+// acoustic onset by tens of milliseconds — ramping the shift in on a fixed
+// window anchored to the detected start can leave a brief stretch of already-
+// audible signal playing unshifted right before the ramp begins. Returns
+// `beforeT` itself if there's no audible run immediately preceding it.
+function findOnsetTime(envelope, beforeT, maxLookback = ONSET_LOOKBACK_SEC) {
+  const inRange = envelope.filter((e) => e.t >= beforeT - maxLookback && e.t < beforeT);
+  let onset = beforeT;
+  for (let i = inRange.length - 1; i >= 0; i--) {
+    if (inRange[i].rms > ENERGY_RMS_THRESHOLD) {
+      onset = inRange[i].t;
+    } else {
+      break;
+    }
+  }
+  return onset;
 }
 
 // Builds a continuous ratio(t) curve, expressed as keyframes {t, ratio},
@@ -106,7 +133,10 @@ export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuratio
     if (isRealPause) {
       const fadeOutEnd = Math.min(cursorT + SILENCE_FADE_SEC, seg.start);
       pushRamp(cursorT, fadeOutEnd, cursorRatio, 1);
-      const fadeInStart = Math.max(fadeOutEnd, seg.start - SILENCE_FADE_SEC);
+      // Ramp in early enough to cover the note's real acoustic onset, not
+      // just its nominal (pitch-tracker-recognized, therefore late) start.
+      const onset = findOnsetTime(energyEnvelope, seg.start);
+      const fadeInStart = Math.max(fadeOutEnd, Math.min(seg.start - SILENCE_FADE_SEC, onset));
       keyframes.push({ t: fadeInStart, ratio: 1 });
       pushRamp(fadeInStart, seg.start, 1, seg.ratio);
     } else {
