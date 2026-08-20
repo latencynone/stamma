@@ -1382,7 +1382,14 @@ export default function App() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac"
+              // No `accept` filter: iOS Safari's iCloud Drive picker ANDs a
+              // MIME wildcard against listed extensions instead of ORing
+              // them, and iCloud often doesn't report MIME metadata for a
+              // file — so audio/* fails silently and the file (even a
+              // plain .wav) shows up grayed out regardless of extension.
+              // handleFileUpload already rejects anything decodeAudioData
+              // can't read, with a clear error, so filtering here isn't
+              // load-bearing — it was just actively breaking iCloud files.
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
