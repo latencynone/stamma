@@ -629,6 +629,7 @@ export default function App() {
   const [autotuneRendering, setAutotuneRendering] = useState(false);
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
   const [micPermission, setMicPermission] = useState('unknown');
+  const [introExpanded, setIntroExpanded] = useState(false);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(null); // null = full recordingDuration
   const [loopEnabled, setLoopEnabled] = useState(false);
@@ -1534,8 +1535,32 @@ export default function App() {
             Stämifier
           </h1>
           <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
-            Sjung in en melodi (max 10 sekunder), eller ladda upp en ljudfil. Appen känner av tonarten och bygger stämmor i ters, kvint och sext som du kan mixa och träna in.
+            Sjung in eller ladda upp en melodi (max 10s).
+            {!introExpanded && (
+              <>
+                {' '}
+                <button
+                  onClick={() => setIntroExpanded(true)}
+                  className="stamma-btn font-mono-ui text-xs align-middle"
+                  style={{ color: '#55D6C0' }}
+                >
+                  Läs mer ▾
+                </button>
+              </>
+            )}
           </p>
+          {introExpanded && (
+            <p className="mt-1 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
+              Appen känner av tonarten och bygger stämmor i ters, kvint och sext som du kan mixa och träna in.{' '}
+              <button
+                onClick={() => setIntroExpanded(false)}
+                className="stamma-btn font-mono-ui text-xs align-middle"
+                style={{ color: '#55D6C0' }}
+              >
+                Visa mindre ▴
+              </button>
+            </p>
+          )}
         </header>
 
         {/* Signature visualization */}
