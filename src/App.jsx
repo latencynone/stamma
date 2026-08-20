@@ -544,12 +544,11 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, fa
 
 const DURATION = 10;
 
-// Discrete stops for the autotune slider — index 0 is always "off" (no
-// render, no correction). The other three are the "tre nivåer" of partial
-// correction strength requested, expressed as the same 0..1 amount
-// buildAutotuneRatioCurve already accepted (see harmonyEngine.js).
+// Strength stops for autotune once it's switched on — the on/off state
+// itself is a separate toggle (autotuneOn), so this is just the "tre
+// nivåer" of partial correction strength, expressed as the same 0..1
+// amount buildAutotuneRatioCurve already accepted (see harmonyEngine.js).
 const AUTOTUNE_LEVELS = [
-  { key: 'off', label: 'Av', amount: 0 },
   { key: 'light', label: 'Lätt', amount: 0.25 },
   { key: 'medium', label: 'Medel', amount: 0.45 },
   { key: 'hard', label: 'Hård', amount: 0.7 },
@@ -592,7 +591,9 @@ export default function App() {
   const [exporting, setExporting] = useState(null);
   const [harmonyRenderingByType, setHarmonyRenderingByType] = useState({});
   const [harmonyRenderErrorsByType, setHarmonyRenderErrorsByType] = useState({});
+  const [autotuneOn, setAutotuneOn] = useState(false);
   const [autotuneLevelIndex, setAutotuneLevelIndex] = useState(0);
+  const [autotuneStrengthExpanded, setAutotuneStrengthExpanded] = useState(false);
   const [autotuneRendering, setAutotuneRendering] = useState(false);
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
   const [micPermission, setMicPermission] = useState('unknown');
@@ -602,7 +603,8 @@ export default function App() {
   const [waveformPeaks, setWaveformPeaks] = useState(null);
   const [fadeIn, setFadeIn] = useState(0);
   const [fadeOut, setFadeOut] = useState(0);
-  const autotuneEnabled = autotuneLevelIndex > 0;
+  const [expandedChannels, setExpandedChannels] = useState({});
+  const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
   const streamRef = useRef(null);
@@ -730,6 +732,12 @@ export default function App() {
     });
   }
 
+  // Volume/pan are collapsed by default per channel — purely a display
+  // toggle, doesn't touch playback.
+  function toggleChannelExpanded(key) {
+    setExpandedChannels((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
   // Renders (or returns the cached render of) a pitch-corrected copy of the
   // recording at the currently selected autotune strength. Cached per
   // level index — switching between lätt/medel/hård keeps each one's
@@ -741,7 +749,7 @@ export default function App() {
     if (!recordedBufferRef.current || !melodyNotes.length || !keyInfo) return null;
     const levelIndex = autotuneLevelIndex;
     const level = AUTOTUNE_LEVELS[levelIndex];
-    if (!level || level.amount === 0) return null;
+    if (!level) return null;
     const cached = autotunedBuffersRef.current[levelIndex];
     if (cached) return cached;
     if (autotuneRenderPromiseRef.current?.levelIndex === levelIndex) {
@@ -821,7 +829,10 @@ export default function App() {
     setChannels(defaultChannels());
     setSoundType('sine');
     setVoiceReady(false);
+    setAutotuneOn(false);
     setAutotuneLevelIndex(0);
+    setAutotuneStrengthExpanded(false);
+    setExpandedChannels({});
     recordedBufferRef.current = null;
     harmonyBuffersRef.current = {};
     harmonyRenderPromisesRef.current = {};
@@ -1621,31 +1632,42 @@ export default function App() {
                         Rättar falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
                       </div>
                     </div>
-                    <span className="font-mono-ui text-xs shrink-0" style={{ color: autotuneEnabled ? '#55D6C0' : '#C7CBDA' }}>
-                      {AUTOTUNE_LEVELS[autotuneLevelIndex].label}
-                    </span>
+                    <ToggleSwitch
+                      checked={autotuneOn}
+                      onChange={() => { setAutotuneOn((v) => !v); if (isPlaying) stopPlayback(); }}
+                      accentColor="#55D6C0"
+                    />
                   </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max={AUTOTUNE_LEVELS.length - 1}
-                    step="1"
-                    value={autotuneLevelIndex}
-                    onChange={(e) => {
-                      setAutotuneLevelIndex(parseInt(e.target.value, 10));
-                      if (isPlaying) stopPlayback();
-                    }}
-                    className="stamma-fader w-full mt-3"
-                    style={{ accentColor: '#55D6C0' }}
-                    aria-label="Autotune-styrka"
-                  />
-                  <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>
-                    {AUTOTUNE_LEVELS.map((lvl, i) => (
-                      <span key={lvl.key} style={i === autotuneLevelIndex ? { color: '#55D6C0', fontWeight: 600 } : undefined}>
-                        {lvl.label}
-                      </span>
-                    ))}
-                  </div>
+                  {autotuneOn && (
+                    <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                      <button
+                        onClick={() => setAutotuneStrengthExpanded((v) => !v)}
+                        className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
+                        style={{ color: '#55D6C0' }}
+                      >
+                        <span>Styrka: {AUTOTUNE_LEVELS[autotuneLevelIndex].label}</span>
+                        <span style={{ display: 'inline-block', transform: autotuneStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                      </button>
+                      {autotuneStrengthExpanded && (
+                        <div className="mt-2.5 grid grid-cols-3 gap-1.5">
+                          {AUTOTUNE_LEVELS.map((lvl, i) => (
+                            <button
+                              key={lvl.key}
+                              onClick={() => { setAutotuneLevelIndex(i); if (isPlaying) stopPlayback(); }}
+                              className="stamma-btn rounded-md py-1.5 text-xs font-medium"
+                              style={{
+                                backgroundColor: autotuneLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
+                                color: autotuneLevelIndex === i ? '#55D6C0' : '#C7CBDA',
+                                border: autotuneLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                              }}
+                            >
+                              {lvl.label}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1688,23 +1710,6 @@ export default function App() {
               )}
 
               <div className="space-y-2">
-                {voiceReady && soundType === 'recording' && (
-                  <MixerChannel
-                    label="Original (rå inspelning)"
-                    accentColor="#F1EDE4"
-                    enabled={channels.original.enabled}
-                    onToggle={() => toggleChannel('original')}
-                    volume={channels.original.volume}
-                    onVolumeChange={(v) => setChannelVolume('original', v)}
-                    pan={channels.original.pan}
-                    onPanChange={(p) => setChannelPan('original', p)}
-                    solo={channels.original.solo}
-                    onToggleSolo={() => toggleChannelSolo('original')}
-                    meterRef={(el) => { meterRefs.current.original = el; }}
-                    previewing={isPlaying && previewingKey === 'original'}
-                    onPreview={() => previewChannel('original')}
-                  />
-                )}
                 <MixerChannel
                   label={soundType === 'recording' ? (autotuneEnabled ? 'Melodi (autotunad)' : 'Melodi (din röst)') : 'Melodi (ren ton)'}
                   accentColor={MELODY_COLOR.line}
@@ -1719,7 +1724,9 @@ export default function App() {
                   meterRef={(el) => { meterRefs.current.melody = el; }}
                   busy={autotuneRendering}
                   previewing={isPlaying && previewingKey === 'melody'}
-                  onPreview={() => previewChannel('melody')}
+                  onPreview={() => (isPlaying && previewingKey === 'melody' ? stopPlayback() : previewChannel('melody'))}
+                  expanded={!!expandedChannels.melody}
+                  onToggleExpanded={() => toggleChannelExpanded('melody')}
                 />
                 {HARMONY_KEYS.map((type) => (
                   <MixerChannel
@@ -1739,7 +1746,9 @@ export default function App() {
                     direction={channels[type].direction}
                     onSetDirection={(d) => setChannelDirection(type, d)}
                     previewing={isPlaying && previewingKey === type}
-                    onPreview={() => previewChannel(type)}
+                    onPreview={() => (isPlaying && previewingKey === type ? stopPlayback() : previewChannel(type))}
+                    expanded={!!expandedChannels[type]}
+                    onToggleExpanded={() => toggleChannelExpanded(type)}
                   />
                 ))}
               </div>
@@ -1863,6 +1872,7 @@ const SOLO_COLOR = '#FFD84D';
 function MixerChannel({
   label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy,
   direction, onSetDirection, solo, onToggleSolo, pan, onPanChange, previewing, onPreview,
+  expanded, onToggleExpanded,
 }) {
   const panLabel = Math.abs(pan) < 0.04 ? 'C' : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
@@ -1895,9 +1905,6 @@ function MixerChannel({
           {label}
           {busy ? <span style={{ color: '#C7CBDA' }}> (bygger …)</span> : null}
         </span>
-        <span className="font-mono-ui text-xs shrink-0" style={{ color: enabled ? accentColor : '#C7CBDA' }}>
-          {Math.round(volume * 100)}%
-        </span>
         <button
           onClick={onPreview}
           disabled={busy}
@@ -1910,20 +1917,20 @@ function MixerChannel({
             border: `1px solid ${previewing ? `${accentColor}66` : 'rgba(241,237,228,0.15)'}`,
             cursor: busy ? 'not-allowed' : 'pointer',
           }}
-          aria-label={previewing ? 'Stoppa förhandslyssning' : 'Spela upp bara den här kanalen'}
-          title="Spela upp bara den här kanalen"
+          aria-label={previewing ? 'Pausa' : 'Spela upp bara den här kanalen'}
+          title={previewing ? 'Pausa' : 'Spela upp bara den här kanalen'}
         >
           {previewing ? <PauseIcon size={12} /> : <PlayIcon size={12} />}
         </button>
       </div>
 
       {direction !== undefined && (
-        <div className="flex gap-1.5 mt-2 ml-[64px]">
+        <div className="flex gap-1 mt-1.5 ml-[64px]">
           {[{ v: -1, label: 'Under' }, { v: 1, label: 'Över' }].map((opt) => (
             <button
               key={opt.v}
               onClick={() => onSetDirection(opt.v)}
-              className="stamma-btn flex-1 rounded-md py-1 text-xs font-medium"
+              className="stamma-btn flex-1 rounded-md py-0.5 text-[11px] font-medium"
               style={{
                 backgroundColor: direction === opt.v ? `${accentColor}26` : 'transparent',
                 color: direction === opt.v ? accentColor : '#C7CBDA',
@@ -1936,37 +1943,53 @@ function MixerChannel({
         </div>
       )}
 
-      <div className="mt-2.5 ml-[64px] h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.08)' }}>
-        <div ref={meterRef} style={{ width: '0%', height: '100%', backgroundColor: accentColor, transition: 'width 60ms linear' }} />
+      <div className="flex items-center gap-2 mt-2.5 ml-[64px]">
+        <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.08)' }}>
+          <div ref={meterRef} style={{ width: '0%', height: '100%', backgroundColor: accentColor, transition: 'width 60ms linear' }} />
+        </div>
+        <button
+          onClick={onToggleExpanded}
+          className="stamma-btn shrink-0 flex items-center gap-1 font-mono-ui text-[11px]"
+          style={{ color: enabled ? accentColor : '#C7CBDA' }}
+          aria-expanded={expanded}
+          aria-label="Visa volym och panorering"
+        >
+          {Math.round(volume * 100)}%
+          <span style={{ display: 'inline-block', transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+        </button>
       </div>
 
-      <input
-        type="range"
-        min="0"
-        max="1"
-        step="0.01"
-        value={volume}
-        onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
-        className="stamma-fader w-full mt-2 ml-0"
-        style={{ accentColor }}
-      />
+      {expanded && (
+        <>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value={volume}
+            onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
+            className="stamma-fader w-full mt-2 ml-0"
+            style={{ accentColor }}
+          />
 
-      <div className="flex items-center gap-2 mt-1.5">
-        <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>L</span>
-        <input
-          type="range"
-          min="-1"
-          max="1"
-          step="0.01"
-          value={pan}
-          onChange={(e) => onPanChange(parseFloat(e.target.value))}
-          className="stamma-fader w-full"
-          style={{ accentColor, height: 3 }}
-          aria-label="Panorering"
-        />
-        <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>R</span>
-        <span className="font-mono-ui text-[10px] shrink-0 w-6 text-right" style={{ color: '#C7CBDA' }}>{panLabel}</span>
-      </div>
+          <div className="flex items-center gap-2 mt-1.5">
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>L</span>
+            <input
+              type="range"
+              min="-1"
+              max="1"
+              step="0.01"
+              value={pan}
+              onChange={(e) => onPanChange(parseFloat(e.target.value))}
+              className="stamma-fader w-full"
+              style={{ accentColor, height: 3 }}
+              aria-label="Panorering"
+            />
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>R</span>
+            <span className="font-mono-ui text-[10px] shrink-0 w-6 text-right" style={{ color: '#C7CBDA' }}>{panLabel}</span>
+          </div>
+        </>
+      )}
     </div>
   );
 }
