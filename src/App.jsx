@@ -299,6 +299,7 @@ export default function App() {
   const rafRef = useRef(null);
   const audioElRef = useRef(null);
   const playCtxRef = useRef(null);
+  const activeSourcesRef = useRef([]);
   const recordedUrlRef = useRef(null);
   const recordedBufferRef = useRef(null);
   const playTimeoutRef = useRef(null);
@@ -690,6 +691,26 @@ export default function App() {
     setErrorMsg('');
   }
 
+  // A single AudioContext, reused for the whole session rather than
+  // created fresh per play/stop cycle. Browsers cap how many contexts a
+  // page may have open — Safari in particular — and creating-then-closing
+  // one on every playback click burns through that budget fast: after
+  // enough plays, new contexts stop producing sound at all (silently, no
+  // error), while the "Original" button kept working because it plays
+  // through a plain <audio> element that never touches the Web Audio API.
+  async function getPlaybackContext() {
+    let ctx = playCtxRef.current;
+    if (!ctx || ctx.state === 'closed') {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+      playCtxRef.current = ctx;
+    }
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    return ctx;
+  }
+
   function stopPlayback() {
     if (playTimeoutRef.current) {
       clearTimeout(playTimeoutRef.current);
@@ -699,10 +720,10 @@ export default function App() {
       cancelAnimationFrame(playheadRafRef.current);
       playheadRafRef.current = null;
     }
-    if (playCtxRef.current) {
-      playCtxRef.current.close().catch(() => {});
-      playCtxRef.current = null;
-    }
+    activeSourcesRef.current.forEach((node) => {
+      try { node.stop(); } catch (e) { /* already stopped/ended */ }
+    });
+    activeSourcesRef.current = [];
     if (audioElRef.current) audioElRef.current.pause();
     setIsPlaying(false);
     setNowPlaying(null);
@@ -817,9 +838,7 @@ export default function App() {
     }
 
     stopPlayback();
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AC();
-    playCtxRef.current = ctx;
+    const ctx = await getPlaybackContext();
     const now = ctx.currentTime + 0.05;
     setIsPlaying(true);
     setNowPlaying(which);
@@ -829,26 +848,28 @@ export default function App() {
       harmonyPlaybackNotes.length ? harmonyPlaybackNotes[harmonyPlaybackNotes.length - 1].end : 0
     );
 
+    const started = [];
     if (soundType === 'recording' && recordedBufferRef.current) {
       totalDur = sourceBuf.duration;
       if (which === 'melody') {
-        playBufferSource(ctx, now, sourceBuf, 0.9);
+        started.push(playBufferSource(ctx, now, sourceBuf, 0.9));
       } else if (which === 'harmony') {
-        playBufferSource(ctx, now, hBuf, 0.9);
+        started.push(playBufferSource(ctx, now, hBuf, 0.9));
       } else if (which === 'both') {
-        playBufferSource(ctx, now, sourceBuf, 0.7);
-        playBufferSource(ctx, now, hBuf, 0.7);
+        started.push(playBufferSource(ctx, now, sourceBuf, 0.7));
+        started.push(playBufferSource(ctx, now, hBuf, 0.7));
       }
     } else {
       if (which === 'melody') {
-        makeVoice(ctx, now, melodyPlaybackNotes, 0.22, soundType);
+        started.push(makeVoice(ctx, now, melodyPlaybackNotes, 0.22, soundType));
       } else if (which === 'harmony') {
-        makeVoice(ctx, now, harmonyPlaybackNotes, 0.22, soundType);
+        started.push(makeVoice(ctx, now, harmonyPlaybackNotes, 0.22, soundType));
       } else if (which === 'both') {
-        makeVoice(ctx, now, melodyPlaybackNotes, 0.16, soundType);
-        makeVoice(ctx, now, harmonyPlaybackNotes, 0.16, soundType);
+        started.push(makeVoice(ctx, now, melodyPlaybackNotes, 0.16, soundType));
+        started.push(makeVoice(ctx, now, harmonyPlaybackNotes, 0.16, soundType));
       }
     }
+    activeSourcesRef.current = started;
 
     playTimeoutRef.current = setTimeout(() => {
       setIsPlaying(false);
