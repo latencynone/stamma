@@ -279,6 +279,153 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTi
   );
 }
 
+/* ---------- Waveform trim view (Original channel) ---------- */
+
+const TRIM_HANDLE_MIN_GAP = 0.15;
+
+// A waveform of the raw recording with two draggable handles marking the
+// [trimStart, trimEnd) window every mixer channel's playback gets clipped
+// to (see startMix). Not zoomable like PitchCanvas — fullscreen here is
+// purely about giving the drag handles more pixels to land precisely on.
+function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, playheadTime }) {
+  const canvasRef = useRef(null);
+  const wrapRef = useRef(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const drawRef = useRef(() => {});
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return;
+
+    const draw = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const width = wrap.clientWidth || 320;
+      const height = wrap.clientHeight || 96;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, width, height);
+
+      const n = peaks.length;
+      const midY = height / 2;
+      const barW = width / n;
+      ctx.fillStyle = 'rgba(241,237,228,0.4)';
+      for (let i = 0; i < n; i++) {
+        const x = (i / n) * width;
+        const h = Math.max(1.5, peaks[i] * (height - 10));
+        ctx.fillRect(x, midY - h / 2, Math.max(1, barW - 0.5), h);
+      }
+
+      const xFor = (t) => (duration > 0 ? (t / duration) * width : 0);
+      ctx.fillStyle = 'rgba(16,19,26,0.72)';
+      if (trimStart > 0) ctx.fillRect(0, 0, xFor(trimStart), height);
+      if (trimEnd < duration) ctx.fillRect(xFor(trimEnd), 0, width - xFor(trimEnd), height);
+
+      if (playheadTime !== null && playheadTime !== undefined) {
+        const x = xFor(Math.min(playheadTime, duration));
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.lineWidth = 2;
+        ctx.shadowColor = 'rgba(255,255,255,0.85)';
+        ctx.shadowBlur = 6;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+    };
+
+    drawRef.current = draw;
+    draw();
+  }, [peaks, duration, trimStart, trimEnd, playheadTime, isFullscreen]);
+
+  // Same reasoning as PitchCanvas's ResizeObserver: the fullscreen overlay's
+  // real size settles a moment after isFullscreen flips, so redraw on
+  // actual layout change rather than trusting the size read at that moment.
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => drawRef.current());
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, []);
+
+  function beginDrag(which) {
+    return (e) => {
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        const rect = wrapRef.current.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+        const t = frac * duration;
+        if (which === 'start') {
+          onTrimChange(Math.min(t, trimEnd - TRIM_HANDLE_MIN_GAP), trimEnd);
+        } else {
+          onTrimChange(trimStart, Math.max(t, trimStart + TRIM_HANDLE_MIN_GAP));
+        }
+      };
+      const up = () => {
+        handle.releasePointerCapture(e.pointerId);
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    };
+  }
+
+  const startPct = duration > 0 ? Math.min(100, (trimStart / duration) * 100) : 0;
+  const endPct = duration > 0 ? Math.min(100, (trimEnd / duration) * 100) : 100;
+
+  const handleStyle = (pct) => ({
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: `calc(${pct}% - 10px)`,
+    width: 20,
+    cursor: 'ew-resize',
+    touchAction: 'none',
+  });
+
+  return (
+    <div className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
+      <div className="flex items-center justify-between mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+        <span>Vågform — beskär start &amp; slut</span>
+        <button
+          onClick={() => setIsFullscreen((v) => !v)}
+          className="stamma-btn px-2.5 py-1 rounded-md"
+          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+        >
+          {isFullscreen ? 'Stäng helskärm' : 'Helskärm'}
+        </button>
+      </div>
+      <div
+        ref={wrapRef}
+        className={isFullscreen ? 'flex-1 relative rounded-xl' : 'relative w-full h-24 rounded-xl'}
+      >
+        <canvas ref={canvasRef} className="block rounded-xl absolute inset-0" />
+        <div onPointerDown={beginDrag('start')} style={handleStyle(startPct)}>
+          <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: '#55D6C0' }} />
+          <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: '#55D6C0' }} />
+        </div>
+        <div onPointerDown={beginDrag('end')} style={handleStyle(endPct)}>
+          <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: '#FB7185' }} />
+          <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: '#FB7185' }} />
+        </div>
+      </div>
+      <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>
+        <span style={{ color: '#55D6C0' }}>{trimStart.toFixed(1)}s</span>
+        <span>{(trimEnd - trimStart).toFixed(1)}s vald</span>
+        <span style={{ color: '#FB7185' }}>{trimEnd.toFixed(1)}s</span>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- Main app ---------- */
 
 const DURATION = 10;
@@ -335,7 +482,12 @@ export default function App() {
   const [autotuneRendering, setAutotuneRendering] = useState(false);
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
   const [micPermission, setMicPermission] = useState('unknown');
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(null); // null = full recordingDuration
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  const [waveformPeaks, setWaveformPeaks] = useState(null);
   const autotuneEnabled = autotuneLevelIndex > 0;
+  const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -358,6 +510,14 @@ export default function App() {
   const autotunedBuffersRef = useRef({}); // keyed by autotuneLevelIndex
   const autotuneRenderPromiseRef = useRef(null);
   const fileInputRef = useRef(null);
+  const loopEnabledRef = useRef(false);
+
+  // Read inside the playback-end setTimeout, which was scheduled back when
+  // it fired — using state directly there would capture whatever loopEnabled
+  // was at schedule time, missing a toggle flipped mid-playback.
+  useEffect(() => {
+    loopEnabledRef.current = loopEnabled;
+  }, [loopEnabled]);
 
   // The browser remembers a granted/denied microphone permission on its own
   // (that's an origin-level browser decision, not something a site can
@@ -553,7 +713,31 @@ export default function App() {
     setHarmonyRenderErrorsByType({});
     autotunedBuffersRef.current = {};
     setAutotuneRenderError('');
+    setTrimStart(0);
+    setTrimEnd(null);
+    setLoopEnabled(false);
+    setWaveformPeaks(null);
     stopPlayback();
+  }
+
+  // Downsamples a recording into per-column peak amplitudes for the
+  // waveform view — computed once per recording rather than redrawing
+  // straight from raw sample data on every render/drag.
+  function computeWaveformPeaks(buffer, numPeaks = 400) {
+    const data = buffer.getChannelData(0);
+    const blockSize = Math.max(1, Math.floor(data.length / numPeaks));
+    const peaks = new Float32Array(numPeaks);
+    for (let i = 0; i < numPeaks; i++) {
+      const start = i * blockSize;
+      const end = Math.min(data.length, start + blockSize);
+      let max = 0;
+      for (let j = start; j < end; j++) {
+        const v = Math.abs(data[j]);
+        if (v > max) max = v;
+      }
+      peaks[i] = max;
+    }
+    return peaks;
   }
 
   async function startRecording() {
@@ -658,6 +842,7 @@ export default function App() {
           const audioBuffer = await decodeCtx.decodeAudioData(arrayBuf);
           recordedBufferRef.current = audioBuffer;
           setVoiceReady(true);
+          setWaveformPeaks(computeWaveformPeaks(audioBuffer));
         } catch (e) {
           recordedBufferRef.current = null;
           setVoiceReady(false);
@@ -773,6 +958,7 @@ export default function App() {
       recordedBufferRef.current = buffer;
       setVoiceReady(true);
       setRecordingDuration(Math.max(0.3, buffer.duration));
+      setWaveformPeaks(computeWaveformPeaks(buffer));
 
       const frames = extractFramesFromBuffer(buffer.getChannelData(0), buffer.sampleRate);
       const result = analyzeFrames(frames);
@@ -853,7 +1039,12 @@ export default function App() {
   // real recording buffer or a synthesized voice) ends up there instead of
   // going straight to the speakers, so the channel's fader and meter apply
   // no matter what kind of source it is.
-  function makeVoice(ctx, outputNode, now, notesArr, voiceSoundType) {
+  // `rangeStart`/`rangeEnd` clip playback to a [start, end) window on the
+  // notes' own timeline (seconds) — the trim range — with every scheduled
+  // time shifted so the window's start lands at `now`. Notes entirely
+  // outside the window are skipped; ones straddling an edge are clipped to
+  // it rather than dropped, same as the waveform view's own trim overlay.
+  function makeVoice(ctx, outputNode, now, notesArr, voiceSoundType, rangeStart = 0, rangeEnd = Infinity) {
     const osc = ctx.createOscillator();
     osc.type = voiceSoundType === 'voice' ? 'sawtooth' : 'sine';
     const envGain = ctx.createGain();
@@ -861,10 +1052,14 @@ export default function App() {
     const outNode = voiceSoundType === 'voice' ? createFormantSum(ctx, osc) : osc;
     outNode.connect(envGain).connect(outputNode);
     osc.start(now);
+    let lastEnd = 0;
     notesArr.forEach((n) => {
+      const clippedStart = Math.max(n.start, rangeStart);
+      const clippedEnd = Math.min(n.end, rangeEnd);
+      if (clippedEnd <= clippedStart) return;
       const freq = midiToFreq(n.midi);
-      const start = now + n.start;
-      const end = Math.max(start + 0.05, now + n.end);
+      const start = now + (clippedStart - rangeStart);
+      const end = Math.max(start + 0.05, now + (clippedEnd - rangeStart));
       const attack = 0.02;
       const release = Math.min(0.06, (end - start) / 3);
       osc.frequency.setValueAtTime(freq, start);
@@ -872,17 +1067,21 @@ export default function App() {
       envGain.gain.linearRampToValueAtTime(1, start + attack);
       envGain.gain.setValueAtTime(1, Math.max(start + attack, end - release));
       envGain.gain.linearRampToValueAtTime(0, end);
+      lastEnd = Math.max(lastEnd, end - now);
     });
-    const lastEnd = notesArr.length ? notesArr[notesArr.length - 1].end : 0;
     osc.stop(now + lastEnd + 0.3);
     return osc;
   }
 
-  function playBufferSource(ctx, outputNode, now, buffer) {
+  function playBufferSource(ctx, outputNode, now, buffer, offset = 0, duration = null) {
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(outputNode);
-    src.start(now);
+    if (duration !== null) {
+      src.start(now, offset, duration);
+    } else {
+      src.start(now, offset);
+    }
     return src;
   }
 
@@ -973,7 +1172,9 @@ export default function App() {
   // Node creation + actually starting a channel is kept synchronous and
   // separate from resolving its content (which can involve an offline
   // render taking a couple hundred ms) — see startMix for why.
-  function startMixChannelWithContent(ctx, key, now, channelState, content) {
+  // `rangeStart`/`rangeEnd` are the trim window (seconds, on the
+  // recording's own timeline) that playback should be clipped to.
+  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd) {
     const gainNode = ctx.createGain();
     gainNode.gain.value = channelState.volume;
     const analyserNode = ctx.createAnalyser();
@@ -986,22 +1187,18 @@ export default function App() {
     gainNode.connect(pannerNode);
     pannerNode.connect(ctx.destination);
 
-    const sourceNode = content.kind === 'buffer'
-      ? playBufferSource(ctx, gainNode, now, content.buffer)
-      : makeVoice(ctx, gainNode, now, content.notes, soundType);
+    let sourceNode;
+    if (content.kind === 'buffer') {
+      const buf = content.buffer;
+      const offset = Math.max(0, Math.min(rangeStart, buf.duration));
+      const duration = Math.max(0, Math.min(rangeEnd, buf.duration) - offset);
+      sourceNode = playBufferSource(ctx, gainNode, now, buf, offset, duration);
+    } else {
+      sourceNode = makeVoice(ctx, gainNode, now, content.notes, soundType, rangeStart, rangeEnd);
+    }
 
     mixNodesRef.current[key] = { gainNode, analyserNode, pannerNode, sourceNode };
     return sourceNode;
-  }
-
-  function computeMixTotalDuration() {
-    if (soundType === 'recording' && recordedBufferRef.current) return recordedBufferRef.current.duration;
-    let maxEnd = melodyPlaybackNotes.length ? melodyPlaybackNotes[melodyPlaybackNotes.length - 1].end : 0;
-    HARMONY_KEYS.forEach((type) => {
-      const notes = harmonyPlaybackNotesFor(type);
-      if (notes.length) maxEnd = Math.max(maxEnd, notes[notes.length - 1].end);
-    });
-    return maxEnd + 0.4;
   }
 
   function updateMeters() {
@@ -1048,21 +1245,33 @@ export default function App() {
     const usable = resolved.filter((r) => r.content);
     if (!usable.length) return;
 
+    // The trim window (waveform handles) clips every channel's playback to
+    // the same [rangeStart, rangeEnd) span on the recording's timeline.
+    const rangeStart = Math.max(0, Math.min(trimStart, recordingDuration));
+    const rangeEnd = Math.max(rangeStart + 0.05, Math.min(effectiveTrimEnd, recordingDuration));
+
     const now = ctx.currentTime + 0.05;
-    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content));
+    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd));
 
     activeSourcesRef.current = started;
     setIsPlaying(true);
     setPreviewingKey(keysOverride && keysOverride.length === 1 ? keysOverride[0] : null);
 
-    const totalDur = computeMixTotalDuration();
+    const totalDur = rangeEnd - rangeStart;
     playTimeoutRef.current = setTimeout(() => {
-      stopPlayback();
+      // Read via a ref, not the `loopEnabled` closed over at schedule time —
+      // this timeout was set up to (totalDur + 0.4)s ago, and a toggle
+      // flipped since then would otherwise be missed.
+      if (loopEnabledRef.current) {
+        startMix(channelsState, keysOverride);
+      } else {
+        stopPlayback();
+      }
     }, (totalDur + 0.4) * 1000);
 
     const tickPlayhead = () => {
       const elapsed = ctx.currentTime - now;
-      setPlayheadTime(Math.max(0, elapsed));
+      setPlayheadTime(Math.max(0, rangeStart + elapsed));
       updateMeters();
       if (elapsed < totalDur + 0.1) {
         playheadRafRef.current = requestAnimationFrame(tickPlayhead);
@@ -1307,6 +1516,23 @@ export default function App() {
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
               </p>
 
+              {voiceReady && soundType === 'recording' && waveformPeaks && (
+                <div className="mb-3 rounded-2xl p-3" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
+                  <WaveformTrimmer
+                    peaks={waveformPeaks}
+                    duration={recordingDuration}
+                    trimStart={trimStart}
+                    trimEnd={effectiveTrimEnd}
+                    onTrimChange={(start, end) => {
+                      setTrimStart(start);
+                      setTrimEnd(end);
+                      if (isPlaying) stopPlayback();
+                    }}
+                    playheadTime={isPlaying ? playheadTime : null}
+                  />
+                </div>
+              )}
+
               <div className="space-y-2">
                 {voiceReady && soundType === 'recording' && (
                   <MixerChannel
@@ -1364,19 +1590,37 @@ export default function App() {
                 ))}
               </div>
 
-              <button
-                onClick={() => (isPlaying ? stopPlayback() : startMix(channels))}
-                disabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
-                className="stamma-btn w-full mt-4 rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98] flex items-center justify-center gap-2"
-                style={{
-                  backgroundColor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.06)' : '#FFB454',
-                  color: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.3)' : '#10131A',
-                  cursor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'not-allowed' : 'pointer',
-                }}
-              >
-                {isPlaying ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
-                {isPlaying ? 'Stoppa mixen' : (anyHarmonyBusy || autotuneRendering) ? 'Bygger …' : 'Spela mixen'}
-              </button>
+              <div className="flex items-center gap-2 mt-4">
+                <button
+                  onClick={() => setLoopEnabled((v) => !v)}
+                  className="stamma-btn shrink-0 rounded-2xl flex items-center justify-center"
+                  style={{
+                    width: 52,
+                    height: 52,
+                    backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                    color: loopEnabled ? '#55D6C0' : '#C7CBDA',
+                    border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                  }}
+                  aria-pressed={loopEnabled}
+                  aria-label="Loopa uppspelning"
+                  title="Loopa uppspelning"
+                >
+                  <LoopIcon size={22} />
+                </button>
+                <button
+                  onClick={() => (isPlaying ? stopPlayback() : startMix(channels))}
+                  disabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
+                  className="stamma-btn flex-1 rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98] flex items-center justify-center gap-2"
+                  style={{
+                    backgroundColor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.06)' : '#FFB454',
+                    color: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.3)' : '#10131A',
+                    cursor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {isPlaying ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
+                  {isPlaying ? 'Stoppa mixen' : (anyHarmonyBusy || autotuneRendering) ? 'Bygger …' : 'Spela mixen'}
+                </button>
+              </div>
             </div>
 
             <div>
@@ -1596,6 +1840,17 @@ function PauseIcon({ size = 20 }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
       <rect x="6" y="4.5" width="4.2" height="15" rx="1.2" />
       <rect x="13.8" y="4.5" width="4.2" height="15" rx="1.2" />
+    </svg>
+  );
+}
+
+function LoopIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 12a8 8 0 0 1 8-8h6" />
+      <path d="M15 1l3 3-3 3" />
+      <path d="M20 12a8 8 0 0 1-8 8H6" />
+      <path d="M9 23l-3-3 3-3" />
     </svg>
   );
 }
