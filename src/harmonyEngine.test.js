@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderHarmonyOffline } from './harmonyEngine.js';
+import { renderHarmonyOffline, renderAutotunedMelody } from './harmonyEngine.js';
 import { midiToFreq, scaleStepToMidi, HARMONY_TYPES } from './musicTheory.js';
 import { autoCorrelate } from './pitchAnalysis.js';
 import { synthesizeVoice, toAudioBuffer, rmsOf, maxSampleDelta, dropoutFraction } from './testUtils.js';
@@ -143,5 +143,59 @@ describe('renderHarmonyOffline — tonhöjdsnoggrannhet', () => {
       const errPct = (100 * Math.abs(freq - expectedFreq)) / expectedFreq;
       expect(errPct).toBeLessThan(1);
     });
+  });
+});
+
+describe('renderAutotunedMelody — lätt tonhöjdskorrigering', () => {
+  const keyInfo = { tonic: 0, mode: 'major' };
+
+  it('flyttar en falsk ton delvis mot måltonen, inte hela eller ingen väg', async () => {
+    const targetFreq = midiToFreq(scaleStepToMidi(0, keyInfo.tonic, keyInfo.mode)); // C4
+    const sungFreq = targetFreq * Math.pow(2, 60 / 1200); // 60 cents sharp — audibly off-key
+    const melodyNotes = [{ step: 0, start: 0.3, end: 1.3, measuredFreq: sungFreq }];
+    const synthNotes = [{ step: 0, start: 0.3, end: 1.3, freq: sungFreq }];
+    const totalDur = 1.8;
+    const amount = 0.4;
+
+    const raw = synthesizeVoice(synthNotes, totalDur, SR);
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const setupCtx = new OfflineCtx(1, raw.length, SR);
+    const recordedBuffer = toAudioBuffer(setupCtx, raw, SR);
+
+    const outBuffer = await renderAutotunedMelody(recordedBuffer, melodyNotes, keyInfo, amount);
+    const outData = outBuffer.getChannelData(0);
+
+    const winLen = 2048;
+    const centerSample = Math.round(0.8 * SR);
+    const { freq } = autoCorrelate(outData.slice(centerSample - winLen / 2, centerSample + winLen / 2), SR);
+    expect(freq).toBeGreaterThan(0);
+
+    const expectedFreq = sungFreq * (1 + (targetFreq / sungFreq - 1) * amount);
+    const errPct = (100 * Math.abs(freq - expectedFreq)) / expectedFreq;
+    expect(errPct).toBeLessThan(1);
+
+    // Sanity: partial correction lands strictly between the sung and target pitch.
+    expect(freq).toBeGreaterThan(Math.min(sungFreq, targetFreq));
+    expect(freq).toBeLessThan(Math.max(sungFreq, targetFreq));
+  });
+
+  it('lämnar en redan korrekt ton praktiskt taget oförändrad', async () => {
+    const targetFreq = midiToFreq(scaleStepToMidi(4, keyInfo.tonic, keyInfo.mode));
+    const melodyNotes = [{ step: 4, start: 0.3, end: 1.3, measuredFreq: targetFreq }];
+    const synthNotes = [{ step: 4, start: 0.3, end: 1.3, freq: targetFreq }];
+    const totalDur = 1.8;
+
+    const raw = synthesizeVoice(synthNotes, totalDur, SR);
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const setupCtx = new OfflineCtx(1, raw.length, SR);
+    const recordedBuffer = toAudioBuffer(setupCtx, raw, SR);
+
+    const outBuffer = await renderAutotunedMelody(recordedBuffer, melodyNotes, keyInfo);
+    const outData = outBuffer.getChannelData(0);
+    const winLen = 2048;
+    const centerSample = Math.round(0.8 * SR);
+    const { freq } = autoCorrelate(outData.slice(centerSample - winLen / 2, centerSample + winLen / 2), SR);
+    const errPct = (100 * Math.abs(freq - targetFreq)) / targetFreq;
+    expect(errPct).toBeLessThan(1);
   });
 });

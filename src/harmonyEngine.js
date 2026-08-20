@@ -26,6 +26,10 @@ const ENERGY_VOICED_FRACTION = 0.15;
 // How far back from a note's detected start to look for where its audible
 // onset actually began, when ramping in from a real pause.
 const ONSET_LOOKBACK_SEC = 0.2;
+// Default strength of the autotune correction: how far to nudge a note from
+// its actual sung pitch toward its quantized target. 1.0 would be a full,
+// robotic hard-snap; this is deliberately partial so it still sounds sung.
+const DEFAULT_AUTOTUNE_AMOUNT = 0.4;
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -85,30 +89,26 @@ function findOnsetTime(envelope, beforeT, maxLookback = ONSET_LOOKBACK_SEC) {
 }
 
 // Builds a continuous ratio(t) curve, expressed as keyframes {t, ratio},
-// covering the whole recording. Inside each melody note the ratio is held
-// constant (harmonyFreq/melodyFreq for that note); short gaps between notes
-// are eased directly from one note's ratio to the next; real pauses ease
-// down to ratio=1 (no shift) and back up, so there is never an instant jump
-// anywhere in the curve.
+// covering the whole recording, from a list of already-decided per-note
+// targets ({start, end, ratio}). Inside each note the ratio is held constant;
+// short gaps between notes are eased directly from one note's ratio to the
+// next; real pauses ease down to ratio=1 (no shift) and back up, so there is
+// never an instant jump anywhere in the curve. This is deliberately agnostic
+// to *why* a note has the ratio it does — the harmony engine derives it from
+// a target interval, the autotune engine derives it from a correction amount,
+// and both get the same gap/pause/onset handling for free.
 //
-// An earlier version of this function instead followed the singer's raw
+// An earlier version of the harmony curve instead followed the singer's raw
 // measured pitch within each note (to carry vibrato through more literally),
 // using the note's quantized ratio only as a fallback/clamp. Measured on a
-// real recording, that made the output *more* jittery than this flat-ratio
-// version, not less: our ~35ms/2048-sample autocorrelation pitch tracker has
+// real recording, that made the output *more* jittery than a flat-per-note
+// ratio, not less: our ~35ms/2048-sample autocorrelation pitch tracker has
 // enough frame-to-frame estimation noise on its own that feeding it straight
-// into the shift ratio injected audible roughness the flat-per-note ratio
-// doesn't have — pitch-shifting the real audio by a constant factor already
-// carries the singer's actual vibrato through mechanically, without needing
-// per-frame tracking accuracy we don't have at this window size.
-export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope = []) {
-  const segments = melodyNotes.map((mn, i) => {
-    const hn = harmonyNotes[i];
-    const melodyFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
-    const harmonyFreq = midiToFreq(scaleStepToMidi(hn.hStep, keyInfo.tonic, keyInfo.mode));
-    return { start: mn.start, end: mn.end, ratio: harmonyFreq / melodyFreq };
-  });
-
+// into the shift ratio injected audible roughness the flat ratio doesn't have
+// — pitch-shifting the real audio by a constant factor already carries the
+// singer's actual vibrato through mechanically, without needing per-frame
+// tracking accuracy we don't have at this window size.
+export function buildRatioCurveFromSegments(segments, totalDuration, energyEnvelope = []) {
   const keyframes = [{ t: 0, ratio: 1 }];
   const pushRamp = (fromT, toT, fromRatio, toRatio) => {
     const dur = toT - fromT;
@@ -155,7 +155,7 @@ export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuratio
     // The singer is still audibly going after the last note we could pin
     // down — hold the last known-good ratio through to the end rather than
     // fading to "no shift", which would otherwise play back a chunk of the
-    // original, un-harmonized voice.
+    // original, uncorrected voice.
     keyframes.push({ t: totalDuration, ratio: cursorRatio });
   }
 
@@ -171,24 +171,43 @@ export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuratio
   return cleaned;
 }
 
-// Renders the harmony as a full-length AudioBuffer by feeding the entire
-// original recording plus the continuous ratio(t) curve into Signalsmith
-// Stretch in one offline pass. There is only ever one, continuous signal
-// path — no per-note clipping, crossfading, or loudness patching, because
-// there are no block boundaries for artifacts to hide at.
-export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyNotes, keyInfo) {
+// Per-note targets for the harmony engine: a fixed interval (harmonyNotes'
+// hStep) above/below each melody note's own quantized pitch.
+export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope = []) {
+  const segments = melodyNotes.map((mn, i) => {
+    const hn = harmonyNotes[i];
+    const melodyFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
+    const harmonyFreq = midiToFreq(scaleStepToMidi(hn.hStep, keyInfo.tonic, keyInfo.mode));
+    return { start: mn.start, end: mn.end, ratio: harmonyFreq / melodyFreq };
+  });
+  return buildRatioCurveFromSegments(segments, totalDuration, energyEnvelope);
+}
+
+// Per-note targets for the autotune engine: nudge each note's *actual* sung
+// pitch (measuredFreq) a fraction of the way toward its quantized target,
+// rather than following the target itself — a full snap-to-grid would sound
+// robotic, and a note whose measured pitch is missing (too little usable
+// frame data) is left alone rather than guessed at.
+export function buildAutotuneRatioCurve(melodyNotes, keyInfo, totalDuration, energyEnvelope = [], amount = DEFAULT_AUTOTUNE_AMOUNT) {
+  const segments = melodyNotes.map((mn) => {
+    const targetFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
+    const sourceFreq = mn.measuredFreq || targetFreq;
+    const fullRatio = targetFreq / sourceFreq;
+    const ratio = 1 + (fullRatio - 1) * amount;
+    return { start: mn.start, end: mn.end, ratio };
+  });
+  return buildRatioCurveFromSegments(segments, totalDuration, energyEnvelope);
+}
+
+// Feeds a recording plus a precomputed ratio(t) curve through Signalsmith
+// Stretch in one continuous offline pass — no per-note clipping,
+// crossfading, or loudness patching, because there are no block boundaries
+// for artifacts to hide at. Used by both the harmony and autotune engines.
+async function renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHz) {
   const sr = recordedBuffer.sampleRate;
   const channels = recordedBuffer.numberOfChannels;
   const totalLen = recordedBuffer.length;
   const totalDuration = totalLen / sr;
-
-  const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), sr);
-  const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope);
-
-  // Rough singer fundamental, used by the library to analyse/compensate
-  // formants so larger intervals don't get a "chipmunk" timbre.
-  const melodyFreqs = melodyNotes.map((n) => midiToFreq(scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode)));
-  const formantBaseHz = melodyFreqs.length ? median(melodyFreqs) : 200;
 
   const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   const offlineCtx = new OfflineCtx(channels, totalLen, sr);
@@ -226,7 +245,7 @@ export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyN
     formantBaseHz,
   });
 
-  // schedule() prunes its own history up to the timestamp of the call
+  // schedule() prunes its own history up to the timestamp of the call —
   // it's built for issuing changes as playback approaches them live, not
   // for front-loading a whole automation curve at once (an early call gets
   // wiped out the instant a later one is scheduled). So each keyframe after
@@ -243,4 +262,27 @@ export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyN
   });
 
   return offlineCtx.startRendering();
+}
+
+function formantBaseHzFor(melodyNotes, keyInfo) {
+  const melodyFreqs = melodyNotes.map((n) => midiToFreq(scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode)));
+  return melodyFreqs.length ? median(melodyFreqs) : 200;
+}
+
+// Renders the harmony as a full-length AudioBuffer: the original recording,
+// continuously pitch-shifted to a fixed interval above/below the melody.
+export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyNotes, keyInfo) {
+  const totalDuration = recordedBuffer.length / recordedBuffer.sampleRate;
+  const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), recordedBuffer.sampleRate);
+  const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope);
+  return renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo));
+}
+
+// Renders a lightly pitch-corrected copy of the recording itself: each note
+// nudged part-way from its actual sung pitch toward its quantized target.
+export async function renderAutotunedMelody(recordedBuffer, melodyNotes, keyInfo, amount = DEFAULT_AUTOTUNE_AMOUNT) {
+  const totalDuration = recordedBuffer.length / recordedBuffer.sampleRate;
+  const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), recordedBuffer.sampleRate);
+  const keyframes = buildAutotuneRatioCurve(melodyNotes, keyInfo, totalDuration, energyEnvelope, amount);
+  return renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo));
 }

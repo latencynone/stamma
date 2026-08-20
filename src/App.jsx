@@ -16,8 +16,10 @@ import {
   framesToNotes,
   filterTransientArtifacts,
   filterOutlierNotes,
+  attachMeasuredFreq,
+  extractFramesFromBuffer,
 } from './pitchAnalysis.js';
-import { renderHarmonyOffline } from './harmonyEngine.js';
+import { renderHarmonyOffline, renderAutotunedMelody } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 
 /* ---------- Formant "voice" synthesis ---------- */
@@ -51,123 +53,215 @@ function createFormantSum(ctx, source) {
 
 function PitchCanvas({ melodyNotes, harmonyNotes, keyInfo, duration, playheadTime }) {
   const canvasRef = useRef(null);
+  const scrollWrapRef = useRef(null);
+  const outerRef = useRef(null);
+  const [zoom, setZoom] = useState(1);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // The fullscreen view is driven by our own state (a CSS overlay), not the
+  // browser's Fullscreen API — that API is unavailable in a lot of contexts
+  // that matter here (in-app browsers, restrictive permissions-policy
+  // embeds), where it just rejects. We still request it when possible, for
+  // the extra benefit of hiding the browser chrome too, but the visual
+  // "fullscreen" result never depends on it succeeding.
+  useEffect(() => {
+    const handler = () => {
+      if (!document.fullscreenElement) setIsFullscreen(false);
+    };
+    document.addEventListener('fullscreenchange', handler);
+    return () => document.removeEventListener('fullscreenchange', handler);
+  }, []);
+
+  function toggleFullscreen() {
+    if (isFullscreen) {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      setIsFullscreen(false);
+      return;
+    }
+    setZoom(1);
+    setIsFullscreen(true);
+    if (outerRef.current?.requestFullscreen) {
+      outerRef.current.requestFullscreen().catch(() => {});
+    }
+  }
+
+  const drawRef = useRef(() => {});
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth || 320;
-    const height = canvas.clientHeight || 160;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, width, height);
+    const scrollWrap = scrollWrapRef.current;
+    if (!canvas || !scrollWrap) return;
 
-    ctx.strokeStyle = 'rgba(241,237,228,0.06)';
-    ctx.lineWidth = 1;
-    for (let i = 1; i < duration; i++) {
-      const x = (i / duration) * width;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.stroke();
-    }
+    const draw = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const viewportWidth = scrollWrap.clientWidth || 320;
+      const width = viewportWidth * zoom;
+      const height = scrollWrap.clientHeight || 192;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, width, height);
 
-    if (!melodyNotes || melodyNotes.length === 0 || !keyInfo) {
-      ctx.fillStyle = 'rgba(241,237,228,0.55)';
-      ctx.font = '14px "Space Grotesk", sans-serif';
-      ctx.fillText('Din tonhöjdskurva ritas upp här efter inspelning', 14, height / 2);
-      return;
-    }
-
-    const melodyMidis = melodyNotes.map((n) => scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode));
-    const harmonyMidis = harmonyNotes && harmonyNotes.length
-      ? harmonyNotes.map((n) => scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode))
-      : [];
-    const all = melodyMidis.concat(harmonyMidis);
-    const minMidi = Math.min(...all) - 2;
-    const maxMidi = Math.max(...all) + 2;
-    const topPad = 20;
-    const bottomPad = 20;
-    const usableHeight = Math.max(1, height - topPad - bottomPad);
-    const yFor = (midi) => topPad + usableHeight - ((midi - minMidi) / (maxMidi - minMidi)) * usableHeight;
-    const xFor = (t) => (t / duration) * width;
-
-    const drawLine = (notes, midis, color, glow, labelDy) => {
-      ctx.lineCap = 'round';
-      notes.forEach((n, i) => {
-        const y = yFor(midis[i]);
+      ctx.strokeStyle = 'rgba(241,237,228,0.06)';
+      ctx.lineWidth = 1;
+      for (let i = 1; i < duration; i++) {
+        const x = (i / duration) * width;
         ctx.beginPath();
-        ctx.moveTo(xFor(n.start), y);
-        ctx.lineTo(xFor(Math.max(n.end, n.start + 0.04)), y);
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 4;
-        ctx.shadowColor = glow;
-        ctx.shadowBlur = 8;
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
         ctx.stroke();
-      });
-      ctx.shadowBlur = 0;
+      }
 
-      // Note-name labels, centered above (melody) or below (harmony) each
-      // segment. Skip a label only if it would actually overlap the
-      // previous one (measured, not a fixed width guess) so short notes
-      // still get labeled whenever there's room.
-      ctx.font = '600 9.5px "JetBrains Mono", monospace';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = color;
-      let lastLabelRight = -Infinity;
-      notes.forEach((n, i) => {
-        const segStart = xFor(n.start);
-        const segEnd = xFor(Math.max(n.end, n.start + 0.04));
-        const cx = (segStart + segEnd) / 2;
-        const label = midiToNoteName(midis[i]);
-        const labelWidth = ctx.measureText(label).width;
-        const labelLeft = cx - labelWidth / 2 - 2;
-        if (labelLeft < lastLabelRight) return; // would overlap the previous label
-        const cy = yFor(midis[i]) + labelDy;
-        ctx.fillText(label, cx, cy);
-        lastLabelRight = cx + labelWidth / 2 + 2;
-      });
+      if (!melodyNotes || melodyNotes.length === 0 || !keyInfo) {
+        ctx.fillStyle = 'rgba(241,237,228,0.55)';
+        ctx.font = '14px "Space Grotesk", sans-serif';
+        ctx.fillText('Din tonhöjdskurva ritas upp här efter inspelning', 14, height / 2);
+        return;
+      }
+
+      const melodyMidis = melodyNotes.map((n) => scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode));
+      const harmonyMidis = harmonyNotes && harmonyNotes.length
+        ? harmonyNotes.map((n) => scaleStepToMidi(n.hStep, keyInfo.tonic, keyInfo.mode))
+        : [];
+      const all = melodyMidis.concat(harmonyMidis);
+      const minMidi = Math.min(...all) - 2;
+      const maxMidi = Math.max(...all) + 2;
+      const topPad = 20;
+      const bottomPad = 20;
+      const usableHeight = Math.max(1, height - topPad - bottomPad);
+      const yFor = (midi) => topPad + usableHeight - ((midi - minMidi) / (maxMidi - minMidi)) * usableHeight;
+      const xFor = (t) => (t / duration) * width;
+
+      const drawLine = (notes, midis, color, glow, labelDy) => {
+        ctx.lineCap = 'round';
+        notes.forEach((n, i) => {
+          const y = yFor(midis[i]);
+          ctx.beginPath();
+          ctx.moveTo(xFor(n.start), y);
+          ctx.lineTo(xFor(Math.max(n.end, n.start + 0.04)), y);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 4;
+          ctx.shadowColor = glow;
+          ctx.shadowBlur = 8;
+          ctx.stroke();
+        });
+        ctx.shadowBlur = 0;
+
+        // Note-name labels, centered above (melody) or below (harmony) each
+        // segment. Skip a label only if it would actually overlap the
+        // previous one (measured, not a fixed width guess) so short notes
+        // still get labeled whenever there's room.
+        ctx.font = '600 9.5px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = color;
+        let lastLabelRight = -Infinity;
+        notes.forEach((n, i) => {
+          const segStart = xFor(n.start);
+          const segEnd = xFor(Math.max(n.end, n.start + 0.04));
+          const cx = (segStart + segEnd) / 2;
+          const label = midiToNoteName(midis[i]);
+          const labelWidth = ctx.measureText(label).width;
+          const labelLeft = cx - labelWidth / 2 - 2;
+          if (labelLeft < lastLabelRight) return; // would overlap the previous label
+          const cy = yFor(midis[i]) + labelDy;
+          ctx.fillText(label, cx, cy);
+          lastLabelRight = cx + labelWidth / 2 + 2;
+        });
+      };
+
+      drawLine(melodyNotes, melodyMidis, '#FFB454', 'rgba(255,180,84,0.65)', -10);
+      if (harmonyNotes && harmonyNotes.length) {
+        drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)', 17);
+      }
+
+      if (playheadTime !== null && playheadTime !== undefined) {
+        const x = xFor(Math.min(playheadTime, duration));
+        // Wide soft highlight band so the position reads at a glance, not
+        // just a thin line that can get lost among the note colors.
+        const bandGrad = ctx.createLinearGradient(x - 10, 0, x + 10, 0);
+        bandGrad.addColorStop(0, 'rgba(241,237,228,0)');
+        bandGrad.addColorStop(0.5, 'rgba(241,237,228,0.16)');
+        bandGrad.addColorStop(1, 'rgba(241,237,228,0)');
+        ctx.fillStyle = bandGrad;
+        ctx.fillRect(x - 10, 0, 20, height);
+
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = 'rgba(255,255,255,0.85)';
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        ctx.beginPath();
+        ctx.moveTo(x - 5, 0);
+        ctx.lineTo(x + 5, 0);
+        ctx.lineTo(x, 8);
+        ctx.closePath();
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fill();
+      }
     };
 
-    drawLine(melodyNotes, melodyMidis, '#FFB454', 'rgba(255,180,84,0.65)', -10);
-    if (harmonyNotes && harmonyNotes.length) {
-      drawLine(harmonyNotes, harmonyMidis, '#55D6C0', 'rgba(85,214,192,0.65)', 17);
-    }
+    drawRef.current = draw;
+    draw();
+  }, [melodyNotes, harmonyNotes, keyInfo, duration, playheadTime, zoom, isFullscreen]);
 
-    if (playheadTime !== null && playheadTime !== undefined) {
-      const x = xFor(Math.min(playheadTime, duration));
-      // Wide soft highlight band so the position reads at a glance, not
-      // just a thin line that can get lost among the note colors.
-      const bandGrad = ctx.createLinearGradient(x - 10, 0, x + 10, 0);
-      bandGrad.addColorStop(0, 'rgba(241,237,228,0)');
-      bandGrad.addColorStop(0.5, 'rgba(241,237,228,0.16)');
-      bandGrad.addColorStop(1, 'rgba(241,237,228,0)');
-      ctx.fillStyle = bandGrad;
-      ctx.fillRect(x - 10, 0, 20, height);
+  // A layout change can arrive later than the props/state change that
+  // triggered it — most notably entering the CSS-driven fullscreen overlay
+  // above, where the wrapper's real size settles a moment after the
+  // isFullscreen state flips. Re-measuring and redrawing on any actual size
+  // change (rather than trusting the size read at the moment of the state
+  // change) avoids ending up with a canvas sized for a stale layout.
+  useEffect(() => {
+    const scrollWrap = scrollWrapRef.current;
+    if (!scrollWrap || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => drawRef.current());
+    ro.observe(scrollWrap);
+    return () => ro.disconnect();
+  }, []);
 
-      ctx.strokeStyle = '#FFFFFF';
-      ctx.lineWidth = 2.5;
-      ctx.shadowColor = 'rgba(255,255,255,0.85)';
-      ctx.shadowBlur = 10;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-
-      ctx.beginPath();
-      ctx.moveTo(x - 5, 0);
-      ctx.lineTo(x + 5, 0);
-      ctx.lineTo(x, 8);
-      ctx.closePath();
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fill();
-    }
-  }, [melodyNotes, harmonyNotes, keyInfo, duration, playheadTime]);
-
-  return <canvas ref={canvasRef} className="w-full h-48 md:h-56 block rounded-xl" />;
+  return (
+    <div ref={outerRef} className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
+      <div className="flex items-center gap-2 mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+        <button
+          onClick={() => setZoom((z) => Math.max(1, +(z - 0.5).toFixed(1)))}
+          className="stamma-btn px-2.5 py-1 rounded-md"
+          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+          aria-label="Zooma ut"
+        >
+          −
+        </button>
+        <span className="w-10 text-center">{Math.round(zoom * 100)}%</span>
+        <button
+          onClick={() => setZoom((z) => Math.min(4, +(z + 0.5).toFixed(1)))}
+          className="stamma-btn px-2.5 py-1 rounded-md"
+          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+          aria-label="Zooma in"
+        >
+          +
+        </button>
+        <button
+          onClick={toggleFullscreen}
+          className="stamma-btn ml-auto px-2.5 py-1 rounded-md"
+          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+        >
+          {isFullscreen ? 'Stäng helskärm' : 'Helskärm'}
+        </button>
+      </div>
+      <div
+        ref={scrollWrapRef}
+        className={isFullscreen ? 'flex-1 overflow-x-auto' : 'w-full h-48 md:h-56 overflow-x-auto rounded-xl'}
+      >
+        <canvas ref={canvasRef} className="block rounded-xl" />
+      </div>
+    </div>
+  );
 }
 
 /* ---------- Main app ---------- */
@@ -192,6 +286,10 @@ export default function App() {
   const [exporting, setExporting] = useState(null);
   const [harmonyRendering, setHarmonyRendering] = useState(false);
   const [harmonyRenderError, setHarmonyRenderError] = useState('');
+  const [autotuneEnabled, setAutotuneEnabled] = useState(false);
+  const [autotuneRendering, setAutotuneRendering] = useState(false);
+  const [autotuneRenderError, setAutotuneRenderError] = useState('');
+  const [micPermission, setMicPermission] = useState('unknown');
 
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -210,6 +308,24 @@ export default function App() {
   const harmonyBufferRef = useRef(null);
   const harmonyBufferKeyRef = useRef(null);
   const harmonyRenderPromiseRef = useRef(null);
+  const autotunedBufferRef = useRef(null);
+  const autotuneRenderPromiseRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  // The browser remembers a granted/denied microphone permission on its own
+  // (that's an origin-level browser decision, not something a site can
+  // configure) — this just lets the UI react to that state instead of
+  // firing off a getUserMedia call that we already know will be denied.
+  useEffect(() => {
+    if (!navigator.permissions?.query) return undefined;
+    let status;
+    navigator.permissions.query({ name: 'microphone' }).then((s) => {
+      status = s;
+      setMicPermission(s.state);
+      s.onchange = () => setMicPermission(s.state);
+    }).catch(() => {});
+    return () => { if (status) status.onchange = null; };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -244,14 +360,53 @@ export default function App() {
     setDirection(HARMONY_TYPES[type].defaultDirection);
   }
 
+  // Renders (or returns the cached render of) a lightly pitch-corrected copy
+  // of the recording. Cached per-recording (there's only ever one amount),
+  // and reused as the *source* for harmony rendering too when autotune is on
+  // — so the two voices stay in tune with each other, not just with an
+  // idealized target neither of them actually sings.
+  async function getAutotunedBuffer() {
+    if (!recordedBufferRef.current || !melodyNotes.length || !keyInfo) return null;
+    if (autotunedBufferRef.current) return autotunedBufferRef.current;
+    if (autotuneRenderPromiseRef.current) return autotuneRenderPromiseRef.current;
+    setAutotuneRendering(true);
+    setAutotuneRenderError('');
+    const promise = renderAutotunedMelody(recordedBufferRef.current, melodyNotes, keyInfo)
+      .then((buffer) => {
+        autotunedBufferRef.current = buffer;
+        return buffer;
+      })
+      .catch((err) => {
+        setAutotuneRenderError('Kunde inte auto-tuna inspelningen. Testa igen, eller stäng av autotune.');
+        throw err;
+      })
+      .finally(() => {
+        setAutotuneRendering(false);
+        autotuneRenderPromiseRef.current = null;
+      });
+    autotuneRenderPromiseRef.current = promise;
+    return promise;
+  }
+
+  // The buffer that "Din röst" playback/export and the harmony engine
+  // should actually use: the raw recording, or — if autotune is on — the
+  // corrected version of it.
+  async function getSourceBuffer() {
+    if (!autotuneEnabled) return recordedBufferRef.current;
+    const buffer = await getAutotunedBuffer();
+    return buffer || recordedBufferRef.current;
+  }
+
   // Renders (or returns the cached render of) the harmony as a real,
-  // pitch-shifted copy of the singer's own recording. Cached per
-  // harmonyType+direction combination since it's expensive to recompute on
-  // every play/export and neither the recording nor the melody notes change
-  // without a full re-record.
+  // pitch-shifted copy of the singer's own recording (or its autotuned
+  // version). Cached per harmonyType+direction+autotune combination since
+  // it's expensive to recompute on every play/export and neither the
+  // recording nor the melody notes change without a full re-record.
   async function getHarmonyBuffer() {
     if (!recordedBufferRef.current || !harmonyType || !harmonyNotes.length || !keyInfo) return null;
-    const key = `${harmonyType}-${direction}`;
+    const sourceBuffer = await getSourceBuffer();
+    if (!sourceBuffer) return null;
+    const key = `${harmonyType}-${direction}-${autotuneEnabled ? 'at' : 'raw'}`;
     if (harmonyBufferKeyRef.current === key && harmonyBufferRef.current) {
       return harmonyBufferRef.current;
     }
@@ -261,7 +416,7 @@ export default function App() {
     harmonyBufferKeyRef.current = `pending-${key}`;
     setHarmonyRendering(true);
     setHarmonyRenderError('');
-    const promise = renderHarmonyOffline(recordedBufferRef.current, melodyNotes, harmonyNotes, keyInfo)
+    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, harmonyNotes, keyInfo)
       .then((buffer) => {
         harmonyBufferRef.current = buffer;
         harmonyBufferKeyRef.current = key;
@@ -280,27 +435,42 @@ export default function App() {
     return promise;
   }
 
-  async function startRecording() {
-    setErrorMsg('');
+  // Clears everything tied to the current recording/upload, so a fresh
+  // source starts from a clean slate. Shared by a new recording, a new
+  // upload, and the explicit reset button.
+  function resetSourceState() {
     setKeyInfo(null);
     setMelodyNotes([]);
     setHarmonyType(null);
     setSoundType('sine');
     setVoiceReady(false);
+    setAutotuneEnabled(false);
     recordedBufferRef.current = null;
     harmonyBufferRef.current = null;
     harmonyBufferKeyRef.current = null;
+    autotunedBufferRef.current = null;
     setHarmonyRenderError('');
+    setAutotuneRenderError('');
     stopPlayback();
     if (recordedUrlRef.current) {
       URL.revokeObjectURL(recordedUrlRef.current);
       recordedUrlRef.current = null;
       setRecordedUrl(null);
     }
+  }
+
+  async function startRecording() {
+    setErrorMsg('');
+    resetSourceState();
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setPhase('error');
       setErrorMsg('Den här webbläsaren stödjer inte mikrofoninspelning.');
+      return;
+    }
+    if (micPermission === 'denied') {
+      setPhase('error');
+      setErrorMsg('Mikrofonåtkomst är blockerad för den här sidan. Ändra behörighet i webbläsarens inställningar och försök igen.');
       return;
     }
 
@@ -404,14 +574,12 @@ export default function App() {
     finishRecording();
   }
 
-  function runAnalysis() {
-    const frames = framesRef.current;
+  // Shared by both the live-recording flow and the file-upload flow: turns
+  // a list of {t, freq} analysis frames into a key + a filtered note list,
+  // or a reason string if there isn't enough to work with.
+  function analyzeFrames(frames) {
     const voiced = frames.filter((f) => f.freq > 0);
-    if (voiced.length < 15) {
-      setPhase('error');
-      setErrorMsg('Vi kunde inte hitta en tydlig tonhöjd i inspelningen. Sjung en enkel, tydlig melodi lite starkare och testa igen.');
-      return;
-    }
+    if (voiced.length < 15) return { error: 'no-pitch' };
 
     const hist = new Array(12).fill(0);
     voiced.forEach((f) => {
@@ -427,38 +595,99 @@ export default function App() {
     });
     const bridged = fillShortGaps(qFrames);
     const rawNotes = framesToNotes(bridged);
-    const notes = filterOutlierNotes(filterTransientArtifacts(rawNotes, key.tonic, key.mode));
+    const filtered = filterOutlierNotes(filterTransientArtifacts(rawNotes, key.tonic, key.mode));
+    if (filtered.length === 0) return { error: 'no-melody' };
 
-    if (notes.length === 0) {
+    const notes = attachMeasuredFreq(filtered, voiced);
+    return { key, notes };
+  }
+
+  const ANALYSIS_ERROR_MESSAGES = {
+    'no-pitch': 'Vi kunde inte hitta en tydlig tonhöjd i inspelningen. Sjung en enkel, tydlig melodi lite starkare och testa igen.',
+    'no-melody': 'Vi kunde inte tolka en tydlig melodislinga. Testa att sjunga lite långsammare och tydligare.',
+  };
+
+  function runAnalysis() {
+    const result = analyzeFrames(framesRef.current);
+    if (result.error) {
       setPhase('error');
-      setErrorMsg('Vi kunde inte tolka en tydlig melodislinga. Testa att sjunga lite långsammare och tydligare.');
+      setErrorMsg(ANALYSIS_ERROR_MESSAGES[result.error]);
       return;
     }
-
-    setKeyInfo(key);
-    setMelodyNotes(notes);
+    setKeyInfo(result.key);
+    setMelodyNotes(result.notes);
     setPhase('ready');
   }
 
+  // Uploaded files are decoded up front (so we have real sample data),
+  // trimmed to the same 10s cap as a live recording, then run through the
+  // exact same offline frame-extraction + analysis pipeline a recording's
+  // live AnalyserNode loop would have produced.
+  function trimAudioBuffer(ctx, buffer, maxDur) {
+    if (buffer.duration <= maxDur) return buffer;
+    const sr = buffer.sampleRate;
+    const len = Math.floor(maxDur * sr);
+    const trimmed = ctx.createBuffer(buffer.numberOfChannels, len, sr);
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      trimmed.copyToChannel(buffer.getChannelData(c).subarray(0, len), c);
+    }
+    return trimmed;
+  }
+
+  async function handleFileUpload(file) {
+    if (!file) return;
+    setErrorMsg('');
+    resetSourceState();
+    setPhase('analyzing');
+
+    try {
+      const arrayBuf = await file.arrayBuffer();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const decodeCtx = new AC();
+      let buffer;
+      try {
+        buffer = await decodeCtx.decodeAudioData(arrayBuf);
+      } catch (e) {
+        setPhase('error');
+        setErrorMsg('Kunde inte läsa ljudfilen. Kontrollera att det är en vanlig ljudfil (t.ex. WAV, MP3 eller M4A).');
+        return;
+      }
+      buffer = trimAudioBuffer(decodeCtx, buffer, DURATION);
+
+      recordedBufferRef.current = buffer;
+      setVoiceReady(true);
+      setRecordingDuration(Math.max(0.3, buffer.duration));
+
+      const blob = audioBufferToWavBlob(buffer);
+      const url = URL.createObjectURL(blob);
+      recordedUrlRef.current = url;
+      setRecordedUrl(url);
+
+      const frames = extractFramesFromBuffer(buffer.getChannelData(0), buffer.sampleRate);
+      const result = analyzeFrames(frames);
+      if (result.error) {
+        setPhase('error');
+        setErrorMsg(
+          result.error === 'no-pitch'
+            ? 'Vi kunde inte hitta en tydlig tonhöjd i ljudfilen. Prova en fil med en tydlig, enkel melodi.'
+            : ANALYSIS_ERROR_MESSAGES[result.error]
+        );
+        return;
+      }
+      setKeyInfo(result.key);
+      setMelodyNotes(result.notes);
+      setPhase('ready');
+    } catch (e) {
+      setPhase('error');
+      setErrorMsg('Kunde inte läsa ljudfilen. Kontrollera att det är en vanlig ljudfil (t.ex. WAV, MP3 eller M4A).');
+    }
+  }
+
   function resetAll() {
-    stopPlayback();
+    resetSourceState();
     setPhase('idle');
-    setKeyInfo(null);
-    setMelodyNotes([]);
-    setHarmonyType(null);
-    setSoundType('sine');
-    setVoiceReady(false);
-    recordedBufferRef.current = null;
-    harmonyBufferRef.current = null;
-    harmonyBufferKeyRef.current = null;
-    setHarmonyRenderError('');
     setRecordingDuration(DURATION);
     setErrorMsg('');
-    if (recordedUrlRef.current) {
-      URL.revokeObjectURL(recordedUrlRef.current);
-      recordedUrlRef.current = null;
-      setRecordedUrl(null);
-    }
   }
 
   function stopPlayback() {
@@ -541,7 +770,9 @@ export default function App() {
     setExporting('melody');
     try {
       if (soundType === 'recording' && recordedBufferRef.current) {
-        const blob = audioBufferToWavBlob(recordedBufferRef.current);
+        const sourceBuffer = await getSourceBuffer();
+        if (!sourceBuffer) return;
+        const blob = audioBufferToWavBlob(sourceBuffer);
         downloadBlob(blob, 'stamma-melodi.wav');
       } else {
         const buffer = await renderSynthOffline(melodyPlaybackNotes, soundType, exportSampleRate());
@@ -571,13 +802,18 @@ export default function App() {
   }
 
   async function playSynth(which) {
-    // Pre-render (or fetch the cached) real-voice harmony before opening the
-    // playback context, so the AudioContext clock only starts once the
-    // buffer is actually ready to schedule.
+    // Pre-render (or fetch the cached) real-voice buffers before opening the
+    // playback context, so the AudioContext clock only starts once they're
+    // actually ready to schedule.
+    let sourceBuf = null;
     let hBuf = null;
-    if (soundType === 'recording' && recordedBufferRef.current && (which === 'harmony' || which === 'both')) {
-      hBuf = await getHarmonyBuffer();
-      if (!hBuf) return;
+    if (soundType === 'recording' && recordedBufferRef.current) {
+      sourceBuf = await getSourceBuffer();
+      if (!sourceBuf) return;
+      if (which === 'harmony' || which === 'both') {
+        hBuf = await getHarmonyBuffer();
+        if (!hBuf) return;
+      }
     }
 
     stopPlayback();
@@ -594,14 +830,13 @@ export default function App() {
     );
 
     if (soundType === 'recording' && recordedBufferRef.current) {
-      const recBuf = recordedBufferRef.current;
-      totalDur = recBuf.duration;
+      totalDur = sourceBuf.duration;
       if (which === 'melody') {
-        playBufferSource(ctx, now, recBuf, 0.9);
+        playBufferSource(ctx, now, sourceBuf, 0.9);
       } else if (which === 'harmony') {
         playBufferSource(ctx, now, hBuf, 0.9);
       } else if (which === 'both') {
-        playBufferSource(ctx, now, recBuf, 0.7);
+        playBufferSource(ctx, now, sourceBuf, 0.7);
         playBufferSource(ctx, now, hBuf, 0.7);
       }
     } else {
@@ -673,10 +908,10 @@ export default function App() {
         {/* Header */}
         <header className="mb-6">
           <h1 className="font-display text-4xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
-            Stämma
+            Stämifier
           </h1>
           <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
-            Sjung en melodi i tio sekunder. Appen känner av tonarten och bygger en stämma i ters, kvint eller sext som du kan träna in.
+            Sjung in en melodi (max 10 sekunder), eller ladda upp en ljudfil. Appen känner av tonarten och bygger en stämma i ters, kvint eller sext som du kan träna in.
           </p>
         </header>
 
@@ -715,16 +950,41 @@ export default function App() {
             {harmonyRenderError}
           </div>
         )}
+        {autotuneRenderError && (
+          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+            {autotuneRenderError}
+          </div>
+        )}
 
-        {/* Idle: start button */}
+        {/* Idle: start button + upload */}
         {(phase === 'idle' || phase === 'error') && (
-          <button
-            onClick={startRecording}
-            className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
-            style={{ backgroundColor: '#FFB454', color: '#10131A' }}
-          >
-            Spela in (max 10 sekunder)
-          </button>
+          <div className="space-y-3">
+            <button
+              onClick={startRecording}
+              className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
+              style={{ backgroundColor: '#FFB454', color: '#10131A' }}
+            >
+              Spela in (max 10 sekunder)
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="stamma-btn w-full rounded-xl py-3 font-body font-medium text-sm"
+              style={{ backgroundColor: 'rgba(241,237,228,0.06)', color: '#F1EDE4', border: '1px solid rgba(241,237,228,0.12)' }}
+            >
+              Ladda upp ljudfil
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                handleFileUpload(file);
+              }}
+            />
+          </div>
         )}
 
         {/* Recording */}
@@ -845,6 +1105,37 @@ export default function App() {
               <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
                 {SOUND_TYPES[soundType].description}
               </p>
+
+              {soundType === 'recording' && (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                  <div>
+                    <div className="text-sm font-medium">Autotune</div>
+                    <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                      Rättar lätt falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setAutotuneEnabled((v) => !v)}
+                    className="stamma-btn shrink-0"
+                    style={{ width: 44, height: 26, borderRadius: 13, backgroundColor: autotuneEnabled ? '#55D6C0' : 'rgba(241,237,228,0.15)', position: 'relative' }}
+                    aria-pressed={autotuneEnabled}
+                    aria-label="Autotune"
+                  >
+                    <span
+                      style={{
+                        position: 'absolute',
+                        top: 3,
+                        left: autotuneEnabled ? 21 : 3,
+                        width: 20,
+                        height: 20,
+                        borderRadius: 10,
+                        backgroundColor: '#10131A',
+                        transition: 'left 150ms ease',
+                      }}
+                    />
+                  </button>
+                </div>
+              )}
             </div>
 
             <div>
@@ -858,20 +1149,29 @@ export default function App() {
                   />
                 )}
                 <PlaybackButton
-                  label={soundType === 'recording' ? 'Din inspelade melodi' : 'Melodislinga (ren ton)'}
+                  label={
+                    soundType === 'recording'
+                      ? autotuneRendering
+                        ? 'Din inspelade melodi (autotunar …)'
+                        : autotuneEnabled
+                          ? 'Din inspelade melodi (autotunad)'
+                          : 'Din inspelade melodi'
+                      : 'Melodislinga (ren ton)'
+                  }
+                  disabled={soundType === 'recording' && autotuneRendering}
                   active={isPlaying && nowPlaying === 'melody'}
                   onClick={() => playSynth('melody')}
                 />
                 <PlaybackButton
-                  label={soundType === 'recording' ? (harmonyRendering ? 'Stämma (bygger …)' : 'Stämma (din röst, formantbevarande)') : 'Stämma'}
+                  label={soundType === 'recording' ? ((harmonyRendering || autotuneRendering) ? 'Stämma (bygger …)' : 'Stämma (din röst, formantbevarande)') : 'Stämma'}
                   primary
-                  disabled={!harmonyType || harmonyRendering}
+                  disabled={!harmonyType || harmonyRendering || autotuneRendering}
                   active={isPlaying && nowPlaying === 'harmony'}
                   onClick={() => playSynth('harmony')}
                 />
                 <PlaybackButton
-                  label={soundType === 'recording' ? (harmonyRendering ? 'Melodi + stämma (bygger …)' : 'Melodi + stämma (din röst)') : 'Melodi + stämma tillsammans'}
-                  disabled={!harmonyType || harmonyRendering}
+                  label={soundType === 'recording' ? ((harmonyRendering || autotuneRendering) ? 'Melodi + stämma (bygger …)' : 'Melodi + stämma (din röst)') : 'Melodi + stämma tillsammans'}
+                  disabled={!harmonyType || harmonyRendering || autotuneRendering}
                   active={isPlaying && nowPlaying === 'both'}
                   onClick={() => playSynth('both')}
                 />
@@ -896,15 +1196,19 @@ export default function App() {
                   onClick={exportSong}
                 />
                 <ExportButton
-                  label={soundType === 'recording' ? 'Melodi (samma som originalet)' : 'Melodislinga (ren ton)'}
-                  busy={exporting === 'melody'}
-                  disabled={!melodyNotes.length || !!exporting}
+                  label={
+                    soundType === 'recording'
+                      ? autotuneEnabled ? 'Melodi (autotunad)' : 'Melodi (samma som originalet)'
+                      : 'Melodislinga (ren ton)'
+                  }
+                  busy={exporting === 'melody' || autotuneRendering}
+                  disabled={!melodyNotes.length || !!exporting || autotuneRendering}
                   onClick={exportMelody}
                 />
                 <ExportButton
                   label="Stämma"
-                  busy={exporting === 'harmony' || harmonyRendering}
-                  disabled={!harmonyType || !!exporting || harmonyRendering}
+                  busy={exporting === 'harmony' || harmonyRendering || autotuneRendering}
+                  disabled={!harmonyType || !!exporting || harmonyRendering || autotuneRendering}
                   onClick={exportHarmony}
                 />
               </div>

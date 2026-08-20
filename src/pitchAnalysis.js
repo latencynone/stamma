@@ -37,6 +37,26 @@ export function autoCorrelate(buf, sampleRate) {
   return { freq: sampleRate / refinedLag, rms };
 }
 
+// Runs the same window/hop autocorrelation pass used on a live microphone
+// stream, but directly against a decoded audio buffer — used for uploaded
+// files, which have no live AnalyserNode loop to capture frames from.
+export function extractFramesFromBuffer(channelData, sampleRate, { fftSize = 2048, hopSec = 0.035 } = {}) {
+  const totalDur = channelData.length / sampleRate;
+  const frames = [];
+  for (let t = 0; t < totalDur; t += hopSec) {
+    const endSample = Math.round(t * sampleRate);
+    const startSample = endSample - fftSize;
+    const win = new Float32Array(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+      const si = startSample + i;
+      win[i] = si >= 0 && si < channelData.length ? channelData[si] : 0;
+    }
+    const { freq } = autoCorrelate(win, sampleRate);
+    frames.push({ t, freq: freq > 55 && freq < 1200 ? freq : -1 });
+  }
+  return frames;
+}
+
 /* ---------- Key detection ---------- */
 
 function correlate(hist, profile) {
@@ -153,4 +173,17 @@ export function filterOutlierNotes(notes, maxDeviationSteps = 7, maxOutlierDur =
   weighted.sort((a, b) => a - b);
   const homeStep = weighted[Math.floor(weighted.length / 2)];
   return notes.filter((n) => (n.end - n.start) > maxOutlierDur || Math.abs(n.step - homeStep) <= maxDeviationSteps);
+}
+
+// Attaches each note's actual (unquantized) sung pitch — the median raw Hz
+// reading across its voiced frames — separately from its quantized `step`.
+// Autotune needs both: the quantized step says where the note *should* sit,
+// `measuredFreq` says where the singer actually put it, and the difference
+// between the two is exactly what a light pitch correction should nudge.
+export function attachMeasuredFreq(notes, voicedFrames) {
+  return notes.map((n) => {
+    const inRange = voicedFrames.filter((f) => f.t >= n.start && f.t <= n.end).map((f) => f.freq).sort((a, b) => a - b);
+    const measuredFreq = inRange.length ? inRange[Math.floor(inRange.length / 2)] : null;
+    return { ...n, measuredFreq };
+  });
 }
