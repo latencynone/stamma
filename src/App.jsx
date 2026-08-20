@@ -607,6 +607,102 @@ function isChannelAudible(channelsState, key) {
   return anySolo ? ch.solo : true;
 }
 
+// A separate, linkable page (see the #om hash handling in App) that
+// explains what each part of the app actually does — kept plain-language
+// and practical rather than technical, matching the app's own tone.
+function AboutPage() {
+  const sections = [
+    {
+      title: 'Sjung in eller ladda upp',
+      body: 'Spela in dig själv (max 10 sekunder) direkt i webbläsaren, eller ladda upp en befintlig ljudfil (WAV, MP3, M4A, OGG eller FLAC). Är filen längre än 10 sekunder klipps den av vid gränsen.',
+    },
+    {
+      title: 'Tonhöjdskurvan',
+      body: 'Appen lyssnar igenom inspelningen och räknar ut vilken ton som sjungs vid varje ögonblick. Det ritas upp som en kurva du kan zooma i och öppna i helskärm — varje stapel är en enskild ton.',
+    },
+    {
+      title: 'Uppfattad tonart',
+      body: 'Utifrån vilka toner som förekommer mest gissar appen vilken tonart (dur eller moll) melodin ligger i. Det är den tonarten stämmorna sedan byggs utifrån, så en fel uppfattad tonart är den vanligaste orsaken till att en stämma låter konstig.',
+    },
+    {
+      title: 'Ljud: Ren synt / Formantröst / Din röst',
+      body: 'Tre sätt att höra melodin och stämmorna på. "Ren synt" är en enkel sinuston, lättast att stämma efter. "Formantröst" är en syntetisk, vokalliknande klang. "Din röst" pitchskiftar din egen inspelning till varje stämmas toner, med bevarad klangfärg — mest verklighetstroget, men kräver att du spelat in (inte laddat upp en synt-fil).',
+    },
+    {
+      title: 'Stämmor: ters, kvint, sext',
+      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma.',
+    },
+    {
+      title: 'Autotune',
+      body: 'Rättar lätt falska toner i själva inspelningen (inte i stämmorna). Av som standard. När den är på väljer du hur mycket rättning som ska ske — Lätt, Medel eller Hård — där Hård drar tonerna närmast helt till rätt tonhöjd.',
+    },
+    {
+      title: 'Vågformen: beskärning och fader',
+      body: 'Under "Din röst" visas en vågform av originalinspelningen. Dra i de två handtagen i kanterna för att välja vilken del som ska spelas — allt utanför blir mörkare. De gula triangelhandtagen i hörnen styr tona in/tona ut: dra dem inåt för en mjukare start eller avslutning istället för en tvär in/utklippning.',
+    },
+    {
+      title: 'Spela, pausa, loopa',
+      body: 'Under vågformen finns tre kontroller: en loop-knapp (upprepar den valda delen tills du stänger av den), en stopp-knapp (stannar och hoppar tillbaka till början) och en kombinerad spela/pausa-knapp. Pausar du mitt i går det att fortsätta exakt där du var. Reglaget under knapparna spolar fram och tillbaka i den valda delen.',
+    },
+    {
+      title: 'Mixern',
+      body: 'Varje spår — melodi, ters, kvint, sext — går att slå på eller av var för sig, och alla påslagna spelas samtidigt när du trycker play. Varje spår har en liten play-knapp för att förhandslyssna bara det spåret, en S-knapp för att solo:a (tysta alla andra tillfälligt), och volym/panorering som fälls ut genom att trycka på procentsatsen.',
+    },
+    {
+      title: 'Exportera',
+      body: 'Ladda ner sången och varje stämma som separata WAV-filer, till exempel för att jobba vidare i ett annat program.',
+    },
+  ];
+
+  return (
+    <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        .font-display { font-family: 'Fraunces', serif; }
+        .font-body { font-family: 'Space Grotesk', sans-serif; }
+        .font-mono-ui { font-family: 'JetBrains Mono', monospace; }
+        .stamma-btn:focus-visible { outline: 2px solid #FFB454; outline-offset: 2px; }
+      `}</style>
+      <div className="w-full max-w-md px-5 py-8 font-body">
+        <a
+          href="#"
+          className="stamma-btn font-mono-ui text-xs"
+          style={{ color: '#55D6C0' }}
+        >
+          ← Tillbaka
+        </a>
+        <h1 className="mt-3 font-display text-3xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
+          Om Stämifier
+        </h1>
+        <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
+          Så fungerar appens olika delar, rent praktiskt.
+        </p>
+
+        <div className="mt-6 space-y-5">
+          {sections.map((s) => (
+            <div key={s.title}>
+              <h2 className="font-display text-lg font-semibold" style={{ color: '#F1EDE4' }}>
+                {s.title}
+              </h2>
+              <p className="mt-1 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
+                {s.body}
+              </p>
+            </div>
+          ))}
+        </div>
+
+        <a
+          href="#"
+          className="stamma-btn mt-8 inline-block font-mono-ui text-xs"
+          style={{ color: '#55D6C0' }}
+        >
+          ← Tillbaka
+        </a>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [phase, setPhase] = useState('idle'); // idle | recording | analyzing | ready | error
   const [errorMsg, setErrorMsg] = useState('');
@@ -630,6 +726,7 @@ export default function App() {
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
   const [micPermission, setMicPermission] = useState('unknown');
   const [introExpanded, setIntroExpanded] = useState(false);
+  const [showAbout, setShowAbout] = useState(() => window.location.hash === '#om');
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(null); // null = full recordingDuration
   const [loopEnabled, setLoopEnabled] = useState(false);
@@ -694,6 +791,15 @@ export default function App() {
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') audioCtxRef.current.close().catch(() => {});
       if (playCtxRef.current && playCtxRef.current.state !== 'closed') playCtxRef.current.close().catch(() => {});
     };
+  }, []);
+
+  // The "Om Stämifier" page lives at #om so it's a real, linkable/
+  // bookmarkable URL rather than just app state — the back link and the
+  // browser's own back button both work by changing the hash.
+  useEffect(() => {
+    const onHashChange = () => setShowAbout(window.location.hash === '#om');
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
   function harmonyNotesFor(type) {
@@ -1512,6 +1618,10 @@ export default function App() {
   const anyChannelEnabled = Object.values(channels).some((c) => c.enabled);
   const anyHarmonyBusy = Object.values(harmonyRenderingByType).some(Boolean);
 
+  if (showAbout) {
+    return <AboutPage />;
+  }
+
   return (
     <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
       <style>{`
@@ -1997,6 +2107,16 @@ export default function App() {
             </button>
           </div>
         )}
+
+        <footer className="mt-8 text-center">
+          <a
+            href="#om"
+            className="stamma-btn font-mono-ui text-xs"
+            style={{ color: '#C7CBDA' }}
+          >
+            Om Stämifier
+          </a>
+        </footer>
       </div>
     </div>
   );
