@@ -279,6 +279,84 @@ function detectNoiseRegion(channelData, sampleRate, duration) {
   return best ? { start: best.start, end: best.end } : { start: 0, end: Math.min(0.4, duration) };
 }
 
+/* ---------- Tempo detection & metronome ---------- */
+
+// A simple, honest-about-being-approximate tempo estimate: the gaps
+// between consecutive note onsets (inter-onset intervals) cluster around
+// the beat duration (or a simple fraction/multiple of it) for anything
+// with a steady pulse, so the most common gap — found via a coarse
+// histogram rather than exact-match counting, since real timing always
+// has some jitter — is taken as the beat. Folded into a 60–180 BPM range
+// by doubling/halving, since raw IOI clustering can't tell a beat from a
+// half- or double-time reading of it.
+function detectTempoBpm(melodyNotes) {
+  if (!melodyNotes || melodyNotes.length < 3) return null;
+  const onsets = melodyNotes.map((n) => n.start).slice().sort((a, b) => a - b);
+  const iois = [];
+  for (let i = 1; i < onsets.length; i++) {
+    const d = onsets[i] - onsets[i - 1];
+    if (d > 0.15 && d < 2.0) iois.push(d);
+  }
+  if (iois.length < 2) return null;
+
+  const bucketSize = 0.05;
+  const buckets = {};
+  iois.forEach((ioi) => {
+    const key = Math.round(ioi / bucketSize);
+    buckets[key] = (buckets[key] || 0) + 1;
+  });
+  let bestKey = null;
+  let bestCount = 0;
+  Object.entries(buckets).forEach(([k, count]) => {
+    if (count > bestCount) { bestCount = count; bestKey = k; }
+  });
+  if (bestKey === null) return null;
+
+  const beatDur = Number(bestKey) * bucketSize;
+  if (beatDur <= 0) return null;
+  let bpm = 60 / beatDur;
+  while (bpm < 60) bpm *= 2;
+  while (bpm > 180) bpm /= 2;
+  return Math.round(bpm);
+}
+
+// One metronome tick — a short sine blip, accented (higher pitch, a touch
+// louder) on the first beat of every 4 so the pulse reads as a bar, not
+// just an undifferentiated click.
+function playMetronomeClick(ctx, whenTime, accent) {
+  const osc = ctx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = accent ? 1500 : 1000;
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0.0001, whenTime);
+  gain.gain.exponentialRampToValueAtTime(accent ? 0.4 : 0.28, whenTime + 0.004);
+  gain.gain.exponentialRampToValueAtTime(0.0001, whenTime + 0.06);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(whenTime);
+  osc.stop(whenTime + 0.08);
+}
+
+// Standard "lookahead" scheduler (setInterval polling ahead of playback
+// time with sample-accurate start() calls) rather than one setTimeout per
+// click — setTimeout alone drifts audibly over even a few bars.
+function startMetronomeScheduler(ctx, bpm) {
+  const beatDur = 60 / Math.max(20, bpm);
+  const lookahead = 0.1;
+  const state = { nextClickTime: ctx.currentTime + 0.1, beatCount: 0 };
+  state.intervalId = setInterval(() => {
+    while (state.nextClickTime < ctx.currentTime + lookahead) {
+      playMetronomeClick(ctx, state.nextClickTime, state.beatCount % 4 === 0);
+      state.nextClickTime += beatDur;
+      state.beatCount++;
+    }
+  }, 25);
+  return state;
+}
+
+function stopMetronomeScheduler(state) {
+  if (state) clearInterval(state.intervalId);
+}
+
 /* ---------- Formant "voice" synthesis ---------- */
 
 // Builds a small vowel-ish resonance filter bank ("oo") fed by `source`
@@ -1122,6 +1200,12 @@ export default function App() {
   const [noiseSampleEnd, setNoiseSampleEnd] = useState(0.5);
   const [denoising, setDenoising] = useState(false);
   const [denoiseError, setDenoiseError] = useState('');
+  const [effectsExpanded, setEffectsExpanded] = useState(false);
+  const [metronomeEnabled, setMetronomeEnabled] = useState(false); // clicks during an actual recording
+  const [metronomeBpm, setMetronomeBpm] = useState(100);
+  const [metronomeListening, setMetronomeListening] = useState(false); // preview click loop, not recording
+  const [metronomeExpanded, setMetronomeExpanded] = useState(false);
+  const [tempoDetected, setTempoDetected] = useState(false);
   const [micPermission, setMicPermission] = useState('unknown');
   const [introExpanded, setIntroExpanded] = useState(false);
   const [showAbout, setShowAbout] = useState(() => window.location.hash === '#om');
@@ -1172,6 +1256,7 @@ export default function App() {
   const ownTakeStartRef = useRef(0);
   const ownTakeFinishedRef = useRef(false);
   const reverbBusRef = useRef(null);
+  const metronomeSchedulerRef = useRef(null);
 
   // Read inside the playback-end setTimeout, which was scheduled back when
   // it fired — using state directly there would capture whatever loopEnabled
@@ -1205,6 +1290,7 @@ export default function App() {
       if (playCtxRef.current && playCtxRef.current.state !== 'closed') playCtxRef.current.close().catch(() => {});
       if (ownTakeRafRef.current) cancelAnimationFrame(ownTakeRafRef.current);
       if (ownTakeStreamRef.current) ownTakeStreamRef.current.getTracks().forEach((t) => t.stop());
+      if (metronomeSchedulerRef.current) stopMetronomeScheduler(metronomeSchedulerRef.current);
     };
   }, []);
 
@@ -1402,6 +1488,12 @@ export default function App() {
     setAutotuneLevelIndex(0);
     setAutotuneStrengthExpanded(false);
     setExpandedChannels({});
+    setTempoDetected(false);
+    if (metronomeListening) {
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = null;
+      setMetronomeListening(false);
+    }
     recordedBufferRef.current = null;
     originalRecordingBufferRef.current = null;
     setIsProcessed(false);
@@ -1620,6 +1712,19 @@ export default function App() {
       setPhase('recording');
       setCountdown(DURATION);
 
+      // Recording gets its own click scheduler below if enabled — stop any
+      // "lyssna"-preview loop from the idle screen first either way, so it
+      // never keeps clicking (unscheduled, off-tempo-aware) into a take.
+      if (metronomeSchedulerRef.current) {
+        stopMetronomeScheduler(metronomeSchedulerRef.current);
+        metronomeSchedulerRef.current = null;
+      }
+      setMetronomeListening(false);
+      if (metronomeEnabled) {
+        const clickCtx = await getPlaybackContext();
+        metronomeSchedulerRef.current = startMetronomeScheduler(clickCtx, metronomeBpm);
+      }
+
       const tick = () => {
         const now = audioCtx.currentTime - startTime;
         if (now >= DURATION) {
@@ -1646,6 +1751,10 @@ export default function App() {
     if (finishedRef.current) return;
     finishedRef.current = true;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (metronomeSchedulerRef.current) {
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = null;
+    }
 
     const audioCtx = audioCtxRef.current;
     const elapsed = audioCtx ? audioCtx.currentTime - recordingStartRef.current : DURATION;
@@ -1734,6 +1843,20 @@ export default function App() {
     'no-melody': 'Vi kunde inte tolka en tydlig melodislinga. Testa att sjunga lite långsammare och tydligare.',
   };
 
+  // Shared by both the recording and upload paths: guesses a tempo from
+  // the note onsets and, if confident enough to return one at all, adopts
+  // it as the metronome's tempo. A manual +/- afterward is always
+  // available if the guess is off.
+  function applyDetectedTempo(notes) {
+    const bpm = detectTempoBpm(notes);
+    if (bpm) {
+      setMetronomeBpm(bpm);
+      setTempoDetected(true);
+    } else {
+      setTempoDetected(false);
+    }
+  }
+
   function runAnalysis() {
     const result = analyzeFrames(framesRef.current);
     if (result.error) {
@@ -1743,6 +1866,7 @@ export default function App() {
     }
     setKeyInfo(result.key);
     setMelodyNotes(result.notes);
+    applyDetectedTempo(result.notes);
     setPhase('ready');
   }
 
@@ -1801,6 +1925,7 @@ export default function App() {
       }
       setKeyInfo(result.key);
       setMelodyNotes(result.notes);
+      applyDetectedTempo(result.notes);
       setPhase('ready');
     } catch (e) {
       setPhase('error');
@@ -1837,6 +1962,34 @@ export default function App() {
       await ctx.resume();
     }
     return ctx;
+  }
+
+  // "Lyssna" — preview the click track on its own, independent of any
+  // recording, so the tempo can be dialed in and heard before committing
+  // to a take. Toggling it off just stops the scheduler.
+  async function toggleMetronomeListen() {
+    if (metronomeListening) {
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = null;
+      setMetronomeListening(false);
+      return;
+    }
+    const ctx = await getPlaybackContext();
+    metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpm);
+    setMetronomeListening(true);
+  }
+
+  function adjustMetronomeBpm(delta) {
+    const next = Math.max(40, Math.min(240, metronomeBpm + delta));
+    setMetronomeBpm(next);
+    setTempoDetected(false);
+    // The scheduler captured the old tempo at start time — restart it so a
+    // change while previewing is actually heard, not applied silently.
+    if (metronomeListening && metronomeSchedulerRef.current) {
+      const ctx = playCtxRef.current;
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = ctx ? startMetronomeScheduler(ctx, next) : null;
+    }
   }
 
   // `keepPosition`: true for pause (freeze playheadTime so Play resumes
@@ -2421,6 +2574,45 @@ export default function App() {
         {/* Idle: start button + upload */}
         {(phase === 'idle' || phase === 'error') && (
           <div className="space-y-3">
+            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+              <div className="flex items-center gap-2">
+                <MetronomeIcon size={16} />
+                <span className="text-sm font-medium">Metronom</span>
+                <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Klick vid inspelning</span>
+                <ToggleSwitch checked={metronomeEnabled} onChange={() => setMetronomeEnabled((v) => !v)} accentColor="#55D6C0" />
+              </div>
+              <div className="flex items-center justify-center gap-4 mt-3">
+                <button
+                  onClick={() => adjustMetronomeBpm(-5)}
+                  className="stamma-btn rounded-md flex items-center justify-center"
+                  style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                  aria-label="Sänk takt"
+                >
+                  −
+                </button>
+                <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4', minWidth: 90, textAlign: 'center' }}>{metronomeBpm} BPM</span>
+                <button
+                  onClick={() => adjustMetronomeBpm(5)}
+                  className="stamma-btn rounded-md flex items-center justify-center"
+                  style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                  aria-label="Höj takt"
+                >
+                  +
+                </button>
+              </div>
+              <button
+                onClick={toggleMetronomeListen}
+                className="stamma-btn w-full mt-3 rounded-lg py-2 flex items-center justify-center gap-1.5 font-body font-medium text-sm"
+                style={{
+                  backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                  color: metronomeListening ? '#55D6C0' : '#F1EDE4',
+                  border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                }}
+              >
+                {metronomeListening ? <PauseIcon size={15} /> : <PlayIcon size={15} />}
+                {metronomeListening ? 'Stoppa' : 'Lyssna på takten'}
+              </button>
+            </div>
             <button
               onClick={startRecording}
               className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
@@ -2525,98 +2717,111 @@ export default function App() {
               <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
                 {SOUND_TYPES[soundType].description}
               </p>
+            </div>
 
-              {soundType === 'recording' && (
-                <div className="mt-3 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-medium">Autotune</div>
-                      <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
-                        Rättar falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
+            <div>
+              <button
+                onClick={() => setEffectsExpanded((v) => !v)}
+                className="stamma-btn w-full flex items-center justify-between mb-2"
+              >
+                <h2 className="font-display text-lg font-semibold">Effekter</h2>
+                <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: effectsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+              </button>
+              {effectsExpanded && (
+                <div className="space-y-3">
+                  {soundType === 'recording' && (
+                    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">Autotune</div>
+                          <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                            Rättar falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
+                          </div>
+                        </div>
+                        <ToggleSwitch
+                          checked={autotuneOn}
+                          onChange={() => { setAutotuneOn((v) => !v); if (isPlaying) stopPlayback(); }}
+                          accentColor="#55D6C0"
+                        />
                       </div>
-                    </div>
-                    <ToggleSwitch
-                      checked={autotuneOn}
-                      onChange={() => { setAutotuneOn((v) => !v); if (isPlaying) stopPlayback(); }}
-                      accentColor="#55D6C0"
-                    />
-                  </div>
-                  {autotuneOn && (
-                    <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
-                      <button
-                        onClick={() => setAutotuneStrengthExpanded((v) => !v)}
-                        className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
-                        style={{ color: '#55D6C0' }}
-                      >
-                        <span>Styrka: {AUTOTUNE_LEVELS[autotuneLevelIndex].label}</span>
-                        <span style={{ display: 'inline-block', fontSize: 15, transform: autotuneStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
-                      </button>
-                      {autotuneStrengthExpanded && (
-                        <div className="mt-2.5 grid grid-cols-3 gap-1.5">
-                          {AUTOTUNE_LEVELS.map((lvl, i) => (
-                            <button
-                              key={lvl.key}
-                              onClick={() => { setAutotuneLevelIndex(i); if (isPlaying) stopPlayback(); }}
-                              className="stamma-btn rounded-md py-1.5 text-xs font-medium"
-                              style={{
-                                backgroundColor: autotuneLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
-                                color: autotuneLevelIndex === i ? '#55D6C0' : '#C7CBDA',
-                                border: autotuneLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                              }}
-                            >
-                              {lvl.label}
-                            </button>
-                          ))}
+                      {autotuneOn && (
+                        <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                          <button
+                            onClick={() => setAutotuneStrengthExpanded((v) => !v)}
+                            className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
+                            style={{ color: '#55D6C0' }}
+                          >
+                            <span>Styrka: {AUTOTUNE_LEVELS[autotuneLevelIndex].label}</span>
+                            <span style={{ display: 'inline-block', fontSize: 15, transform: autotuneStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                          </button>
+                          {autotuneStrengthExpanded && (
+                            <div className="mt-2.5 grid grid-cols-3 gap-1.5">
+                              {AUTOTUNE_LEVELS.map((lvl, i) => (
+                                <button
+                                  key={lvl.key}
+                                  onClick={() => { setAutotuneLevelIndex(i); if (isPlaying) stopPlayback(); }}
+                                  className="stamma-btn rounded-md py-1.5 text-xs font-medium"
+                                  style={{
+                                    backgroundColor: autotuneLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
+                                    color: autotuneLevelIndex === i ? '#55D6C0' : '#C7CBDA',
+                                    border: autotuneLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                                  }}
+                                >
+                                  {lvl.label}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
                   )}
-                </div>
-              )}
-            </div>
 
-            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-medium">Reverb</div>
-                  <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
-                    Lägger på lite rymd på hela mixen
-                  </div>
-                </div>
-                <ToggleSwitch
-                  checked={reverbOn}
-                  onChange={() => { setReverbOn((v) => !v); if (isPlaying) stopPlayback(); }}
-                  accentColor="#55D6C0"
-                />
-              </div>
-              {reverbOn && (
-                <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
-                  <button
-                    onClick={() => setReverbStrengthExpanded((v) => !v)}
-                    className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
-                    style={{ color: '#55D6C0' }}
-                  >
-                    <span>Storlek: {REVERB_LEVELS[reverbLevelIndex].label}</span>
-                    <span style={{ display: 'inline-block', fontSize: 15, transform: reverbStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
-                  </button>
-                  {reverbStrengthExpanded && (
-                    <div className="mt-2.5 grid grid-cols-3 gap-1.5">
-                      {REVERB_LEVELS.map((lvl, i) => (
-                        <button
-                          key={lvl.key}
-                          onClick={() => { setReverbLevelIndex(i); if (isPlaying) stopPlayback(); }}
-                          className="stamma-btn rounded-md py-1.5 text-xs font-medium"
-                          style={{
-                            backgroundColor: reverbLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
-                            color: reverbLevelIndex === i ? '#55D6C0' : '#C7CBDA',
-                            border: reverbLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                          }}
-                        >
-                          {lvl.label}
-                        </button>
-                      ))}
+                  <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium">Reverb</div>
+                        <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                          Lägger på lite rymd på hela mixen
+                        </div>
+                      </div>
+                      <ToggleSwitch
+                        checked={reverbOn}
+                        onChange={() => { setReverbOn((v) => !v); if (isPlaying) stopPlayback(); }}
+                        accentColor="#55D6C0"
+                      />
                     </div>
-                  )}
+                    {reverbOn && (
+                      <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                        <button
+                          onClick={() => setReverbStrengthExpanded((v) => !v)}
+                          className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
+                          style={{ color: '#55D6C0' }}
+                        >
+                          <span>Storlek: {REVERB_LEVELS[reverbLevelIndex].label}</span>
+                          <span style={{ display: 'inline-block', fontSize: 15, transform: reverbStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                        </button>
+                        {reverbStrengthExpanded && (
+                          <div className="mt-2.5 grid grid-cols-3 gap-1.5">
+                            {REVERB_LEVELS.map((lvl, i) => (
+                              <button
+                                key={lvl.key}
+                                onClick={() => { setReverbLevelIndex(i); if (isPlaying) stopPlayback(); }}
+                                className="stamma-btn rounded-md py-1.5 text-xs font-medium"
+                                style={{
+                                  backgroundColor: reverbLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
+                                  color: reverbLevelIndex === i ? '#55D6C0' : '#C7CBDA',
+                                  border: reverbLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                                }}
+                              >
+                                {lvl.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -2728,10 +2933,81 @@ export default function App() {
                 </div>
               )}
 
-              <div className="flex justify-end mb-2">
+              <div className="flex items-center justify-between mb-2 gap-2">
+                <div className="relative">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => setMetronomeEnabled((v) => !v)}
+                      className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
+                      style={{
+                        width: 26,
+                        height: 26,
+                        backgroundColor: metronomeEnabled ? 'rgba(85,214,192,0.15)' : 'transparent',
+                        color: metronomeEnabled ? '#55D6C0' : '#C7CBDA',
+                        border: metronomeEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.15)',
+                      }}
+                      aria-pressed={metronomeEnabled}
+                      aria-label="Metronom vid inspelning"
+                      title="Metronom vid inspelning"
+                    >
+                      <MetronomeIcon size={14} />
+                    </button>
+                    <button
+                      onClick={() => setMetronomeExpanded((v) => !v)}
+                      className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
+                      style={{ color: '#C7CBDA' }}
+                    >
+                      {metronomeBpm} BPM
+                      <span style={{ display: 'inline-block', fontSize: 15, transform: metronomeExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                    </button>
+                  </div>
+                  {metronomeExpanded && (
+                    <div
+                      className="absolute z-10 mt-2 rounded-xl p-3"
+                      style={{ width: 220, backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
+                    >
+                      <div className="flex items-center justify-center gap-4">
+                        <button
+                          onClick={() => adjustMetronomeBpm(-5)}
+                          className="stamma-btn rounded-md flex items-center justify-center"
+                          style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                          aria-label="Sänk takt"
+                        >
+                          −
+                        </button>
+                        <span className="font-mono-ui text-lg" style={{ color: '#F1EDE4', minWidth: 56, textAlign: 'center' }}>{metronomeBpm}</span>
+                        <button
+                          onClick={() => adjustMetronomeBpm(5)}
+                          className="stamma-btn rounded-md flex items-center justify-center"
+                          style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                          aria-label="Höj takt"
+                        >
+                          +
+                        </button>
+                      </div>
+                      {tempoDetected && (
+                        <div className="mt-1.5 text-center font-mono-ui text-[10px]" style={{ color: '#55D6C0' }}>
+                          Upptäckt från inspelningen
+                        </div>
+                      )}
+                      <button
+                        onClick={toggleMetronomeListen}
+                        className="stamma-btn w-full mt-3 rounded-lg py-1.5 flex items-center justify-center gap-1.5 font-body font-medium text-xs"
+                        style={{
+                          backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                          color: metronomeListening ? '#55D6C0' : '#F1EDE4',
+                          border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                        }}
+                      >
+                        {metronomeListening ? <PauseIcon size={13} /> : <PlayIcon size={13} />}
+                        {metronomeListening ? 'Stoppa' : 'Lyssna'}
+                      </button>
+                    </div>
+                  )}
+                </div>
                 <button
                   onClick={toggleAllChannelsExpanded}
-                  className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
+                  className="stamma-btn flex items-center gap-1 font-mono-ui text-xs shrink-0"
                   style={{ color: '#C7CBDA' }}
                 >
                   {allChannelsExpanded ? 'Göm alla' : 'Expandera alla'}
@@ -3215,6 +3491,17 @@ function TrashIcon({ size = 14 }) {
       <path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" />
       <path d="M10 11v6" />
       <path d="M14 11v6" />
+    </svg>
+  );
+}
+
+function MetronomeIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 21h8" />
+      <path d="M7 21L11 4h2l4 17" />
+      <path d="M9.5 13l5-3.5" />
+      <circle cx="12" cy="7" r="1" fill="currentColor" stroke="none" />
     </svg>
   );
 }
