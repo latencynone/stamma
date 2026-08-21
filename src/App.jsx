@@ -19,7 +19,7 @@ import {
   attachMeasuredFreq,
   extractFramesFromBuffer,
 } from './pitchAnalysis.js';
-import { renderHarmonyOffline, renderAutotunedMelody } from './harmonyEngine.js';
+import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 
 const HARMONY_KEYS = Object.keys(HARMONY_TYPES);
@@ -64,6 +64,219 @@ function scheduleFadeGain(gainParam, now, windowDur, elapsedIntoWindow, fadeInDu
       gainParam.linearRampToValueAtTime(0, now + (windowDur - elapsedIntoWindow));
     }
   }
+}
+
+// A synthetic reverb impulse response: exponentially-decaying filtered
+// noise, the standard cheap substitute for a recorded impulse when there's
+// no audio asset to convolve against. `decaySeconds` controls the tail
+// length (see REVERB_LEVELS); the squared falloff keeps the early part
+// audible without a harsh, unnaturally long noisy tail.
+function generateReverbImpulse(ctx, decaySeconds) {
+  const rate = ctx.sampleRate;
+  const length = Math.max(1, Math.floor(rate * decaySeconds));
+  const impulse = ctx.createBuffer(2, length, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = impulse.getChannelData(ch);
+    for (let i = 0; i < length; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 2.5);
+    }
+  }
+  return impulse;
+}
+
+// Every mixer channel connects to this bus's `input` instead of straight to
+// `ctx.destination`, so reverb (a mix-wide effect, not per-channel) only
+// needs to exist in one place. The dry path is always wired through
+// unconditionally — reverb off just means no wet path exists.
+function createReverbBus(ctx, reverbOn, reverbLevel) {
+  const input = ctx.createGain();
+  input.connect(ctx.destination);
+  if (!reverbOn || !reverbLevel) return { input };
+  const convolver = ctx.createConvolver();
+  convolver.buffer = generateReverbImpulse(ctx, reverbLevel.decay);
+  const wetGain = ctx.createGain();
+  wetGain.gain.value = reverbLevel.wet;
+  input.connect(convolver);
+  convolver.connect(wetGain);
+  wetGain.connect(ctx.destination);
+  return { input, convolver, wetGain };
+}
+
+/* ---------- Noise reduction (spectral subtraction) ----------
+ * A from-scratch, moderate-quality implementation — not a match for a
+ * dedicated plugin, but a real spectral noise reduction pass rather than a
+ * simple gate: it learns a noise magnitude spectrum from a user-marked
+ * (or auto-detected) quiet region, then subtracts that spectrum from every
+ * analysis frame across the whole recording via STFT / overlap-add.
+ */
+
+// In-place radix-2 Cooley-Tukey FFT. `re`/`im` length must be a power of 2.
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curWr = 1, curWi = 0;
+      const half = len / 2;
+      for (let j = 0; j < half; j++) {
+        const uRe = re[i + j], uIm = im[i + j];
+        const vRe = re[i + j + half] * curWr - im[i + j + half] * curWi;
+        const vIm = re[i + j + half] * curWi + im[i + j + half] * curWr;
+        re[i + j] = uRe + vRe;
+        im[i + j] = uIm + vIm;
+        re[i + j + half] = uRe - vRe;
+        im[i + j + half] = uIm - vIm;
+        const nextWr = curWr * wr - curWi * wi;
+        const nextWi = curWr * wi + curWi * wr;
+        curWr = nextWr;
+        curWi = nextWi;
+      }
+    }
+  }
+}
+
+function ifft(re, im) {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < n; i++) {
+    re[i] /= n;
+    im[i] = -im[i] / n;
+  }
+}
+
+function hannWindow(size) {
+  const w = new Float32Array(size);
+  for (let i = 0; i < size; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (size - 1));
+  return w;
+}
+
+// Average magnitude spectrum over [startSec, endSec) — the "what does the
+// room/hiss sound like" fingerprint that gets subtracted from every frame
+// of the full recording.
+function computeNoiseProfile(channelData, sampleRate, startSec, endSec, fftSize, window) {
+  const hop = fftSize / 2;
+  const startSample = Math.max(0, Math.floor(startSec * sampleRate));
+  const endSample = Math.min(channelData.length, Math.floor(endSec * sampleRate));
+  const profile = new Float32Array(fftSize / 2 + 1);
+  const re = new Float32Array(fftSize);
+  const im = new Float32Array(fftSize);
+  let frameCount = 0;
+  for (let start = startSample; start + fftSize <= endSample; start += hop) {
+    for (let i = 0; i < fftSize; i++) {
+      re[i] = channelData[start + i] * window[i];
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k <= fftSize / 2; k++) profile[k] += Math.hypot(re[k], im[k]);
+    frameCount++;
+  }
+  if (frameCount === 0) {
+    // Region shorter than one FFT frame — zero-pad a single frame instead
+    // of producing an empty (all-zero, i.e. no-op) profile.
+    for (let i = 0; i < fftSize; i++) {
+      const idx = startSample + i;
+      re[i] = (idx < endSample && idx < channelData.length ? channelData[idx] : 0) * window[i];
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k <= fftSize / 2; k++) profile[k] = Math.hypot(re[k], im[k]);
+    frameCount = 1;
+  }
+  for (let k = 0; k < profile.length; k++) profile[k] /= frameCount;
+  return profile;
+}
+
+// Runs the actual subtraction across the whole channel via STFT / overlap-
+// add. `oversubtract` pushes the noise estimate down harder than measured
+// (standard spectral-subtraction practice, since a single averaged profile
+// under-represents the noise's real peaks); `floorRatio` keeps a small
+// fraction of each bin rather than letting it hit zero, which is what
+// avoids the "musical noise" (isolated warbling tones) naive spectral
+// subtraction is known for.
+function spectralSubtractChannel(channelData, noiseProfile, fftSize, window, oversubtract = 1.6, floorRatio = 0.06) {
+  const hop = fftSize / 2;
+  const out = new Float32Array(channelData.length);
+  const windowSum = new Float32Array(channelData.length);
+  const re = new Float32Array(fftSize);
+  const im = new Float32Array(fftSize);
+  let lastCovered = 0;
+
+  for (let start = 0; start + fftSize <= channelData.length; start += hop) {
+    for (let i = 0; i < fftSize; i++) {
+      re[i] = channelData[start + i] * window[i];
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k <= fftSize / 2; k++) {
+      const mag = Math.hypot(re[k], im[k]);
+      const phase = Math.atan2(im[k], re[k]);
+      const floor = mag * floorRatio;
+      const newMag = Math.max(floor, mag - noiseProfile[k] * oversubtract);
+      re[k] = newMag * Math.cos(phase);
+      im[k] = newMag * Math.sin(phase);
+      if (k > 0 && k < fftSize / 2) {
+        // Real-signal spectrum is conjugate-symmetric — mirror the
+        // negative-frequency bin instead of computing it separately.
+        re[fftSize - k] = re[k];
+        im[fftSize - k] = -im[k];
+      }
+    }
+    ifft(re, im);
+    for (let i = 0; i < fftSize; i++) {
+      out[start + i] += re[i] * window[i];
+      windowSum[start + i] += window[i] * window[i];
+    }
+    lastCovered = start + fftSize;
+  }
+  for (let i = 0; i < out.length; i++) {
+    out[i] = windowSum[i] > 1e-6 ? out[i] / windowSum[i] : channelData[i];
+  }
+  // The tail shorter than one hop past the last full frame never got a
+  // window contribution at all — carry the original signal through rather
+  // than leaving it silent.
+  for (let i = lastCovered; i < out.length; i++) out[i] = channelData[i];
+  return out;
+}
+
+// Finds a plausible noise-only stretch to pre-select: the longest run of
+// consecutive low-energy frames (quiet, but not hard digital silence — true
+// silence carries no usable noise-floor information), capped at 1.5s so the
+// profile stays local instead of averaging over unrelated parts of the
+// take. Falls back to the first 0.4s (room tone before singing is common)
+// if nothing better stands out.
+function detectNoiseRegion(channelData, sampleRate, duration) {
+  const envelope = computeEnergyEnvelope(channelData, sampleRate, 0.02);
+  if (!envelope.length) return { start: 0, end: Math.min(0.4, duration) };
+  const sorted = envelope.map((e) => e.rms).slice().sort((a, b) => a - b);
+  const threshold = Math.max(0.0008, sorted[Math.floor(sorted.length * 0.2)] * 1.5);
+  let best = null;
+  let runStart = null;
+  for (let i = 0; i <= envelope.length; i++) {
+    const frame = envelope[i];
+    const inRun = frame && frame.rms <= threshold && frame.rms > 0.0003;
+    if (inRun) {
+      if (runStart === null) runStart = frame.t;
+    } else if (runStart !== null) {
+      const runEnd = frame ? frame.t : duration;
+      const len = runEnd - runStart;
+      if (len >= 0.4 && (!best || len > best.len)) {
+        best = { start: runStart, end: Math.min(runEnd, runStart + 1.5), len };
+      }
+      runStart = null;
+    }
+  }
+  return best ? { start: best.start, end: best.end } : { start: 0, end: Math.min(0.4, duration) };
 }
 
 /* ---------- Formant "voice" synthesis ---------- */
@@ -330,9 +543,13 @@ const FADE_COLOR = '#FFD84D';
 // from the centerline rather than from one corner.
 // Not zoomable like PitchCanvas — fullscreen here is purely about giving
 // the drag handles more pixels to land precisely on.
+const NOISE_COLOR = '#FF9F5A';
+
 function WaveformTrimmer({
   peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime,
   isPlaying, onPlayPause, onSeek, playDisabled,
+  noiseReductionMode, onToggleNoiseReductionMode, noiseSampleStart, noiseSampleEnd, onNoiseSampleChange,
+  onApplyNoiseReduction, denoising, denoiseError,
 }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
@@ -412,6 +629,18 @@ function WaveformTrimmer({
         ctx.stroke();
       }
 
+      if (noiseReductionMode) {
+        const nx0 = xFor(Math.max(0, noiseSampleStart));
+        const nx1 = xFor(Math.min(duration, noiseSampleEnd));
+        ctx.fillStyle = 'rgba(255,159,90,0.18)';
+        ctx.fillRect(nx0, 0, nx1 - nx0, height);
+        ctx.strokeStyle = NOISE_COLOR;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(nx0 + 0.75, 0.75, Math.max(0, nx1 - nx0 - 1.5), height - 1.5);
+        ctx.setLineDash([]);
+      }
+
       if (playheadTime !== null && playheadTime !== undefined) {
         const x = xFor(Math.min(playheadTime, duration));
         ctx.strokeStyle = '#FFFFFF';
@@ -428,7 +657,7 @@ function WaveformTrimmer({
 
     drawRef.current = draw;
     draw();
-  }, [peaks, duration, trimStart, trimEnd, fadeIn, fadeOut, playheadTime, isFullscreen]);
+  }, [peaks, duration, trimStart, trimEnd, fadeIn, fadeOut, playheadTime, isFullscreen, noiseReductionMode, noiseSampleStart, noiseSampleEnd]);
 
   // Same reasoning as PitchCanvas's ResizeObserver: the fullscreen overlay's
   // real size settles a moment after isFullscreen flips, so redraw on
@@ -492,6 +721,35 @@ function WaveformTrimmer({
     };
   }
 
+  // Unlike trim/fade, the noise sample region isn't clamped inside the
+  // trim window — a quiet stretch worth sampling might sit just outside
+  // the part you're actually keeping (room tone before the trimmed-in
+  // singing starts, say), so this ranges over the full recording.
+  const NOISE_MIN_GAP = 0.1;
+  function beginNoiseDrag(which) {
+    return (e) => {
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        const rect = wrapRef.current.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+        const t = frac * duration;
+        if (which === 'start') {
+          onNoiseSampleChange(Math.min(t, noiseSampleEnd - NOISE_MIN_GAP), noiseSampleEnd);
+        } else {
+          onNoiseSampleChange(noiseSampleStart, Math.max(t, noiseSampleStart + NOISE_MIN_GAP));
+        }
+      };
+      const up = () => {
+        handle.releasePointerCapture(e.pointerId);
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    };
+  }
+
   const startPct = duration > 0 ? Math.min(100, (trimStart / duration) * 100) : 0;
   const endPct = duration > 0 ? Math.min(100, (trimEnd / duration) * 100) : 100;
   const windowDurForHandles = Math.max(0.001, trimEnd - trimStart);
@@ -533,6 +791,32 @@ function WaveformTrimmer({
     />
   );
 
+  const noiseStartPct = duration > 0 ? Math.min(100, (Math.max(0, noiseSampleStart) / duration) * 100) : 0;
+  const noiseEndPct = duration > 0 ? Math.min(100, (Math.min(duration, noiseSampleEnd) / duration) * 100) : 0;
+
+  const noiseHandleStyle = (pct) => ({
+    position: 'absolute',
+    bottom: 0,
+    left: `calc(${pct}% - 9px)`,
+    width: 18,
+    height: 18,
+    cursor: 'ew-resize',
+    touchAction: 'none',
+  });
+
+  const noiseFlag = (
+    <div
+      style={{
+        width: 0,
+        height: 0,
+        borderBottom: `11px solid ${NOISE_COLOR}`,
+        borderLeft: '9px solid transparent',
+        borderRight: '9px solid transparent',
+        filter: 'drop-shadow(0 -1px 2px rgba(0,0,0,0.5))',
+      }}
+    />
+  );
+
   return (
     <div className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
       <div className="flex items-center justify-between mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
@@ -564,6 +848,16 @@ function WaveformTrimmer({
         <div onPointerDown={beginFadeDrag('out')} style={fadeHandleStyle(fadeOutPct)} title="Tona ut">
           {fadeFlag(false)}
         </div>
+        {isFullscreen && noiseReductionMode && (
+          <>
+            <div onPointerDown={beginNoiseDrag('start')} style={noiseHandleStyle(noiseStartPct)} title="Brusprov start">
+              {noiseFlag}
+            </div>
+            <div onPointerDown={beginNoiseDrag('end')} style={noiseHandleStyle(noiseEndPct)} title="Brusprov slut">
+              {noiseFlag}
+            </div>
+          </>
+        )}
       </div>
       <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>
         <span style={{ color: '#55D6C0' }}>{trimStart.toFixed(1)}s</span>
@@ -574,6 +868,45 @@ function WaveformTrimmer({
         <span>Tona in: {fadeInClamped.toFixed(1)}s</span>
         <span>Tona ut: {fadeOutClamped.toFixed(1)}s</span>
       </div>
+
+      {/* Fullscreen only, per request — precise placement of the noise
+          sample needs the extra room the compact view doesn't have. */}
+      {isFullscreen && onToggleNoiseReductionMode && (
+        <div className="mt-4 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: `1px solid ${noiseReductionMode ? `${NOISE_COLOR}55` : 'rgba(241,237,228,0.1)'}` }}>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-medium">Brusreducering</div>
+              <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                Markera en del med bara brus — resten av inspelningen renas utifrån den
+              </div>
+            </div>
+            <ToggleSwitch checked={noiseReductionMode} onChange={onToggleNoiseReductionMode} accentColor={NOISE_COLOR} />
+          </div>
+          {noiseReductionMode && (
+            <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+              <div className="flex justify-between font-mono-ui text-[10px] mb-2" style={{ color: NOISE_COLOR }}>
+                <span>Brusprov: {noiseSampleStart.toFixed(2)}s – {noiseSampleEnd.toFixed(2)}s</span>
+                <span>({(noiseSampleEnd - noiseSampleStart).toFixed(2)}s)</span>
+              </div>
+              <button
+                onClick={onApplyNoiseReduction}
+                disabled={denoising}
+                className="stamma-btn w-full rounded-xl py-2.5 flex items-center justify-center gap-2 font-body font-medium text-sm"
+                style={{
+                  backgroundColor: denoising ? 'rgba(241,237,228,0.06)' : NOISE_COLOR,
+                  color: denoising ? 'rgba(241,237,228,0.3)' : '#10131A',
+                  cursor: denoising ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {denoising ? 'Bearbetar …' : 'Tillämpa brusreducering'}
+              </button>
+              {denoiseError && (
+                <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{denoiseError}</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Fullscreen only — the normal view's play/pause and seek slider
           live in the parent, right below this component, but that's
@@ -628,6 +961,16 @@ const AUTOTUNE_LEVELS = [
   { key: 'light', label: 'Lätt', amount: 0.25 },
   { key: 'medium', label: 'Medel', amount: 0.45 },
   { key: 'hard', label: 'Hård', amount: 0.7 },
+];
+
+// Strength stops for reverb, same on/off + collapsed strength UI pattern
+// as autotune. `decay` is the synthetic impulse response's length
+// (seconds); `wet` is how much of the reverberated signal gets mixed
+// back in alongside the untouched dry signal.
+const REVERB_LEVELS = [
+  { key: 'light', label: 'Lätt', decay: 0.9, wet: 0.14 },
+  { key: 'medium', label: 'Medel', decay: 1.7, wet: 0.24 },
+  { key: 'large', label: 'Stor', decay: 3.0, wet: 0.38 },
 ];
 
 function defaultChannels() {
@@ -768,6 +1111,17 @@ export default function App() {
   const [autotuneStrengthExpanded, setAutotuneStrengthExpanded] = useState(false);
   const [autotuneRendering, setAutotuneRendering] = useState(false);
   const [autotuneRenderError, setAutotuneRenderError] = useState('');
+  const [reverbOn, setReverbOn] = useState(false);
+  const [reverbLevelIndex, setReverbLevelIndex] = useState(0);
+  const [reverbStrengthExpanded, setReverbStrengthExpanded] = useState(false);
+  const [isProcessed, setIsProcessed] = useState(false); // recordedBufferRef differs from the original decode
+  const [normalizing, setNormalizing] = useState(false);
+  const [normalizeError, setNormalizeError] = useState('');
+  const [noiseReductionMode, setNoiseReductionMode] = useState(false);
+  const [noiseSampleStart, setNoiseSampleStart] = useState(0);
+  const [noiseSampleEnd, setNoiseSampleEnd] = useState(0.5);
+  const [denoising, setDenoising] = useState(false);
+  const [denoiseError, setDenoiseError] = useState('');
   const [micPermission, setMicPermission] = useState('unknown');
   const [introExpanded, setIntroExpanded] = useState(false);
   const [showAbout, setShowAbout] = useState(() => window.location.hash === '#om');
@@ -795,6 +1149,11 @@ export default function App() {
   const meterRefs = useRef({});
   const meterScratchRef = useRef(null);
   const recordedBufferRef = useRef(null);
+  // The untouched decode, kept alongside recordedBufferRef (the "current
+  // working" buffer everything else reads from) so normalize/noise
+  // reduction — both one-shot, destructive operations — have something to
+  // revert back to.
+  const originalRecordingBufferRef = useRef(null);
   const playTimeoutRef = useRef(null);
   const recordingStartRef = useRef(0);
   const playheadRafRef = useRef(null);
@@ -812,6 +1171,7 @@ export default function App() {
   const ownTakeRafRef = useRef(null);
   const ownTakeStartRef = useRef(0);
   const ownTakeFinishedRef = useRef(false);
+  const reverbBusRef = useRef(null);
 
   // Read inside the playback-end setTimeout, which was scheduled back when
   // it fired — using state directly there would capture whatever loopEnabled
@@ -1043,6 +1403,15 @@ export default function App() {
     setAutotuneStrengthExpanded(false);
     setExpandedChannels({});
     recordedBufferRef.current = null;
+    originalRecordingBufferRef.current = null;
+    setIsProcessed(false);
+    setNormalizing(false);
+    setNormalizeError('');
+    setNoiseReductionMode(false);
+    setNoiseSampleStart(0);
+    setNoiseSampleEnd(0.5);
+    setDenoising(false);
+    setDenoiseError('');
     harmonyBuffersRef.current = {};
     harmonyRenderPromisesRef.current = {};
     setHarmonyRenderingByType({});
@@ -1088,6 +1457,113 @@ export default function App() {
       peaks[i] = max;
     }
     return peaks;
+  }
+
+  // Any processing applied to the recording (normalize, noise reduction)
+  // invalidates buffers derived from the old version of it, and needs a
+  // redrawn waveform + a stopped mix (playing nodes already reference the
+  // old buffer).
+  function applyProcessedRecording(newBuffer) {
+    recordedBufferRef.current = newBuffer;
+    setIsProcessed(true);
+    setWaveformPeaks(computeWaveformPeaks(newBuffer));
+    harmonyBuffersRef.current = {};
+    autotunedBuffersRef.current = {};
+    if (isPlaying) stopPlayback();
+  }
+
+  function revertToOriginalRecording() {
+    if (!originalRecordingBufferRef.current) return;
+    recordedBufferRef.current = originalRecordingBufferRef.current;
+    setIsProcessed(false);
+    setWaveformPeaks(computeWaveformPeaks(originalRecordingBufferRef.current));
+    harmonyBuffersRef.current = {};
+    autotunedBuffersRef.current = {};
+    setNormalizeError('');
+    setDenoiseError('');
+    if (isPlaying) stopPlayback();
+  }
+
+  // Peak-normalizes the current recording to just under full scale.
+  // One-shot and destructive (see revertToOriginalRecording for the way
+  // back), matching how "normalize" behaves in a regular audio editor.
+  async function normalizeRecording() {
+    const source = recordedBufferRef.current;
+    if (!source || normalizing) return;
+    setNormalizing(true);
+    setNormalizeError('');
+    try {
+      let peak = 0;
+      for (let ch = 0; ch < source.numberOfChannels; ch++) {
+        const data = source.getChannelData(ch);
+        for (let i = 0; i < data.length; i++) {
+          const abs = Math.abs(data[i]);
+          if (abs > peak) peak = abs;
+        }
+      }
+      if (peak <= 0.0005) {
+        setNormalizeError('Inspelningen verkar vara helt tyst — går inte att normalisera.');
+        return;
+      }
+      const gain = 0.97 / peak;
+      const ctx = await getPlaybackContext();
+      const outBuffer = ctx.createBuffer(source.numberOfChannels, source.length, source.sampleRate);
+      for (let ch = 0; ch < source.numberOfChannels; ch++) {
+        const data = source.getChannelData(ch);
+        const out = new Float32Array(data.length);
+        for (let i = 0; i < data.length; i++) out[i] = data[i] * gain;
+        outBuffer.copyToChannel(out, ch);
+      }
+      applyProcessedRecording(outBuffer);
+    } catch (err) {
+      setNormalizeError('Kunde inte normalisera inspelningen. Testa igen.');
+    } finally {
+      setNormalizing(false);
+    }
+  }
+
+  // Turning noise-reduction mode on (from the waveform's fullscreen view)
+  // pre-selects a plausible noise sample via detectNoiseRegion — the user
+  // can drag the handles from there instead of starting from nothing.
+  function enterNoiseReductionMode() {
+    const source = recordedBufferRef.current;
+    if (source) {
+      const region = detectNoiseRegion(source.getChannelData(0), source.sampleRate, source.duration);
+      setNoiseSampleStart(region.start);
+      setNoiseSampleEnd(region.end);
+    }
+    setNoiseReductionMode(true);
+  }
+
+  // Learns a noise profile from [noiseSampleStart, noiseSampleEnd) and
+  // subtracts it from the whole recording via STFT/overlap-add (see
+  // spectralSubtractChannel). One-shot and destructive like normalize —
+  // always runs against the CURRENT recordedBufferRef, so normalize +
+  // denoise compose in whichever order they're applied, and re-running
+  // denoise with adjusted handles re-processes from there again.
+  async function applyNoiseReduction() {
+    const source = recordedBufferRef.current;
+    if (!source || denoising) return;
+    const start = Math.max(0, Math.min(noiseSampleStart, source.duration));
+    const end = Math.max(start + 0.05, Math.min(noiseSampleEnd, source.duration));
+    setDenoising(true);
+    setDenoiseError('');
+    try {
+      const fftSize = 2048;
+      const window = hannWindow(fftSize);
+      const profile = computeNoiseProfile(source.getChannelData(0), source.sampleRate, start, end, fftSize, window);
+      const ctx = await getPlaybackContext();
+      const outBuffer = ctx.createBuffer(source.numberOfChannels, source.length, source.sampleRate);
+      for (let ch = 0; ch < source.numberOfChannels; ch++) {
+        const processed = spectralSubtractChannel(source.getChannelData(ch), profile, fftSize, window);
+        outBuffer.copyToChannel(processed, ch);
+      }
+      applyProcessedRecording(outBuffer);
+    } catch (err) {
+      setDenoiseError('Kunde inte brusreducera inspelningen. Testa igen, eller välj en annan del som brusprov.');
+    } finally {
+      setDenoising(false);
+    }
   }
 
   async function startRecording() {
@@ -1191,6 +1667,7 @@ export default function App() {
             : new (window.AudioContext || window.webkitAudioContext)();
           const audioBuffer = await decodeCtx.decodeAudioData(arrayBuf);
           recordedBufferRef.current = audioBuffer;
+          originalRecordingBufferRef.current = audioBuffer;
           setVoiceReady(true);
           setWaveformPeaks(computeWaveformPeaks(audioBuffer));
         } catch (e) {
@@ -1306,6 +1783,7 @@ export default function App() {
       buffer = trimAudioBuffer(decodeCtx, buffer, DURATION);
 
       recordedBufferRef.current = buffer;
+      originalRecordingBufferRef.current = buffer;
       setVoiceReady(true);
       setRecordingDuration(Math.max(0.3, buffer.duration));
       setWaveformPeaks(computeWaveformPeaks(buffer));
@@ -1384,6 +1862,12 @@ export default function App() {
       try { nodes.pannerNode.disconnect(); } catch (e) { /* already disconnected */ }
     });
     mixNodesRef.current = {};
+    if (reverbBusRef.current) {
+      try { reverbBusRef.current.input.disconnect(); } catch (e) { /* already disconnected */ }
+      try { reverbBusRef.current.convolver?.disconnect(); } catch (e) { /* already disconnected */ }
+      try { reverbBusRef.current.wetGain?.disconnect(); } catch (e) { /* already disconnected */ }
+      reverbBusRef.current = null;
+    }
     Object.values(meterRefs.current).forEach((el) => { if (el) el.style.width = '0%'; });
     setIsPlaying(false);
     if (!keepPosition) setPlayheadTime(null);
@@ -1541,7 +2025,10 @@ export default function App() {
   // `fadeInDur`/`fadeOutDur` (seconds) drive a separate automation-only
   // gain stage — kept apart from `gainNode` (the user's live volume
   // fader) so a fader drag never collides with a scheduled fade ramp.
-  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur, playFrom) {
+  // `destNode` is the reverb bus's input (see createReverbBus) rather than
+  // ctx.destination directly — reverb is mix-wide, so every channel feeds
+  // the same bus instead of each needing its own send.
+  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur, playFrom, destNode) {
     const gainNode = ctx.createGain();
     gainNode.gain.value = channelState.volume;
 
@@ -1561,7 +2048,7 @@ export default function App() {
     const pannerNode = ctx.createStereoPanner();
     pannerNode.pan.value = channelState.pan || 0;
     fadeGainNode.connect(pannerNode);
-    pannerNode.connect(ctx.destination);
+    pannerNode.connect(destNode);
 
     let sourceNode;
     if (content.kind === 'buffer') {
@@ -1631,8 +2118,11 @@ export default function App() {
     const rangeEnd = Math.max(rangeStart + 0.05, Math.min(effectiveTrimEnd, recordingDuration));
     const playFrom = Math.max(rangeStart, Math.min(startOffset ?? rangeStart, rangeEnd - 0.05));
 
+    const reverbBus = createReverbBus(ctx, reverbOn, REVERB_LEVELS[reverbLevelIndex]);
+    reverbBusRef.current = reverbBus;
+
     const now = ctx.currentTime + 0.05;
-    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom));
+    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom, reverbBus.input));
 
     activeSourcesRef.current = started;
     setIsPlaying(true);
@@ -2085,6 +2575,52 @@ export default function App() {
               )}
             </div>
 
+            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">Reverb</div>
+                  <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                    Lägger på lite rymd på hela mixen
+                  </div>
+                </div>
+                <ToggleSwitch
+                  checked={reverbOn}
+                  onChange={() => { setReverbOn((v) => !v); if (isPlaying) stopPlayback(); }}
+                  accentColor="#55D6C0"
+                />
+              </div>
+              {reverbOn && (
+                <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                  <button
+                    onClick={() => setReverbStrengthExpanded((v) => !v)}
+                    className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
+                    style={{ color: '#55D6C0' }}
+                  >
+                    <span>Storlek: {REVERB_LEVELS[reverbLevelIndex].label}</span>
+                    <span style={{ display: 'inline-block', fontSize: 15, transform: reverbStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                  </button>
+                  {reverbStrengthExpanded && (
+                    <div className="mt-2.5 grid grid-cols-3 gap-1.5">
+                      {REVERB_LEVELS.map((lvl, i) => (
+                        <button
+                          key={lvl.key}
+                          onClick={() => { setReverbLevelIndex(i); if (isPlaying) stopPlayback(); }}
+                          className="stamma-btn rounded-md py-1.5 text-xs font-medium"
+                          style={{
+                            backgroundColor: reverbLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
+                            color: reverbLevelIndex === i ? '#55D6C0' : '#C7CBDA',
+                            border: reverbLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                          }}
+                        >
+                          {lvl.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             <div>
               <div className="flex items-center justify-between mb-2">
                 <h2 className="font-display text-lg font-semibold">Mixer</h2>
@@ -2122,7 +2658,43 @@ export default function App() {
                     onPlayPause={togglePlayPause}
                     onSeek={seekTo}
                     playDisabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
+                    noiseReductionMode={noiseReductionMode}
+                    onToggleNoiseReductionMode={() => (noiseReductionMode ? setNoiseReductionMode(false) : enterNoiseReductionMode())}
+                    noiseSampleStart={noiseSampleStart}
+                    noiseSampleEnd={noiseSampleEnd}
+                    onNoiseSampleChange={(s, e) => { setNoiseSampleStart(s); setNoiseSampleEnd(e); }}
+                    onApplyNoiseReduction={applyNoiseReduction}
+                    denoising={denoising}
+                    denoiseError={denoiseError}
                   />
+
+                  <div className="flex items-center gap-2 mt-3">
+                    <button
+                      onClick={normalizeRecording}
+                      disabled={normalizing}
+                      className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
+                      style={{
+                        backgroundColor: 'rgba(241,237,228,0.06)',
+                        color: normalizing ? 'rgba(241,237,228,0.3)' : '#F1EDE4',
+                        border: '1px solid rgba(241,237,228,0.12)',
+                        cursor: normalizing ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      {normalizing ? 'Normaliserar …' : 'Normalisera'}
+                    </button>
+                    {isProcessed && (
+                      <button
+                        onClick={revertToOriginalRecording}
+                        className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
+                        style={{ backgroundColor: 'rgba(255,107,107,0.1)', color: '#FFB4B4', border: '1px solid rgba(255,107,107,0.3)' }}
+                      >
+                        Återställ till original
+                      </button>
+                    )}
+                  </div>
+                  {normalizeError && (
+                    <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{normalizeError}</div>
+                  )}
 
                   <div className="mt-3">
                     <TransportButtons
