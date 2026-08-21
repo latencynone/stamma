@@ -1201,6 +1201,9 @@ export default function App() {
   const [denoising, setDenoising] = useState(false);
   const [denoiseError, setDenoiseError] = useState('');
   const [effectsExpanded, setEffectsExpanded] = useState(false);
+  const [ljudExpanded, setLjudExpanded] = useState(true);
+  const [mixerExpanded, setMixerExpanded] = useState(true);
+  const [exportExpanded, setExportExpanded] = useState(false);
   const [metronomeEnabled, setMetronomeEnabled] = useState(false); // clicks during an actual recording
   const [metronomeBpm, setMetronomeBpm] = useState(100);
   const [metronomeListening, setMetronomeListening] = useState(false); // preview click loop, not recording
@@ -2581,37 +2584,51 @@ export default function App() {
                 <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Klick vid inspelning</span>
                 <ToggleSwitch checked={metronomeEnabled} onChange={() => setMetronomeEnabled((v) => !v)} accentColor="#55D6C0" />
               </div>
-              <div className="flex items-center justify-center gap-4 mt-3">
+              <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
                 <button
-                  onClick={() => adjustMetronomeBpm(-5)}
-                  className="stamma-btn rounded-md flex items-center justify-center"
-                  style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
-                  aria-label="Sänk takt"
+                  onClick={() => setMetronomeExpanded((v) => !v)}
+                  className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
+                  style={{ color: '#55D6C0' }}
                 >
-                  −
+                  <span>Takt: {metronomeBpm} BPM</span>
+                  <span style={{ display: 'inline-block', fontSize: 15, transform: metronomeExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
                 </button>
-                <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4', minWidth: 90, textAlign: 'center' }}>{metronomeBpm} BPM</span>
-                <button
-                  onClick={() => adjustMetronomeBpm(5)}
-                  className="stamma-btn rounded-md flex items-center justify-center"
-                  style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
-                  aria-label="Höj takt"
-                >
-                  +
-                </button>
+                {metronomeExpanded && (
+                  <div className="mt-2.5">
+                    <div className="flex items-center justify-center gap-4">
+                      <button
+                        onClick={() => adjustMetronomeBpm(-5)}
+                        className="stamma-btn rounded-md flex items-center justify-center"
+                        style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                        aria-label="Sänk takt"
+                      >
+                        −
+                      </button>
+                      <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4', minWidth: 90, textAlign: 'center' }}>{metronomeBpm} BPM</span>
+                      <button
+                        onClick={() => adjustMetronomeBpm(5)}
+                        className="stamma-btn rounded-md flex items-center justify-center"
+                        style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                        aria-label="Höj takt"
+                      >
+                        +
+                      </button>
+                    </div>
+                    <button
+                      onClick={toggleMetronomeListen}
+                      className="stamma-btn w-full mt-3 rounded-lg py-2 flex items-center justify-center gap-1.5 font-body font-medium text-sm"
+                      style={{
+                        backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                        color: metronomeListening ? '#55D6C0' : '#F1EDE4',
+                        border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                      }}
+                    >
+                      {metronomeListening ? <PauseIcon size={15} /> : <PlayIcon size={15} />}
+                      {metronomeListening ? 'Stoppa' : 'Lyssna på takten'}
+                    </button>
+                  </div>
+                )}
               </div>
-              <button
-                onClick={toggleMetronomeListen}
-                className="stamma-btn w-full mt-3 rounded-lg py-2 flex items-center justify-center gap-1.5 font-body font-medium text-sm"
-                style={{
-                  backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                  color: metronomeListening ? '#55D6C0' : '#F1EDE4',
-                  border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                }}
-              >
-                {metronomeListening ? <PauseIcon size={15} /> : <PlayIcon size={15} />}
-                {metronomeListening ? 'Stoppa' : 'Lyssna på takten'}
-              </button>
             </div>
             <button
               onClick={startRecording}
@@ -2691,32 +2708,42 @@ export default function App() {
         {phase === 'ready' && (
           <div className="space-y-5">
             <div>
-              <h2 className="font-display text-lg font-semibold mb-2">Ljud</h2>
-              <div className="grid grid-cols-3 gap-2">
-                {Object.keys(SOUND_TYPES).map((type) => {
-                  const active = soundType === type;
-                  const disabled = type === 'recording' && !voiceReady;
-                  return (
-                    <button
-                      key={type}
-                      onClick={() => { if (!disabled) { setSoundType(type); if (isPlaying) stopPlayback(); } }}
-                      disabled={disabled}
-                      className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
-                      style={{
-                        backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : active ? '#FFB454' : 'rgba(241,237,228,0.06)',
-                        color: disabled ? 'rgba(241,237,228,0.25)' : active ? '#10131A' : '#F1EDE4',
-                        border: active ? '1px solid #FFB454' : '1px solid rgba(241,237,228,0.12)',
-                        cursor: disabled ? 'not-allowed' : 'pointer',
-                      }}
-                    >
-                      {SOUND_TYPES[type].label}
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
-                {SOUND_TYPES[soundType].description}
-              </p>
+              <button
+                onClick={() => setLjudExpanded((v) => !v)}
+                className="stamma-btn w-full flex items-center justify-between mb-2"
+              >
+                <h2 className="font-display text-lg font-semibold">Ljud</h2>
+                <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: ljudExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+              </button>
+              {ljudExpanded && (
+                <>
+                  <div className="grid grid-cols-3 gap-2">
+                    {Object.keys(SOUND_TYPES).map((type) => {
+                      const active = soundType === type;
+                      const disabled = type === 'recording' && !voiceReady;
+                      return (
+                        <button
+                          key={type}
+                          onClick={() => { if (!disabled) { setSoundType(type); if (isPlaying) stopPlayback(); } }}
+                          disabled={disabled}
+                          className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
+                          style={{
+                            backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : active ? '#FFB454' : 'rgba(241,237,228,0.06)',
+                            color: disabled ? 'rgba(241,237,228,0.25)' : active ? '#10131A' : '#F1EDE4',
+                            border: active ? '1px solid #FFB454' : '1px solid rgba(241,237,228,0.12)',
+                            cursor: disabled ? 'not-allowed' : 'pointer',
+                          }}
+                        >
+                          {SOUND_TYPES[type].label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
+                    {SOUND_TYPES[soundType].description}
+                  </p>
+                </>
+              )}
             </div>
 
             <div>
@@ -2828,13 +2855,21 @@ export default function App() {
 
             <div>
               <div className="flex items-center justify-between mb-2">
-                <h2 className="font-display text-lg font-semibold">Mixer</h2>
+                <button
+                  onClick={() => setMixerExpanded((v) => !v)}
+                  className="stamma-btn flex items-center gap-2"
+                >
+                  <h2 className="font-display text-lg font-semibold">Mixer</h2>
+                  <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: mixerExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                </button>
                 {isPlaying && (
                   <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
                     Stoppa
                   </button>
                 )}
               </div>
+              {mixerExpanded && (
+                <>
               <p className="text-sm leading-relaxed mb-3" style={{ color: '#C7CBDA' }}>
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
               </p>
@@ -3100,40 +3135,8 @@ export default function App() {
                   busy={anyHarmonyBusy || autotuneRendering}
                 />
               </div>
-            </div>
-
-            <div>
-              <h2 className="font-display text-lg font-semibold mb-2">Exportera</h2>
-              <p className="text-sm leading-relaxed mb-2" style={{ color: '#C7CBDA' }}>
-                Ladda ner sång och stämmor som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
-              </p>
-              <div className="grid grid-cols-1 gap-2">
-                <ExportButton
-                  label="Sång (original)"
-                  busy={exporting === 'song'}
-                  disabled={!voiceReady || soundType !== 'recording' || !!exporting}
-                  onClick={exportSong}
-                />
-                <ExportButton
-                  label={
-                    soundType === 'recording'
-                      ? autotuneEnabled ? 'Melodi (autotunad)' : 'Melodi (samma som originalet)'
-                      : 'Melodislinga (ren ton)'
-                  }
-                  busy={exporting === 'melody' || autotuneRendering}
-                  disabled={!melodyNotes.length || !!exporting || autotuneRendering}
-                  onClick={exportMelody}
-                />
-                {HARMONY_KEYS.map((type) => (
-                  <ExportButton
-                    key={type}
-                    label={`${HARMONY_TYPES[type].label} (${channels[type].direction === -1 ? 'under' : 'över'})`}
-                    busy={exporting === `harmony-${type}` || harmonyRenderingByType[type]}
-                    disabled={!melodyNotes.length || !!exporting || harmonyRenderingByType[type]}
-                    onClick={() => exportHarmonyType(type)}
-                  />
-                ))}
-              </div>
+                </>
+              )}
             </div>
 
             <button
@@ -3150,6 +3153,50 @@ export default function App() {
             >
               Ladda upp ny ljudfil
             </button>
+
+            <div>
+              <button
+                onClick={() => setExportExpanded((v) => !v)}
+                className="stamma-btn w-full flex items-center justify-between mb-2"
+              >
+                <h2 className="font-display text-lg font-semibold">Exportera</h2>
+                <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: exportExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+              </button>
+              {exportExpanded && (
+                <>
+                  <p className="text-sm leading-relaxed mb-2" style={{ color: '#C7CBDA' }}>
+                    Ladda ner sång och stämmor som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
+                  </p>
+                  <div className="grid grid-cols-1 gap-2">
+                    <ExportButton
+                      label="Sång (original)"
+                      busy={exporting === 'song'}
+                      disabled={!voiceReady || soundType !== 'recording' || !!exporting}
+                      onClick={exportSong}
+                    />
+                    <ExportButton
+                      label={
+                        soundType === 'recording'
+                          ? autotuneEnabled ? 'Melodi (autotunad)' : 'Melodi (samma som originalet)'
+                          : 'Melodislinga (ren ton)'
+                      }
+                      busy={exporting === 'melody' || autotuneRendering}
+                      disabled={!melodyNotes.length || !!exporting || autotuneRendering}
+                      onClick={exportMelody}
+                    />
+                    {HARMONY_KEYS.map((type) => (
+                      <ExportButton
+                        key={type}
+                        label={`${HARMONY_TYPES[type].label} (${channels[type].direction === -1 ? 'under' : 'över'})`}
+                        busy={exporting === `harmony-${type}` || harmonyRenderingByType[type]}
+                        disabled={!melodyNotes.length || !!exporting || harmonyRenderingByType[type]}
+                        onClick={() => exportHarmonyType(type)}
+                      />
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         )}
 
