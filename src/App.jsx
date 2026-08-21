@@ -97,7 +97,7 @@ function createFormantSum(ctx, source) {
 
 // `harmonyLayers`: array of { key, notes, color, glow } — one per currently
 // active (mixer-enabled) harmony type, drawn simultaneously in its own color.
-function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTime }) {
+function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, playheadTime }) {
   const canvasRef = useRef(null);
   const scrollWrapRef = useRef(null);
   const outerRef = useRef(null);
@@ -275,7 +275,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTi
 
   return (
     <div ref={outerRef} className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
-      <div className="flex items-center gap-2 mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+      <div className="flex flex-wrap items-center gap-2 mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
         <button
           onClick={() => setZoom((z) => Math.max(1, +(z - 0.5).toFixed(1)))}
           className="stamma-btn px-2.5 py-1 rounded-md"
@@ -293,6 +293,9 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, duration, playheadTi
         >
           +
         </button>
+        {keyLabel && (
+          <span style={{ color: '#FFB454', whiteSpace: 'nowrap' }}>Tonart: {keyLabel}</span>
+        )}
         <button
           onClick={toggleFullscreen}
           className="stamma-btn ml-auto px-2.5 py-1 rounded-md"
@@ -327,7 +330,10 @@ const FADE_COLOR = '#FFD84D';
 // from the centerline rather than from one corner.
 // Not zoomable like PitchCanvas — fullscreen here is purely about giving
 // the drag handles more pixels to land precisely on.
-function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime }) {
+function WaveformTrimmer({
+  peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime,
+  isPlaying, onPlayPause, onSeek, playDisabled,
+}) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -568,6 +574,44 @@ function WaveformTrimmer({ peaks, duration, trimStart, trimEnd, onTrimChange, fa
         <span>Tona in: {fadeInClamped.toFixed(1)}s</span>
         <span>Tona ut: {fadeOutClamped.toFixed(1)}s</span>
       </div>
+
+      {/* Fullscreen only — the normal view's play/pause and seek slider
+          live in the parent, right below this component, but that's
+          covered by this fixed overlay once isFullscreen is true. */}
+      {isFullscreen && onPlayPause && (
+        <div className="mt-4">
+          <button
+            onClick={onPlayPause}
+            disabled={playDisabled}
+            className="stamma-btn w-full rounded-xl py-3 flex items-center justify-center gap-2 font-body font-medium text-sm"
+            style={{
+              backgroundColor: playDisabled ? 'rgba(241,237,228,0.06)' : '#FFB454',
+              color: playDisabled ? 'rgba(241,237,228,0.3)' : '#10131A',
+              cursor: playDisabled ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {isPlaying ? <PauseIcon size={19} /> : <PlayIcon size={19} />}
+            {isPlaying ? 'Pausa' : 'Spela mix'}
+          </button>
+          <div className="flex items-center gap-2 mt-2">
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
+              {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
+            </span>
+            <input
+              type="range"
+              min={trimStart}
+              max={trimEnd}
+              step="0.01"
+              value={playheadTime !== null ? playheadTime : trimStart}
+              onChange={(e) => onSeek(parseFloat(e.target.value))}
+              className="stamma-fader w-full"
+              style={{ accentColor: '#FFB454' }}
+              aria-label="Spola i vågformen"
+            />
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{trimEnd.toFixed(1)}s</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -621,7 +665,7 @@ function AboutPage() {
       body: 'Appen lyssnar igenom inspelningen och räknar ut vilken ton som sjungs vid varje ögonblick. Det ritas upp som en kurva du kan zooma i och öppna i helskärm — varje stapel är en enskild ton.',
     },
     {
-      title: 'Uppfattad tonart',
+      title: 'Tonart',
       body: 'Utifrån vilka toner som förekommer mest gissar appen vilken tonart (dur eller moll) melodin ligger i. Det är den tonarten stämmorna sedan byggs utifrån, så en fel uppfattad tonart är den vanligaste orsaken till att en stämma låter konstig.',
     },
     {
@@ -1654,7 +1698,7 @@ export default function App() {
                   className="stamma-btn font-mono-ui text-xs align-middle"
                   style={{ color: '#55D6C0' }}
                 >
-                  Läs mer ▾
+                  Läs mer <span style={{ fontSize: 15 }}>▾</span>
                 </button>
               </>
             )}
@@ -1667,7 +1711,7 @@ export default function App() {
                 className="stamma-btn font-mono-ui text-xs align-middle"
                 style={{ color: '#55D6C0' }}
               >
-                Visa mindre ▴
+                Visa mindre <span style={{ fontSize: 15 }}>▴</span>
               </button>
             </p>
           )}
@@ -1675,7 +1719,7 @@ export default function App() {
 
         {/* Signature visualization */}
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-          <PitchCanvas melodyNotes={melodyNotes} harmonyLayers={harmonyLayers} keyInfo={keyInfo} duration={recordingDuration} playheadTime={playheadTime} />
+          <PitchCanvas melodyNotes={melodyNotes} harmonyLayers={harmonyLayers} keyInfo={keyInfo} keyLabel={keyLabel} duration={recordingDuration} playheadTime={playheadTime} />
           {melodyNotes.length > 0 && (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
               <span className="flex items-center gap-1.5">
@@ -1693,6 +1737,19 @@ export default function App() {
                   {playheadTime.toFixed(1)}s / {recordingDuration.toFixed(1)}s
                 </span>
               )}
+            </div>
+          )}
+          {phase === 'ready' && (
+            <div className="mt-3">
+              <TransportButtons
+                loopEnabled={loopEnabled}
+                onToggleLoop={() => setLoopEnabled((v) => !v)}
+                onStop={() => stopPlayback()}
+                isPlaying={isPlaying}
+                onPlayPause={togglePlayPause}
+                disabled={!anyChannelEnabled}
+                busy={anyHarmonyBusy || autotuneRendering}
+              />
             </div>
           )}
         </div>
@@ -1731,26 +1788,29 @@ export default function App() {
             >
               Ladda upp ljudfil
             </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              // No `accept` filter: iOS Safari's iCloud Drive picker ANDs a
-              // MIME wildcard against listed extensions instead of ORing
-              // them, and iCloud often doesn't report MIME metadata for a
-              // file — so audio/* fails silently and the file (even a
-              // plain .wav) shows up grayed out regardless of extension.
-              // handleFileUpload already rejects anything decodeAudioData
-              // can't read, with a clear error, so filtering here isn't
-              // load-bearing — it was just actively breaking iCloud files.
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                e.target.value = '';
-                handleFileUpload(file);
-              }}
-            />
           </div>
         )}
+
+        {/* Shared by both the idle upload button and the "ready" phase's
+            "Ladda upp ny ljudfil" — always rendered so both can reach it. */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          // No `accept` filter: iOS Safari's iCloud Drive picker ANDs a
+          // MIME wildcard against listed extensions instead of ORing
+          // them, and iCloud often doesn't report MIME metadata for a
+          // file — so audio/* fails silently and the file (even a
+          // plain .wav) shows up grayed out regardless of extension.
+          // handleFileUpload already rejects anything decodeAudioData
+          // can't read, with a clear error, so filtering here isn't
+          // load-bearing — it was just actively breaking iCloud files.
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = '';
+            handleFileUpload(file);
+          }}
+        />
 
         {/* Recording */}
         {phase === 'recording' && (
@@ -1788,14 +1848,9 @@ export default function App() {
           </div>
         )}
 
-        {/* Ready: key readout, sound mode, mixer, export */}
+        {/* Ready: sound mode, mixer, export */}
         {phase === 'ready' && (
           <div className="space-y-5">
-            <div className="rounded-2xl p-4 flex items-center justify-between" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-              <span className="text-base" style={{ color: '#C7CBDA' }}>Uppfattad tonart</span>
-              <span className="font-mono-ui text-lg" style={{ color: '#FFB454' }}>{keyLabel}</span>
-            </div>
-
             <div>
               <h2 className="font-display text-lg font-semibold mb-2">Ljud</h2>
               <div className="grid grid-cols-3 gap-2">
@@ -1847,7 +1902,7 @@ export default function App() {
                         style={{ color: '#55D6C0' }}
                       >
                         <span>Styrka: {AUTOTUNE_LEVELS[autotuneLevelIndex].label}</span>
-                        <span style={{ display: 'inline-block', transform: autotuneStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                        <span style={{ display: 'inline-block', fontSize: 15, transform: autotuneStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
                       </button>
                       {autotuneStrengthExpanded && (
                         <div className="mt-2.5 grid grid-cols-3 gap-1.5">
@@ -1876,21 +1931,11 @@ export default function App() {
             <div>
               <div className="flex items-center justify-between mb-2">
                 <h2 className="font-display text-lg font-semibold">Mixer</h2>
-                <div className="flex items-center gap-3">
-                  {isPlaying && (
-                    <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
-                      Stoppa
-                    </button>
-                  )}
-                  <button
-                    onClick={toggleAllChannelsExpanded}
-                    className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
-                    style={{ color: '#C7CBDA' }}
-                  >
-                    {allChannelsExpanded ? 'Göm alla' : 'Expandera alla'}
-                    <span style={{ display: 'inline-block', transform: allChannelsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                {isPlaying && (
+                  <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
+                    Stoppa
                   </button>
-                </div>
+                )}
               </div>
               <p className="text-sm leading-relaxed mb-3" style={{ color: '#C7CBDA' }}>
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
@@ -1916,55 +1961,22 @@ export default function App() {
                       if (isPlaying) stopPlayback();
                     }}
                     playheadTime={playheadTime}
+                    isPlaying={isPlaying}
+                    onPlayPause={togglePlayPause}
+                    onSeek={seekTo}
+                    playDisabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
                   />
 
-                  <div className="flex items-center gap-2 mt-3">
-                    <button
-                      onClick={() => setLoopEnabled((v) => !v)}
-                      className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
-                      style={{
-                        width: 40,
-                        height: 40,
-                        backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                        color: loopEnabled ? '#55D6C0' : '#C7CBDA',
-                        border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                      }}
-                      aria-pressed={loopEnabled}
-                      aria-label="Loopa uppspelning"
-                      title="Loopa uppspelning"
-                    >
-                      <LoopIcon size={18} />
-                    </button>
-                    <button
-                      onClick={() => stopPlayback()}
+                  <div className="mt-3">
+                    <TransportButtons
+                      loopEnabled={loopEnabled}
+                      onToggleLoop={() => setLoopEnabled((v) => !v)}
+                      onStop={() => stopPlayback()}
+                      isPlaying={isPlaying}
+                      onPlayPause={togglePlayPause}
                       disabled={!anyChannelEnabled}
-                      className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
-                      style={{
-                        width: 40,
-                        height: 40,
-                        backgroundColor: 'rgba(241,237,228,0.06)',
-                        color: anyChannelEnabled ? '#C7CBDA' : 'rgba(241,237,228,0.25)',
-                        border: '1px solid rgba(241,237,228,0.12)',
-                        cursor: anyChannelEnabled ? 'pointer' : 'not-allowed',
-                      }}
-                      aria-label="Stoppa och gå till start"
-                      title="Stoppa och gå till start"
-                    >
-                      <StopIcon size={15} />
-                    </button>
-                    <button
-                      onClick={togglePlayPause}
-                      disabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
-                      className="stamma-btn flex-1 rounded-xl py-2.5 flex items-center justify-center gap-2 font-body font-medium text-sm"
-                      style={{
-                        backgroundColor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.06)' : '#FFB454',
-                        color: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.3)' : '#10131A',
-                        cursor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'not-allowed' : 'pointer',
-                      }}
-                    >
-                      {isPlaying ? <PauseIcon size={18} /> : <PlayIcon size={18} />}
-                      {isPlaying ? 'Pausa' : (anyHarmonyBusy || autotuneRendering) ? 'Bygger …' : 'Spela mix'}
-                    </button>
+                      busy={anyHarmonyBusy || autotuneRendering}
+                    />
                   </div>
 
                   <div className="flex items-center gap-2 mt-2">
@@ -1986,6 +1998,17 @@ export default function App() {
                   </div>
                 </div>
               )}
+
+              <div className="flex justify-end mb-2">
+                <button
+                  onClick={toggleAllChannelsExpanded}
+                  className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
+                  style={{ color: '#C7CBDA' }}
+                >
+                  {allChannelsExpanded ? 'Göm alla' : 'Expandera alla'}
+                  <span style={{ display: 'inline-block', fontSize: 15, transform: allChannelsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                </button>
+              </div>
 
               <div className="space-y-2">
                 <MixerChannel
@@ -2031,36 +2054,16 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="flex items-center gap-2 mt-4">
-                <button
-                  onClick={() => setLoopEnabled((v) => !v)}
-                  className="stamma-btn shrink-0 rounded-2xl flex items-center justify-center"
-                  style={{
-                    width: 52,
-                    height: 52,
-                    backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                    color: loopEnabled ? '#55D6C0' : '#C7CBDA',
-                    border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                  }}
-                  aria-pressed={loopEnabled}
-                  aria-label="Loopa uppspelning"
-                  title="Loopa uppspelning"
-                >
-                  <LoopIcon size={22} />
-                </button>
-                <button
-                  onClick={() => (isPlaying ? stopPlayback() : startMix(channels))}
-                  disabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
-                  className="stamma-btn flex-1 rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98] flex items-center justify-center gap-2"
-                  style={{
-                    backgroundColor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.06)' : '#FFB454',
-                    color: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'rgba(241,237,228,0.3)' : '#10131A',
-                    cursor: (!anyChannelEnabled || anyHarmonyBusy || autotuneRendering) ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  {isPlaying ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
-                  {isPlaying ? 'Stoppa mixen' : (anyHarmonyBusy || autotuneRendering) ? 'Bygger …' : 'Spela mixen'}
-                </button>
+              <div className="mt-4">
+                <TransportButtons
+                  loopEnabled={loopEnabled}
+                  onToggleLoop={() => setLoopEnabled((v) => !v)}
+                  onStop={() => stopPlayback()}
+                  isPlaying={isPlaying}
+                  onPlayPause={togglePlayPause}
+                  disabled={!anyChannelEnabled}
+                  busy={anyHarmonyBusy || autotuneRendering}
+                />
               </div>
             </div>
 
@@ -2103,7 +2106,14 @@ export default function App() {
               className="stamma-btn w-full rounded-xl py-3 font-body font-medium text-base transition-transform active:scale-[0.98]"
               style={{ backgroundColor: '#FF6B6B', color: '#10131A' }}
             >
-              Spela in igen
+              Spela in ny melodi
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="stamma-btn w-full mt-2 rounded-xl py-3 font-body font-medium text-sm"
+              style={{ backgroundColor: 'rgba(241,237,228,0.06)', color: '#F1EDE4', border: '1px solid rgba(241,237,228,0.12)' }}
+            >
+              Ladda upp ny ljudfil
             </button>
           </div>
         )}
@@ -2118,6 +2128,62 @@ export default function App() {
           </a>
         </footer>
       </div>
+    </div>
+  );
+}
+
+// Loop / Stop-and-rewind / Play-Pause, as one row — reused under the note
+// window, under the waveform, and under the last mixer channel, so all
+// three places control the exact same mix playback identically.
+function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlayPause, disabled, busy }) {
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        onClick={onToggleLoop}
+        className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
+        style={{
+          width: 44,
+          height: 44,
+          backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+          color: loopEnabled ? '#55D6C0' : '#C7CBDA',
+          border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+        }}
+        aria-pressed={loopEnabled}
+        aria-label="Loopa uppspelning"
+        title="Loopa uppspelning"
+      >
+        <LoopIcon size={19} />
+      </button>
+      <button
+        onClick={onStop}
+        disabled={disabled}
+        className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
+        style={{
+          width: 44,
+          height: 44,
+          backgroundColor: 'rgba(241,237,228,0.06)',
+          color: disabled ? 'rgba(241,237,228,0.25)' : '#C7CBDA',
+          border: '1px solid rgba(241,237,228,0.12)',
+          cursor: disabled ? 'not-allowed' : 'pointer',
+        }}
+        aria-label="Stoppa och gå till start"
+        title="Stoppa och gå till start"
+      >
+        <StopIcon size={16} />
+      </button>
+      <button
+        onClick={onPlayPause}
+        disabled={disabled || busy}
+        className="stamma-btn flex-1 rounded-xl py-3 flex items-center justify-center gap-2 font-body font-medium text-sm transition-transform active:scale-[0.98]"
+        style={{
+          backgroundColor: (disabled || busy) ? 'rgba(241,237,228,0.06)' : '#FFB454',
+          color: (disabled || busy) ? 'rgba(241,237,228,0.3)' : '#10131A',
+          cursor: (disabled || busy) ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {isPlaying ? <PauseIcon size={19} /> : <PlayIcon size={19} />}
+        {isPlaying ? 'Pausa' : busy ? 'Bygger …' : 'Spela mix'}
+      </button>
     </div>
   );
 }
@@ -2243,7 +2309,7 @@ function MixerChannel({
           aria-label="Visa volym och panorering"
         >
           {Math.round(volume * 100)}%
-          <span style={{ display: 'inline-block', transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+          <span style={{ display: 'inline-block', fontSize: 15, transform: expanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
         </button>
       </div>
 
