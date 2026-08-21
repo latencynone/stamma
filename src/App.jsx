@@ -1460,7 +1460,7 @@ export default function App() {
     setHarmonyRenderingByType((s) => ({ ...s, [type]: true }));
     setHarmonyRenderErrorsByType((s) => ({ ...s, [type]: '' }));
     const hNotes = harmonyNotesFor(type);
-    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, hNotes, keyInfo)
+    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, hNotes, keyInfo, type)
       .then((buffer) => {
         harmonyBuffersRef.current[type] = { key, buffer };
         return buffer;

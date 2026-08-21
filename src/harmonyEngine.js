@@ -171,16 +171,70 @@ export function buildRatioCurveFromSegments(segments, totalDuration, energyEnvel
   return cleaned;
 }
 
+// A harmony voice built by pitch-shifting the *same* take the melody is
+// (or, for another harmony type, would be) shifted from is otherwise a
+// perfect clone in every way pitch-shifting can't touch: identical timing,
+// identical micro-pitch behavior, laser-locked to the target ratio for the
+// full length of every note. Real double-tracked/harmony singers never
+// actually agree that precisely — a small fixed "this voice tends slightly
+// sharp/flat" detune, plus a slow (sub-1Hz, well below vibrato rate) pitch
+// drift, is what a live harmony pedal's "humanize"/voice-character controls
+// are doing too. One fixed profile per interval keeps a given type's
+// character consistent across renders instead of it just adding random
+// per-render noise.
+const HARMONY_HUMANIZE_PROFILES = {
+  ters: { detuneCents: -3, wobbleCents: 4, wobbleHz: 0.22, phase: 0.4 },
+  kvint: { detuneCents: 4, wobbleCents: 3, wobbleHz: 0.31, phase: 2.1 },
+  sext: { detuneCents: -2, wobbleCents: 5, wobbleHz: 0.18, phase: 4.7 },
+};
+
+// Multiplies every keyframe's ratio by a small detune+wobble factor (in
+// cents, so it composes with the existing ratio regardless of interval
+// size), and — since the source curve holds a single flat ratio for a
+// whole sustained note or pause, with no intermediate keyframes — inserts
+// extra samples through any gap wider than `maxGapForInsertion` so the
+// wobble is actually audible during a held note, not just at its two
+// endpoints. Ramp/onset sections already have keyframes closer together
+// than that gap, so their carefully-tuned shape is untouched beyond the
+// same small multiplicative wobble every other keyframe gets.
+function humanizeKeyframes(keyframes, { detuneCents = 0, wobbleCents = 0, wobbleHz = 0.25, phase = 0 } = {}) {
+  if (!detuneCents && !wobbleCents) return keyframes;
+  const maxGapForInsertion = 0.15;
+  const insertHop = 0.06;
+  const factorAt = (t) => {
+    const cents = detuneCents + wobbleCents * Math.sin(2 * Math.PI * wobbleHz * t + phase);
+    return Math.pow(2, cents / 1200);
+  };
+  const out = [];
+  for (let i = 0; i < keyframes.length; i++) {
+    const k = keyframes[i];
+    out.push({ t: k.t, ratio: k.ratio * factorAt(k.t) });
+    const next = keyframes[i + 1];
+    if (next && next.t - k.t > maxGapForInsertion) {
+      for (let t = k.t + insertHop; t < next.t; t += insertHop) {
+        const f = (t - k.t) / (next.t - k.t);
+        const base = k.ratio + (next.ratio - k.ratio) * f;
+        out.push({ t, ratio: base * factorAt(t) });
+      }
+    }
+  }
+  return out;
+}
+
 // Per-note targets for the harmony engine: a fixed interval (harmonyNotes'
-// hStep) above/below each melody note's own quantized pitch.
-export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope = []) {
+// hStep) above/below each melody note's own quantized pitch. `harmonyType`
+// (e.g. "ters") selects that voice's humanization character — omit it (as
+// the accuracy tests do) to get the exact, unhumanized ratio curve.
+export function buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope = [], harmonyType = null) {
   const segments = melodyNotes.map((mn, i) => {
     const hn = harmonyNotes[i];
     const melodyFreq = midiToFreq(scaleStepToMidi(mn.step, keyInfo.tonic, keyInfo.mode));
     const harmonyFreq = midiToFreq(scaleStepToMidi(hn.hStep, keyInfo.tonic, keyInfo.mode));
     return { start: mn.start, end: mn.end, ratio: harmonyFreq / melodyFreq };
   });
-  return buildRatioCurveFromSegments(segments, totalDuration, energyEnvelope);
+  const curve = buildRatioCurveFromSegments(segments, totalDuration, energyEnvelope);
+  const profile = harmonyType && HARMONY_HUMANIZE_PROFILES[harmonyType];
+  return profile ? humanizeKeyframes(curve, profile) : curve;
 }
 
 // Per-note targets for the autotune engine: nudge each note's *actual* sung
@@ -271,10 +325,10 @@ function formantBaseHzFor(melodyNotes, keyInfo) {
 
 // Renders the harmony as a full-length AudioBuffer: the original recording,
 // continuously pitch-shifted to a fixed interval above/below the melody.
-export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyNotes, keyInfo) {
+export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyNotes, keyInfo, harmonyType = null) {
   const totalDuration = recordedBuffer.length / recordedBuffer.sampleRate;
   const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), recordedBuffer.sampleRate);
-  const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope);
+  const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope, harmonyType);
   return renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo));
 }
 
