@@ -778,6 +778,8 @@ export default function App() {
   const [fadeIn, setFadeIn] = useState(0);
   const [fadeOut, setFadeOut] = useState(0);
   const [expandedChannels, setExpandedChannels] = useState({});
+  const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countdown } | null
+  const [ownTakeError, setOwnTakeError] = useState('');
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -803,6 +805,13 @@ export default function App() {
   const autotuneRenderPromiseRef = useRef(null);
   const fileInputRef = useRef(null);
   const loopEnabledRef = useRef(false);
+  const ownTakeBuffersRef = useRef({}); // { ters, kvint, sext } -> AudioBuffer | null
+  const ownTakeStreamRef = useRef(null);
+  const ownTakeRecorderRef = useRef(null);
+  const ownTakeChunksRef = useRef([]);
+  const ownTakeRafRef = useRef(null);
+  const ownTakeStartRef = useRef(0);
+  const ownTakeFinishedRef = useRef(false);
 
   // Read inside the playback-end setTimeout, which was scheduled back when
   // it fired — using state directly there would capture whatever loopEnabled
@@ -834,6 +843,8 @@ export default function App() {
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') audioCtxRef.current.close().catch(() => {});
       if (playCtxRef.current && playCtxRef.current.state !== 'closed') playCtxRef.current.close().catch(() => {});
+      if (ownTakeRafRef.current) cancelAnimationFrame(ownTakeRafRef.current);
+      if (ownTakeStreamRef.current) ownTakeStreamRef.current.getTracks().forEach((t) => t.stop());
     };
   }, []);
 
@@ -1044,6 +1055,18 @@ export default function App() {
     setWaveformPeaks(null);
     setFadeIn(0);
     setFadeOut(0);
+    if (recordingOwnTake) {
+      ownTakeFinishedRef.current = true; // suppress the in-flight recording's own completion
+      if (ownTakeRafRef.current) cancelAnimationFrame(ownTakeRafRef.current);
+      if (ownTakeStreamRef.current) ownTakeStreamRef.current.getTracks().forEach((t) => t.stop());
+      if (ownTakeRecorderRef.current && ownTakeRecorderRef.current.state !== 'inactive') {
+        ownTakeRecorderRef.current.onstop = null;
+        ownTakeRecorderRef.current.stop();
+      }
+      setRecordingOwnTake(null);
+    }
+    ownTakeBuffersRef.current = {};
+    setOwnTakeError('');
     stopPlayback();
   }
 
@@ -1491,6 +1514,14 @@ export default function App() {
       }
       return melodyPlaybackNotes.length ? { kind: 'notes', notes: melodyPlaybackNotes } : null;
     }
+    // A user's own recorded take of a harmony type (see recordOwnTake) —
+    // already at whatever pitch they actually sang, so it's played back
+    // as-is with no pitch-shifting or note-derived synthesis.
+    if (key.endsWith('Own')) {
+      const type = key.slice(0, -3);
+      const buffer = ownTakeBuffersRef.current[type];
+      return buffer ? { kind: 'buffer', buffer } : null;
+    }
     // ters / kvint / sext
     if (soundType === 'recording') {
       if (!recordedBufferRef.current) return null;
@@ -1658,6 +1689,127 @@ export default function App() {
     setPlayheadTime(clamped);
   }
 
+  // Records the user's own take of a harmony type (ters/kvint/sext),
+  // played back as-is — no pitch-shifting, since it's already sung at
+  // whatever pitch the singer actually hit. The melody plays back
+  // concurrently as a monitor so there's something to harmonize against.
+  // Pressing this again (on the original Ters/Kvint/Sext channel, not the
+  // resulting "Egen X" one) always re-records and replaces the take.
+  async function recordOwnTake(type) {
+    if (recordingOwnTake) return;
+    setOwnTakeError('');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setOwnTakeError('Den här webbläsaren stödjer inte mikrofoninspelning.');
+      return;
+    }
+    if (micPermission === 'denied') {
+      setOwnTakeError('Mikrofonåtkomst är blockerad för den här sidan. Ändra behörighet i webbläsarens inställningar och försök igen.');
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      setOwnTakeError('Kunde inte komma åt mikrofonen. Kontrollera att appen har mikrofonbehörighet i webbläsaren.');
+      return;
+    }
+    ownTakeStreamRef.current = stream;
+
+    if (isPlaying) stopPlayback();
+    startMix(channels, ['melody']);
+
+    ownTakeChunksRef.current = [];
+    ownTakeFinishedRef.current = false;
+    let mr = null;
+    if (window.MediaRecorder) {
+      try {
+        mr = new MediaRecorder(stream);
+        mr.ondataavailable = (e) => { if (e.data.size > 0) ownTakeChunksRef.current.push(e.data); };
+        mr.start();
+      } catch (e) {
+        mr = null;
+      }
+    }
+    ownTakeRecorderRef.current = mr;
+
+    if (!mr) {
+      stream.getTracks().forEach((t) => t.stop());
+      stopPlayback();
+      setOwnTakeError('Den här webbläsaren stödjer inte inspelning.');
+      return;
+    }
+
+    ownTakeStartRef.current = performance.now();
+    setRecordingOwnTake({ type, countdown: recordingDuration });
+
+    const tick = () => {
+      const elapsed = (performance.now() - ownTakeStartRef.current) / 1000;
+      const remaining = Math.max(0, recordingDuration - elapsed);
+      setRecordingOwnTake((s) => (s && s.type === type ? { ...s, countdown: remaining } : s));
+      if (remaining <= 0) {
+        finishOwnTakeRecording(type);
+        return;
+      }
+      ownTakeRafRef.current = requestAnimationFrame(tick);
+    };
+    ownTakeRafRef.current = requestAnimationFrame(tick);
+  }
+
+  function stopOwnTakeRecordingEarly() {
+    if (!recordingOwnTake) return;
+    finishOwnTakeRecording(recordingOwnTake.type);
+  }
+
+  function finishOwnTakeRecording(type) {
+    if (ownTakeFinishedRef.current) return;
+    ownTakeFinishedRef.current = true;
+    if (ownTakeRafRef.current) cancelAnimationFrame(ownTakeRafRef.current);
+    stopPlayback(); // stop the monitor
+    const stream = ownTakeStreamRef.current;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+
+    const mr = ownTakeRecorderRef.current;
+    if (!mr || mr.state === 'inactive') {
+      setRecordingOwnTake(null);
+      return;
+    }
+    mr.onstop = async () => {
+      let decodeCtx = null;
+      try {
+        const blob = new Blob(ownTakeChunksRef.current, { type: (ownTakeChunksRef.current[0] && ownTakeChunksRef.current[0].type) || 'audio/webm' });
+        const arrayBuf = await blob.arrayBuffer();
+        const AC = window.AudioContext || window.webkitAudioContext;
+        decodeCtx = new AC();
+        const audioBuffer = await decodeCtx.decodeAudioData(arrayBuf);
+        ownTakeBuffersRef.current[type] = audioBuffer;
+        const ownKey = `${type}Own`;
+        setChannels((prev) => ({
+          ...prev,
+          [ownKey]: prev[ownKey] || { enabled: true, volume: 0.85, pan: 0, solo: false },
+        }));
+      } catch (err) {
+        setOwnTakeError(`Kunde inte spela in din ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
+      } finally {
+        if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
+        setRecordingOwnTake(null);
+      }
+    };
+    mr.stop();
+  }
+
+  function deleteOwnTake(type) {
+    ownTakeBuffersRef.current[type] = null;
+    const ownKey = `${type}Own`;
+    setChannels((prev) => {
+      if (!(ownKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[ownKey];
+      return next;
+    });
+    if (isPlaying) stopPlayback();
+  }
+
   const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
   const anyChannelEnabled = Object.values(channels).some((c) => c.enabled);
   const anyHarmonyBusy = Object.values(harmonyRenderingByType).some(Boolean);
@@ -1770,6 +1922,11 @@ export default function App() {
             {msg}
           </div>
         ))}
+        {ownTakeError && (
+          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+            {ownTakeError}
+          </div>
+        )}
 
         {/* Idle: start button + upload */}
         {(phase === 'idle' || phase === 'error') && (
@@ -2029,29 +2186,59 @@ export default function App() {
                   expanded={!!expandedChannels.melody}
                   onToggleExpanded={() => toggleChannelExpanded('melody')}
                 />
-                {HARMONY_KEYS.map((type) => (
-                  <MixerChannel
-                    key={type}
-                    label={HARMONY_TYPES[type].label}
-                    accentColor={HARMONY_COLORS[type].line}
-                    enabled={channels[type].enabled}
-                    onToggle={() => toggleChannel(type)}
-                    volume={channels[type].volume}
-                    onVolumeChange={(v) => setChannelVolume(type, v)}
-                    pan={channels[type].pan}
-                    onPanChange={(p) => setChannelPan(type, p)}
-                    solo={channels[type].solo}
-                    onToggleSolo={() => toggleChannelSolo(type)}
-                    meterRef={(el) => { meterRefs.current[type] = el; }}
-                    busy={harmonyRenderingByType[type]}
-                    direction={channels[type].direction}
-                    onSetDirection={(d) => setChannelDirection(type, d)}
-                    previewing={isPlaying && previewingKey === type}
-                    onPreview={() => (isPlaying && previewingKey === type ? stopPlayback() : previewChannel(type))}
-                    expanded={!!expandedChannels[type]}
-                    onToggleExpanded={() => toggleChannelExpanded(type)}
-                  />
-                ))}
+                {HARMONY_KEYS.flatMap((type) => {
+                  const ownKey = `${type}Own`;
+                  const ownChannel = channels[ownKey];
+                  return [
+                      <MixerChannel
+                        key={type}
+                        label={HARMONY_TYPES[type].label}
+                        accentColor={HARMONY_COLORS[type].line}
+                        enabled={channels[type].enabled}
+                        onToggle={() => toggleChannel(type)}
+                        volume={channels[type].volume}
+                        onVolumeChange={(v) => setChannelVolume(type, v)}
+                        pan={channels[type].pan}
+                        onPanChange={(p) => setChannelPan(type, p)}
+                        solo={channels[type].solo}
+                        onToggleSolo={() => toggleChannelSolo(type)}
+                        meterRef={(el) => { meterRefs.current[type] = el; }}
+                        busy={harmonyRenderingByType[type]}
+                        direction={channels[type].direction}
+                        onSetDirection={(d) => setChannelDirection(type, d)}
+                        previewing={isPlaying && previewingKey === type}
+                        onPreview={() => (isPlaying && previewingKey === type ? stopPlayback() : previewChannel(type))}
+                        expanded={!!expandedChannels[type]}
+                        onToggleExpanded={() => toggleChannelExpanded(type)}
+                        onRecord={() => recordOwnTake(type)}
+                        onStopRecordEarly={stopOwnTakeRecordingEarly}
+                        recording={recordingOwnTake?.type === type}
+                        recordCountdown={recordingOwnTake?.type === type ? recordingOwnTake.countdown : null}
+                        recordDisabled={!!recordingOwnTake}
+                      />,
+                      ownChannel && (
+                        <MixerChannel
+                          key={ownKey}
+                          label={`Egen ${HARMONY_TYPES[type].label.toLowerCase()}`}
+                          accentColor={HARMONY_COLORS[type].line}
+                          enabled={ownChannel.enabled}
+                          onToggle={() => toggleChannel(ownKey)}
+                          volume={ownChannel.volume}
+                          onVolumeChange={(v) => setChannelVolume(ownKey, v)}
+                          pan={ownChannel.pan}
+                          onPanChange={(p) => setChannelPan(ownKey, p)}
+                          solo={ownChannel.solo}
+                          onToggleSolo={() => toggleChannelSolo(ownKey)}
+                          meterRef={(el) => { meterRefs.current[ownKey] = el; }}
+                          previewing={isPlaying && previewingKey === ownKey}
+                          onPreview={() => (isPlaying && previewingKey === ownKey ? stopPlayback() : previewChannel(ownKey))}
+                          expanded={!!expandedChannels[ownKey]}
+                          onToggleExpanded={() => toggleChannelExpanded(ownKey)}
+                          onDelete={() => deleteOwnTake(type)}
+                        />
+                      ),
+                  ].filter(Boolean);
+                })}
               </div>
 
               <div className="mt-4">
@@ -2227,6 +2414,7 @@ function MixerChannel({
   label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy,
   direction, onSetDirection, solo, onToggleSolo, pan, onPanChange, previewing, onPreview,
   expanded, onToggleExpanded,
+  onRecord, onStopRecordEarly, recording, recordCountdown, recordDisabled, onDelete,
 }) {
   const panLabel = Math.abs(pan) < 0.04 ? 'C' : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
@@ -2238,7 +2426,52 @@ function MixerChannel({
       }}
     >
       <div className="flex items-center gap-2">
-        <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} />
+        <div className="flex flex-col items-center gap-1">
+          <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} />
+          {onRecord && (
+            <button
+              onClick={recording ? onStopRecordEarly : onRecord}
+              disabled={recordDisabled && !recording}
+              className="stamma-btn shrink-0 rounded-full flex items-center justify-center"
+              style={{
+                width: 20,
+                height: 20,
+                backgroundColor: recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
+                color: recording ? '#10131A' : '#FF6B6B',
+                border: '1px solid rgba(255,107,107,0.5)',
+                opacity: (recordDisabled && !recording) ? 0.4 : 1,
+                cursor: (recordDisabled && !recording) ? 'not-allowed' : 'pointer',
+              }}
+              aria-label={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
+              title={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
+            >
+              {recording ? (
+                <span className="rec-dot font-mono-ui" style={{ fontSize: 9, fontWeight: 700 }}>
+                  {Math.ceil(recordCountdown)}
+                </span>
+              ) : (
+                <RecordIcon size={10} />
+              )}
+            </button>
+          )}
+          {onDelete && (
+            <button
+              onClick={onDelete}
+              className="stamma-btn shrink-0 rounded-full flex items-center justify-center"
+              style={{
+                width: 20,
+                height: 20,
+                backgroundColor: 'transparent',
+                color: '#C7CBDA',
+                border: '1px solid rgba(241,237,228,0.15)',
+              }}
+              aria-label={`Radera ${label.toLowerCase()}`}
+              title={`Radera ${label.toLowerCase()}`}
+            >
+              <TrashIcon size={11} />
+            </button>
+          )}
+        </div>
         <button
           onClick={onToggleSolo}
           className="stamma-btn shrink-0 rounded-md font-mono-ui text-xs font-semibold"
@@ -2390,6 +2623,26 @@ function LoopIcon({ size = 20 }) {
       <path d="M15 1l3 3-3 3" />
       <path d="M20 12a8 8 0 0 1-8 8H6" />
       <path d="M9 23l-3-3 3-3" />
+    </svg>
+  );
+}
+
+function RecordIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+      <circle cx="12" cy="12" r="9" />
+    </svg>
+  );
+}
+
+function TrashIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 7h16" />
+      <path d="M9 7V4.5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1V7" />
+      <path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
     </svg>
   );
 }
