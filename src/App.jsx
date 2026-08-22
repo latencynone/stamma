@@ -357,6 +357,27 @@ function stopMetronomeScheduler(state) {
   if (state) clearInterval(state.intervalId);
 }
 
+// A count-in before recording actually starts — same click sound and
+// tempo as the metronome, so it also doubles as a "here's the tempo"
+// lead-in. Schedules all COUNT_IN_BEATS clicks up front (sample-accurate,
+// same as the scheduler above), and resolves once the last one has
+// sounded — i.e. exactly when recording should begin. `onBeat(i)` is
+// setTimeout-paced (not sample-accurate) since it only drives a UI digit.
+const COUNT_IN_BEATS = 4;
+function playCountIn(ctx, bpm, onBeat) {
+  const beatDur = 60 / Math.max(20, bpm);
+  const start = ctx.currentTime + 0.05;
+  for (let i = 0; i < COUNT_IN_BEATS; i++) {
+    playMetronomeClick(ctx, start + i * beatDur, i === 0);
+  }
+  return new Promise((resolve) => {
+    for (let i = 0; i < COUNT_IN_BEATS; i++) {
+      setTimeout(() => onBeat?.(i), i * beatDur * 1000);
+    }
+    setTimeout(resolve, COUNT_IN_BEATS * beatDur * 1000);
+  });
+}
+
 /* ---------- Formant "voice" synthesis ---------- */
 
 // Builds a small vowel-ish resonance filter bank ("oo") fed by `source`
@@ -627,7 +648,7 @@ function WaveformTrimmer({
   peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime,
   isPlaying, onPlayPause, onSeek, playDisabled,
   noiseReductionMode, onToggleNoiseReductionMode, noiseSampleStart, noiseSampleEnd, onNoiseSampleChange,
-  onApplyNoiseReduction, denoising, denoiseError,
+  onApplyNoiseReduction, denoising, denoiseError, noiseReductionApplied,
 }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
@@ -953,7 +974,17 @@ function WaveformTrimmer({
         <div className="mt-4 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: `1px solid ${noiseReductionMode ? `${NOISE_COLOR}55` : 'rgba(241,237,228,0.1)'}` }}>
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-sm font-medium">Brusreducering</div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-medium">Brusreducering</span>
+                {noiseReductionApplied && (
+                  <span
+                    className="font-mono-ui text-[10px] font-semibold px-1.5 py-0.5 rounded"
+                    style={{ backgroundColor: `${NOISE_COLOR}26`, color: NOISE_COLOR, border: `1px solid ${NOISE_COLOR}66` }}
+                  >
+                    ✓ Aktiv
+                  </span>
+                )}
+              </div>
               <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
                 Markera en del med bara brus — resten av inspelningen renas utifrån den
               </div>
@@ -976,8 +1007,14 @@ function WaveformTrimmer({
                   cursor: denoising ? 'not-allowed' : 'pointer',
                 }}
               >
-                {denoising ? 'Bearbetar …' : 'Tillämpa brusreducering'}
+                {denoising ? 'Bearbetar …' : noiseReductionApplied ? 'Tillämpa igen' : 'Tillämpa brusreducering'}
               </button>
+              {noiseReductionApplied && !denoising && (
+                <div className="mt-2 flex items-center gap-1.5 font-mono-ui text-[11px]" style={{ color: NOISE_COLOR }}>
+                  <span>✓</span>
+                  <span>Brusreducering tillämpad på inspelningen</span>
+                </div>
+              )}
               {denoiseError && (
                 <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{denoiseError}</div>
               )}
@@ -1234,9 +1271,10 @@ function AboutPage() {
 }
 
 export default function App() {
-  const [phase, setPhase] = useState('idle'); // idle | recording | analyzing | ready | error
+  const [phase, setPhase] = useState('idle'); // idle | countin | recording | analyzing | ready | error
   const [errorMsg, setErrorMsg] = useState('');
   const [countdown, setCountdown] = useState(DURATION);
+  const [countInBeat, setCountInBeat] = useState(0); // 0..COUNT_IN_BEATS-1 during phase 'countin'
   const [keyInfo, setKeyInfo] = useState(null);
   const [melodyNotes, setMelodyNotes] = useState([]);
   const [channels, setChannels] = useState(defaultChannels);
@@ -1257,6 +1295,11 @@ export default function App() {
   const [reverbOn, setReverbOn] = useState(false);
   const [reverbLevelIndex, setReverbLevelIndex] = useState(0);
   const [reverbStrengthExpanded, setReverbStrengthExpanded] = useState(false);
+  // Per-voice micro-detune + slow pitch drift on the rendered ters/kvint/
+  // sext (see HARMONY_HUMANIZE_PROFILES in harmonyEngine.js) — on by
+  // default since it's the more natural-sounding option, but toggleable
+  // for a perfectly locked-to-interval sound instead.
+  const [humanizeOn, setHumanizeOn] = useState(true);
   const [isProcessed, setIsProcessed] = useState(false); // recordedBufferRef differs from the original decode
   const [normalizing, setNormalizing] = useState(false);
   const [normalizeError, setNormalizeError] = useState('');
@@ -1265,6 +1308,10 @@ export default function App() {
   const [noiseSampleEnd, setNoiseSampleEnd] = useState(0.5);
   const [denoising, setDenoising] = useState(false);
   const [denoiseError, setDenoiseError] = useState('');
+  // True once a noise-reduction pass has actually been applied to the
+  // current recording — separate from `denoising` (in-progress) so the UI
+  // can show a lasting "applied" confirmation, not just a brief spinner.
+  const [noiseReductionApplied, setNoiseReductionApplied] = useState(false);
   const [effectsExpanded, setEffectsExpanded] = useState(false);
   const [ljudExpanded, setLjudExpanded] = useState(true);
   const [mixerExpanded, setMixerExpanded] = useState(true);
@@ -1284,7 +1331,7 @@ export default function App() {
   const [fadeIn, setFadeIn] = useState(0);
   const [fadeOut, setFadeOut] = useState(0);
   const [expandedChannels, setExpandedChannels] = useState({});
-  const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countdown } | null
+  const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countingIn, countInBeat, countdown } | null
   const [ownTakeError, setOwnTakeError] = useState('');
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
@@ -1295,6 +1342,7 @@ export default function App() {
   const chunksRef = useRef([]);
   const framesRef = useRef([]);
   const rafRef = useRef(null);
+  const countInCancelledRef = useRef(false);
   const playCtxRef = useRef(null);
   const activeSourcesRef = useRef([]);
   const mixNodesRef = useRef({});
@@ -1334,6 +1382,7 @@ export default function App() {
   const ownTakeRafRef = useRef(null);
   const ownTakeStartRef = useRef(0);
   const ownTakeFinishedRef = useRef(false);
+  const ownTakeCountInCancelledRef = useRef(false);
   const reverbBusRef = useRef(null);
   const metronomeSchedulerRef = useRef(null);
 
@@ -1526,7 +1575,7 @@ export default function App() {
     if (!recordedBufferRef.current || !melodyNotes.length || !keyInfo) return null;
     const sourceBuffer = await getSourceBuffer();
     if (!sourceBuffer) return null;
-    const key = `${channels[type].direction}-${autotuneEnabled ? `at${autotuneLevelIndex}` : 'raw'}`;
+    const key = `${channels[type].direction}-${autotuneEnabled ? `at${autotuneLevelIndex}` : 'raw'}-${humanizeOn ? 'hum' : 'plain'}`;
     const cached = harmonyBuffersRef.current[type];
     if (cached && cached.key === key) return cached.buffer;
     if (harmonyRenderPromisesRef.current[type] && cached?.key === `pending-${key}`) {
@@ -1536,7 +1585,7 @@ export default function App() {
     setHarmonyRenderingByType((s) => ({ ...s, [type]: true }));
     setHarmonyRenderErrorsByType((s) => ({ ...s, [type]: '' }));
     const hNotes = harmonyNotesFor(type);
-    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, hNotes, keyInfo, type)
+    const promise = renderHarmonyOffline(sourceBuffer, melodyNotes, hNotes, keyInfo, humanizeOn ? type : null)
       .then((buffer) => {
         harmonyBuffersRef.current[type] = { key, buffer };
         return buffer;
@@ -1583,6 +1632,7 @@ export default function App() {
     setNoiseSampleEnd(0.5);
     setDenoising(false);
     setDenoiseError('');
+    setNoiseReductionApplied(false);
     harmonyBuffersRef.current = {};
     harmonyRenderPromisesRef.current = {};
     setHarmonyRenderingByType({});
@@ -1652,6 +1702,7 @@ export default function App() {
     autotunedBuffersRef.current = {};
     setNormalizeError('');
     setDenoiseError('');
+    setNoiseReductionApplied(false);
     if (isPlaying) stopPlayback();
   }
 
@@ -1730,6 +1781,7 @@ export default function App() {
         outBuffer.copyToChannel(processed, ch);
       }
       applyProcessedRecording(outBuffer);
+      setNoiseReductionApplied(true);
     } catch (err) {
       setDenoiseError('Kunde inte brusreducera inspelningen. Testa igen, eller välj en annan del som brusprov.');
     } finally {
@@ -1755,6 +1807,28 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+
+      // A count-in gets its own click scheduler below if the ongoing
+      // metronome is enabled too — stop any "lyssna"-preview loop from the
+      // idle screen first either way, so it never keeps clicking
+      // (unscheduled, off-tempo-aware) right through the count-in and into
+      // the take.
+      if (metronomeSchedulerRef.current) {
+        stopMetronomeScheduler(metronomeSchedulerRef.current);
+        metronomeSchedulerRef.current = null;
+      }
+      setMetronomeListening(false);
+
+      // A short audible count-in (same click, same tempo as the metronome)
+      // so the singer knows exactly when recording actually starts, rather
+      // than needing to react the instant they press the button.
+      countInCancelledRef.current = false;
+      setPhase('countin');
+      setCountInBeat(0);
+      const clickCtx = await getPlaybackContext();
+      await playCountIn(clickCtx, metronomeBpm, setCountInBeat);
+      if (countInCancelledRef.current) return;
+
       // Belt-and-suspenders: a previous recording's context should already
       // be closed by finishRecording, but never leave a live one behind
       // before opening another — see the finally block there for why this
@@ -1791,16 +1865,7 @@ export default function App() {
       setPhase('recording');
       setCountdown(DURATION);
 
-      // Recording gets its own click scheduler below if enabled — stop any
-      // "lyssna"-preview loop from the idle screen first either way, so it
-      // never keeps clicking (unscheduled, off-tempo-aware) into a take.
-      if (metronomeSchedulerRef.current) {
-        stopMetronomeScheduler(metronomeSchedulerRef.current);
-        metronomeSchedulerRef.current = null;
-      }
-      setMetronomeListening(false);
       if (metronomeEnabled) {
-        const clickCtx = await getPlaybackContext();
         metronomeSchedulerRef.current = startMetronomeScheduler(clickCtx, metronomeBpm);
       }
 
@@ -1823,7 +1888,23 @@ export default function App() {
     } catch (err) {
       setPhase('error');
       setErrorMsg('Kunde inte komma åt mikrofonen. Kontrollera att appen har mikrofonbehörighet i webbläsaren.');
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
     }
+  }
+
+  // Bails out of the count-in before the actual mic recording has started
+  // — the mic stream was already opened (to fail fast on a denied
+  // permission before the count-in plays), so it needs closing here too.
+  function cancelCountIn() {
+    countInCancelledRef.current = true;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    setPhase('idle');
   }
 
   function finishRecording() {
@@ -2442,7 +2523,20 @@ export default function App() {
 
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Echo cancellation/noise suppression/AGC are all *on* by default —
+      // fine for a solo recording, but this take is captured while the
+      // melody plays back through the speakers as a monitor (see
+      // startMix(...) below), and the singer is deliberately singing in
+      // time and in harmony with it. The browser's AEC then reads much of
+      // that overlap as "echo of what we're playing" and aggressively
+      // guts it from the mic signal, which sounded exactly like "only
+      // records small parts" — the takes were real, just chopped up by
+      // the echo canceller. Headphones would sidestep this entirely, but
+      // most people won't have them on for a quick take, so ask for the
+      // rawest signal the browser will give instead.
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
     } catch (err) {
       setOwnTakeError('Kunde inte komma åt mikrofonen. Kontrollera att appen har mikrofonbehörighet i webbläsaren.');
       return;
@@ -2450,6 +2544,18 @@ export default function App() {
     ownTakeStreamRef.current = stream;
 
     if (isPlaying) stopPlayback();
+
+    // Count-in before the mic actually starts recording, same as the main
+    // recording flow — lets the singer come in on time with the melody
+    // that's about to play as a monitor.
+    ownTakeCountInCancelledRef.current = false;
+    setRecordingOwnTake({ type, countingIn: true, countInBeat: 0, countdown: recordingDuration });
+    const clickCtx = await getPlaybackContext();
+    await playCountIn(clickCtx, metronomeBpm, (i) => {
+      setRecordingOwnTake((s) => (s && s.type === type && s.countingIn ? { ...s, countInBeat: i } : s));
+    });
+    if (ownTakeCountInCancelledRef.current) return;
+
     startMix(channels, ['melody']);
 
     ownTakeChunksRef.current = [];
@@ -2470,11 +2576,12 @@ export default function App() {
       stream.getTracks().forEach((t) => t.stop());
       stopPlayback();
       setOwnTakeError('Den här webbläsaren stödjer inte inspelning.');
+      setRecordingOwnTake(null);
       return;
     }
 
     ownTakeStartRef.current = performance.now();
-    setRecordingOwnTake({ type, countdown: recordingDuration });
+    setRecordingOwnTake({ type, countingIn: false, countdown: recordingDuration });
 
     const tick = () => {
       const elapsed = (performance.now() - ownTakeStartRef.current) / 1000;
@@ -2491,6 +2598,18 @@ export default function App() {
 
   function stopOwnTakeRecordingEarly() {
     if (!recordingOwnTake) return;
+    // Still in the count-in — nothing's actually recording yet, so just
+    // bail out of it instead of running the (not-yet-started) recorder
+    // teardown in finishOwnTakeRecording.
+    if (recordingOwnTake.countingIn) {
+      ownTakeCountInCancelledRef.current = true;
+      if (ownTakeStreamRef.current) {
+        ownTakeStreamRef.current.getTracks().forEach((t) => t.stop());
+        ownTakeStreamRef.current = null;
+      }
+      setRecordingOwnTake(null);
+      return;
+    }
     finishOwnTakeRecording(recordingOwnTake.type);
   }
 
@@ -2684,7 +2803,7 @@ export default function App() {
                   <div className="mt-2.5">
                     <div className="flex items-center justify-center gap-4">
                       <button
-                        onClick={() => adjustMetronomeBpm(-5)}
+                        onClick={() => adjustMetronomeBpm(-1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
                         style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                         aria-label="Sänk takt"
@@ -2693,7 +2812,7 @@ export default function App() {
                       </button>
                       <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4', minWidth: 90, textAlign: 'center' }}>{metronomeBpm} BPM</span>
                       <button
-                        onClick={() => adjustMetronomeBpm(5)}
+                        onClick={() => adjustMetronomeBpm(1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
                         style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                         aria-label="Höj takt"
@@ -2754,6 +2873,23 @@ export default function App() {
             handleFileUpload(file);
           }}
         />
+
+        {/* Count-in — plays before the mic actually starts recording */}
+        {phase === 'countin' && (
+          <div className="rounded-2xl p-5 flex flex-col items-center" style={{ backgroundColor: '#171B26', border: '1px solid rgba(255,180,84,0.3)' }}>
+            <span className="font-mono-ui text-sm" style={{ color: '#FFB454' }}>GÖR DIG REDO</span>
+            <span className="font-display text-6xl font-semibold mt-2 tabular-nums" style={{ color: '#F1EDE4' }}>
+              {COUNT_IN_BEATS - countInBeat}
+            </span>
+            <button
+              onClick={cancelCountIn}
+              className="stamma-btn mt-4 rounded-xl py-2 px-5 font-body font-medium text-sm"
+              style={{ backgroundColor: 'rgba(241,237,228,0.06)', color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.12)' }}
+            >
+              Avbryt
+            </button>
+          </div>
+        )}
 
         {/* Recording */}
         {phase === 'recording' && (
@@ -2936,6 +3072,24 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  {soundType === 'recording' && (
+                    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">Humanisera stämmor</div>
+                          <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                            Ger ters/kvint/sext en liten egen tonhöjdskaraktär istället för att ligga perfekt låst på intervallet
+                          </div>
+                        </div>
+                        <ToggleSwitch
+                          checked={humanizeOn}
+                          onChange={() => { setHumanizeOn((v) => !v); if (isPlaying) stopPlayback(); }}
+                          accentColor="#55D6C0"
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -2993,6 +3147,7 @@ export default function App() {
                     onApplyNoiseReduction={applyNoiseReduction}
                     denoising={denoising}
                     denoiseError={denoiseError}
+                    noiseReductionApplied={noiseReductionApplied}
                   />
 
                   <div className="flex items-center gap-2 mt-3">
@@ -3090,7 +3245,7 @@ export default function App() {
                     >
                       <div className="flex items-center justify-center gap-4">
                         <button
-                          onClick={() => adjustMetronomeBpm(-5)}
+                          onClick={() => adjustMetronomeBpm(-1)}
                           className="stamma-btn rounded-md flex items-center justify-center"
                           style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                           aria-label="Sänk takt"
@@ -3099,7 +3254,7 @@ export default function App() {
                         </button>
                         <span className="font-mono-ui text-lg" style={{ color: '#F1EDE4', minWidth: 56, textAlign: 'center' }}>{metronomeBpm}</span>
                         <button
-                          onClick={() => adjustMetronomeBpm(5)}
+                          onClick={() => adjustMetronomeBpm(1)}
                           className="stamma-btn rounded-md flex items-center justify-center"
                           style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                           aria-label="Höj takt"
@@ -3183,6 +3338,8 @@ export default function App() {
                         onRecord={() => recordOwnTake(type)}
                         onStopRecordEarly={stopOwnTakeRecordingEarly}
                         recording={recordingOwnTake?.type === type}
+                        recordCountingIn={recordingOwnTake?.type === type && !!recordingOwnTake.countingIn}
+                        recordCountInBeat={recordingOwnTake?.type === type ? recordingOwnTake.countInBeat : null}
                         recordCountdown={recordingOwnTake?.type === type ? recordingOwnTake.countdown : null}
                         recordDisabled={!!recordingOwnTake}
                       />,
@@ -3397,7 +3554,7 @@ function MixerChannel({
   label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy,
   direction, onSetDirection, solo, onToggleSolo, pan, onPanChange, previewing, onPreview,
   expanded, onToggleExpanded,
-  onRecord, onStopRecordEarly, recording, recordCountdown, recordDisabled, onDelete,
+  onRecord, onStopRecordEarly, recording, recordCountingIn, recordCountInBeat, recordCountdown, recordDisabled, onDelete,
 }) {
   const panLabel = Math.abs(pan) < 0.04 ? 'C' : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
@@ -3478,16 +3635,20 @@ function MixerChannel({
               style={{
                 width: 40,
                 height: 28,
-                backgroundColor: recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
-                color: recording ? '#10131A' : '#FF6B6B',
-                border: '1px solid rgba(255,107,107,0.5)',
+                backgroundColor: recordCountingIn ? 'rgba(255,180,84,0.15)' : recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
+                color: recordCountingIn ? '#FFB454' : recording ? '#10131A' : '#FF6B6B',
+                border: `1px solid ${recordCountingIn ? 'rgba(255,180,84,0.6)' : 'rgba(255,107,107,0.5)'}`,
                 opacity: (recordDisabled && !recording) ? 0.4 : 1,
                 cursor: (recordDisabled && !recording) ? 'not-allowed' : 'pointer',
               }}
               aria-label={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
               title={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
             >
-              {recording ? (
+              {recordCountingIn ? (
+                <span className="font-mono-ui" style={{ fontSize: 11, fontWeight: 700 }}>
+                  {COUNT_IN_BEATS - (recordCountInBeat || 0)}
+                </span>
+              ) : recording ? (
                 <span className="rec-dot font-mono-ui" style={{ fontSize: 9, fontWeight: 700 }}>
                   {Math.ceil(recordCountdown)}
                 </span>
