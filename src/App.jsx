@@ -996,8 +996,9 @@ function WaveformTrimmer({
             disabled={playDisabled}
             className="stamma-btn w-full rounded-xl py-3 flex items-center justify-center gap-2 font-body font-medium text-sm"
             style={{
-              backgroundColor: playDisabled ? 'rgba(241,237,228,0.06)' : '#FFB454',
-              color: playDisabled ? 'rgba(241,237,228,0.3)' : '#10131A',
+              backgroundColor: 'rgba(241,237,228,0.06)',
+              color: playDisabled ? 'rgba(241,237,228,0.3)' : '#C7CBDA',
+              border: '1px solid rgba(241,237,228,0.12)',
               cursor: playDisabled ? 'not-allowed' : 'pointer',
             }}
           >
@@ -1046,7 +1047,7 @@ const AUTOTUNE_LEVELS = [
 // (seconds); `wet` is how much of the reverberated signal gets mixed
 // back in alongside the untouched dry signal.
 const REVERB_LEVELS = [
-  { key: 'light', label: 'Lätt', decay: 0.9, wet: 0.14 },
+  { key: 'light', label: 'Liten', decay: 0.9, wet: 0.14 },
   { key: 'medium', label: 'Medel', decay: 1.7, wet: 0.24 },
   { key: 'large', label: 'Stor', decay: 3.0, wet: 0.38 },
 ];
@@ -1078,46 +1079,86 @@ function isChannelAudible(channelsState, key) {
 function AboutPage() {
   const sections = [
     {
+      id: 'spela-in',
       title: 'Sjung in eller ladda upp',
-      body: 'Spela in dig själv (max 10 sekunder) direkt i webbläsaren, eller ladda upp en befintlig ljudfil (WAV, MP3, M4A, OGG eller FLAC). Är filen längre än 10 sekunder klipps den av vid gränsen.',
+      body: 'Spela in dig själv (max 10s) direkt i webbläsaren, eller ladda upp en befintlig ljudfil (WAV, MP3, M4A, OGG eller FLAC). Är filen längre än 10 sekunder klipps den av vid gränsen.',
     },
     {
+      id: 'metronom',
+      title: 'Metronom',
+      body: 'Innan du spelar in kan du slå på ett klickspår som hörs medan du sjunger, med en egen takt (BPM) du ställer med +/− eller lyssnar dig fram till i förväg. Har du redan spelat in en gång försöker appen räkna ut takten själv utifrån tonerna — går det inte, går det alltid att sätta den manuellt.',
+    },
+    {
+      id: 'tonhojdskurva',
       title: 'Tonhöjdskurvan',
       body: 'Appen lyssnar igenom inspelningen och räknar ut vilken ton som sjungs vid varje ögonblick. Det ritas upp som en kurva du kan zooma i och öppna i helskärm — varje stapel är en enskild ton.',
     },
     {
+      id: 'tonart',
       title: 'Tonart',
       body: 'Utifrån vilka toner som förekommer mest gissar appen vilken tonart (dur eller moll) melodin ligger i. Det är den tonarten stämmorna sedan byggs utifrån, så en fel uppfattad tonart är den vanligaste orsaken till att en stämma låter konstig.',
     },
     {
+      id: 'ljud',
       title: 'Ljud: Ren synt / Formantröst / Din röst',
       body: 'Tre sätt att höra melodin och stämmorna på. "Ren synt" är en enkel sinuston, lättast att stämma efter. "Formantröst" är en syntetisk, vokalliknande klang. "Din röst" pitchskiftar din egen inspelning till varje stämmas toner, med bevarad klangfärg — mest verklighetstroget, men kräver att du spelat in (inte laddat upp en synt-fil).',
     },
     {
+      id: 'stammor',
       title: 'Stämmor: ters, kvint, sext',
-      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma.',
+      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma. Varje stämmas röst får dessutom en egen liten, konsekvent karaktär (en aning över/under tonhöjden, med en långsam svävning) så den låter mindre som en perfekt klon av din egen röst.',
     },
     {
+      id: 'egen-stamma',
+      title: 'Spela in egen stämma',
+      body: 'Rec-knappen på en stämmas kanal spelar in dig själv sjungandes just den stämman, med melodin i hörlurarna/högtalaren som stöd samtidigt. Din inspelade stämma dyker upp som en egen kanal ("Egen ters" osv.) och spelas upp precis som du sjöng den, utan pitchskiftning — du kan radera den och spela in igen när du vill.',
+    },
+    {
+      id: 'autotune',
       title: 'Autotune',
-      body: 'Rättar lätt falska toner i själva inspelningen (inte i stämmorna). Av som standard. När den är på väljer du hur mycket rättning som ska ske — Lätt, Medel eller Hård — där Hård drar tonerna närmast helt till rätt tonhöjd.',
+      body: 'Rättar falska toner i själva inspelningen (inte i stämmorna). Av som standard. När den är på väljer du hur mycket rättning som ska ske — Lätt, Medel eller Hård — där Hård drar tonerna närmast helt till rätt tonhöjd.',
     },
     {
+      id: 'reverb',
+      title: 'Reverb',
+      body: 'Lägger på lite rymd på hela mixen (alla kanaler samtidigt, inte en i taget). Av som standard. Storleken — Liten, Medel eller Stor — styr hur lång och påtaglig efterklangen är.',
+    },
+    {
+      id: 'brusreducering',
+      title: 'Brusreducering',
+      body: 'Markera en del av inspelningen som bara innehåller bakgrundsbrus (t.ex. tystnaden precis innan du börjar sjunga) — resten av inspelningen renas sedan utifrån hur det bruset låter.',
+    },
+    {
+      id: 'normalisera',
+      title: 'Normalisera',
+      body: 'Höjer inspelningens volym så den högsta toppen når precis under maxnivå, utan att förvränga ljudet. Både brusreducering och normalisering skriver över den inspelning stämmorna byggs från — "Återställ till original" ångrar alla sådana ändringar och går tillbaka till den allra första inspelningen.',
+    },
+    {
+      id: 'vagform',
       title: 'Vågformen: beskärning och fader',
       body: 'Under "Din röst" visas en vågform av originalinspelningen. Dra i de två handtagen i kanterna för att välja vilken del som ska spelas — allt utanför blir mörkare. De gula triangelhandtagen i hörnen styr tona in/tona ut: dra dem inåt för en mjukare start eller avslutning istället för en tvär in/utklippning.',
     },
     {
+      id: 'transport',
       title: 'Spela, pausa, loopa',
-      body: 'Under vågformen finns tre kontroller: en loop-knapp (upprepar den valda delen tills du stänger av den), en stopp-knapp (stannar och hoppar tillbaka till början) och en kombinerad spela/pausa-knapp. Pausar du mitt i går det att fortsätta exakt där du var. Reglaget under knapparna spolar fram och tillbaka i den valda delen.',
+      body: 'Under vågformen finns tre kontroller i samma stil: en stopp-knapp (stannar och hoppar tillbaka till början), en kombinerad spela/pausa-knapp, och en loop-knapp till höger om den (upprepar den valda delen tills du stänger av den). Pausar du mitt i går det att fortsätta exakt där du var. Reglaget under knapparna spolar fram och tillbaka i den valda delen.',
     },
     {
+      id: 'mixer',
       title: 'Mixern',
-      body: 'Varje spår — melodi, ters, kvint, sext — går att slå på eller av var för sig, och alla påslagna spelas samtidigt när du trycker play. Varje spår har en liten play-knapp för att förhandslyssna bara det spåret, en S-knapp för att solo:a (tysta alla andra tillfälligt), och volym/panorering som fälls ut genom att trycka på procentsatsen.',
+      body: 'Varje spår — melodi, ters, kvint, sext, och eventuella egna inspelade stämmor — går att slå på eller av var för sig, och alla påslagna spelas samtidigt när du trycker play. Varje spår har en liten play-knapp för att förhandslyssna bara det spåret, en S-knapp för att solo:a (tysta alla andra tillfälligt), och volym/panorering som fälls ut genom att trycka på procentsatsen.',
     },
     {
+      id: 'exportera',
       title: 'Exportera',
       body: 'Ladda ner sången och varje stämma som separata WAV-filer, till exempel för att jobba vidare i ett annat program.',
     },
   ];
+
+  function scrollToSection(e, id) {
+    e.preventDefault();
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 
   return (
     <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
@@ -1143,9 +1184,33 @@ function AboutPage() {
           Så fungerar appens olika delar, rent praktiskt.
         </p>
 
+        <nav
+          className="mt-5 rounded-xl p-3"
+          style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}
+          aria-label="Innehåll"
+        >
+          <div className="font-mono-ui text-xs font-medium" style={{ color: '#C7CBDA' }}>
+            Innehåll
+          </div>
+          <ul className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5">
+            {sections.map((s) => (
+              <li key={s.id}>
+                <a
+                  href={`#${s.id}`}
+                  onClick={(e) => scrollToSection(e, s.id)}
+                  className="stamma-btn text-sm leading-snug"
+                  style={{ color: '#55D6C0' }}
+                >
+                  {s.title}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </nav>
+
         <div className="mt-6 space-y-5">
           {sections.map((s) => (
-            <div key={s.title}>
+            <div key={s.id} id={s.id} style={{ scrollMarginTop: 16 }}>
               <h2 className="font-display text-lg font-semibold" style={{ color: '#F1EDE4' }}>
                 {s.title}
               </h2>
@@ -1233,6 +1298,17 @@ export default function App() {
   const playCtxRef = useRef(null);
   const activeSourcesRef = useRef([]);
   const mixNodesRef = useRef({});
+  // Bumped by every stopPlayback() call (including the one every startMix()
+  // does at its own top) and captured as `myGeneration` right after; a
+  // startMix() call whose generation no longer matches once its (possibly
+  // slow, harmony-render-involving) content resolution finishes has been
+  // superseded by a newer play/pause/stop/preview press and must not
+  // schedule any audio — otherwise its nodes would start playing orphaned,
+  // invisible to activeSourcesRef/mixNodesRef (which the newer call already
+  // owns), so stopPlayback() could never reach them again and they'd keep
+  // sounding — or silently colliding with whatever plays next — until a
+  // full page reload.
+  const playGenerationRef = useRef(0);
   const meterRefs = useRef({});
   const meterScratchRef = useRef(null);
   const recordedBufferRef = useRef(null);
@@ -2000,6 +2076,11 @@ export default function App() {
   // every "position" reader (the seek slider, startMix's default offset)
   // treats as "start of the trim window", i.e. back to the beginning.
   function stopPlayback({ keepPosition } = {}) {
+    // Invalidates any startMix() call still awaiting content resolution
+    // (e.g. a first-time harmony render) — without this, that call would
+    // still schedule and start audio after the user asked for it to stop.
+    // See playGenerationRef.
+    playGenerationRef.current += 1;
     if (playTimeoutRef.current) {
       clearTimeout(playTimeoutRef.current);
       playTimeoutRef.current = null;
@@ -2258,6 +2339,7 @@ export default function App() {
   // restart and a fresh channel preview want.
   async function startMix(channelsState, keysOverride, startOffset) {
     stopPlayback();
+    const myGeneration = playGenerationRef.current;
     const activeKeys = keysOverride || Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
     if (!activeKeys.length) return;
 
@@ -2267,6 +2349,11 @@ export default function App() {
     );
     const usable = resolved.filter((r) => r.content);
     if (!usable.length) return;
+    // A newer startMix() call (another play/pause/preview press while this
+    // one was still awaiting content, e.g. a first-time harmony render)
+    // has since taken over — starting audio now would create nodes no
+    // stopPlayback() can ever reach again. See playGenerationRef.
+    if (playGenerationRef.current !== myGeneration) return;
 
     // The trim window (waveform handles) clips every channel's playback to
     // the same [rangeStart, rangeEnd) span on the recording's timeline.
@@ -2635,7 +2722,7 @@ export default function App() {
               className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
               style={{ backgroundColor: '#FFB454', color: '#10131A' }}
             >
-              Spela in (max 10 sekunder)
+              Spela in (max 10s)
             </button>
             <button
               onClick={() => fileInputRef.current?.click()}
@@ -3221,22 +3308,6 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
   return (
     <div className="flex items-center gap-2">
       <button
-        onClick={onToggleLoop}
-        className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
-        style={{
-          width: 44,
-          height: 44,
-          backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-          color: loopEnabled ? '#55D6C0' : '#C7CBDA',
-          border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-        }}
-        aria-pressed={loopEnabled}
-        aria-label="Loopa uppspelning"
-        title="Loopa uppspelning"
-      >
-        <LoopIcon size={19} />
-      </button>
-      <button
         onClick={onStop}
         disabled={disabled}
         className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
@@ -3258,13 +3329,30 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
         disabled={disabled || busy}
         className="stamma-btn flex-1 rounded-xl py-3 flex items-center justify-center gap-2 font-body font-medium text-sm transition-transform active:scale-[0.98]"
         style={{
-          backgroundColor: (disabled || busy) ? 'rgba(241,237,228,0.06)' : '#FFB454',
-          color: (disabled || busy) ? 'rgba(241,237,228,0.3)' : '#10131A',
+          backgroundColor: 'rgba(241,237,228,0.06)',
+          color: (disabled || busy) ? 'rgba(241,237,228,0.3)' : '#C7CBDA',
+          border: '1px solid rgba(241,237,228,0.12)',
           cursor: (disabled || busy) ? 'not-allowed' : 'pointer',
         }}
       >
         {isPlaying ? <PauseIcon size={19} /> : <PlayIcon size={19} />}
         {isPlaying ? 'Pausa' : busy ? 'Bygger …' : 'Spela mix'}
+      </button>
+      <button
+        onClick={onToggleLoop}
+        className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
+        style={{
+          width: 44,
+          height: 44,
+          backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+          color: loopEnabled ? '#55D6C0' : '#C7CBDA',
+          border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+        }}
+        aria-pressed={loopEnabled}
+        aria-label="Loopa uppspelning"
+        title="Loopa uppspelning"
+      >
+        <LoopIcon size={19} />
       </button>
     </div>
   );
@@ -3323,32 +3411,6 @@ function MixerChannel({
       <div className="flex items-center gap-2">
         <div className="flex flex-col items-center gap-1">
           <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} />
-          {onRecord && (
-            <button
-              onClick={recording ? onStopRecordEarly : onRecord}
-              disabled={recordDisabled && !recording}
-              className="stamma-btn shrink-0 rounded-full flex items-center justify-center"
-              style={{
-                width: 20,
-                height: 20,
-                backgroundColor: recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
-                color: recording ? '#10131A' : '#FF6B6B',
-                border: '1px solid rgba(255,107,107,0.5)',
-                opacity: (recordDisabled && !recording) ? 0.4 : 1,
-                cursor: (recordDisabled && !recording) ? 'not-allowed' : 'pointer',
-              }}
-              aria-label={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
-              title={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
-            >
-              {recording ? (
-                <span className="rec-dot font-mono-ui" style={{ fontSize: 9, fontWeight: 700 }}>
-                  {Math.ceil(recordCountdown)}
-                </span>
-              ) : (
-                <RecordIcon size={10} />
-              )}
-            </button>
-          )}
           {onDelete && (
             <button
               onClick={onDelete}
@@ -3407,13 +3469,40 @@ function MixerChannel({
       </div>
 
       {direction !== undefined && (
-        <div className="flex gap-1 mt-1.5 ml-[64px]">
+        <div className="flex items-center gap-2 mt-1.5">
+          {onRecord && (
+            <button
+              onClick={recording ? onStopRecordEarly : onRecord}
+              disabled={recordDisabled && !recording}
+              className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
+              style={{
+                width: 40,
+                height: 28,
+                backgroundColor: recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
+                color: recording ? '#10131A' : '#FF6B6B',
+                border: '1px solid rgba(255,107,107,0.5)',
+                opacity: (recordDisabled && !recording) ? 0.4 : 1,
+                cursor: (recordDisabled && !recording) ? 'not-allowed' : 'pointer',
+              }}
+              aria-label={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
+              title={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
+            >
+              {recording ? (
+                <span className="rec-dot font-mono-ui" style={{ fontSize: 9, fontWeight: 700 }}>
+                  {Math.ceil(recordCountdown)}
+                </span>
+              ) : (
+                <RecordIcon size={12} />
+              )}
+            </button>
+          )}
           {[{ v: -1, label: 'Understämma' }, { v: 1, label: 'Överstämma' }].map((opt) => (
             <button
               key={opt.v}
               onClick={() => onSetDirection(opt.v)}
-              className="stamma-btn flex-1 rounded-md py-0.5 text-[10px] font-medium leading-tight"
+              className="stamma-btn flex-1 rounded-md text-[10px] font-medium leading-tight"
               style={{
+                height: 28,
                 backgroundColor: direction === opt.v ? `${accentColor}26` : 'transparent',
                 color: direction === opt.v ? accentColor : '#C7CBDA',
                 border: direction === opt.v ? `1px solid ${accentColor}66` : '1px solid rgba(241,237,228,0.12)',
