@@ -1083,7 +1083,7 @@ function AboutPage() {
     },
     {
       id: 'ljud',
-      title: 'Ljud: Ren synt / Formantröst / Din röst',
+      title: 'Röst: Ren synt / Formantröst / Din röst',
       body: 'Tre sätt att höra melodin och stämmorna på. "Ren synt" är en enkel sinuston, lättast att stämma efter. "Formantröst" är en syntetisk, vokalliknande klang. "Din röst" pitchskiftar din egen inspelning till varje stämmas toner, med bevarad klangfärg — mest verklighetstroget, men kräver att du spelat in (inte laddat upp en synt-fil).',
     },
     {
@@ -2915,7 +2915,7 @@ export default function App() {
                 onClick={() => setLjudExpanded((v) => !v)}
                 className="stamma-btn w-full flex items-center justify-between mb-2"
               >
-                <h2 className="font-display text-lg font-semibold">Ljud</h2>
+                <h2 className="font-display text-lg font-semibold">Röst</h2>
                 <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: ljudExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
               </button>
               {ljudExpanded && (
