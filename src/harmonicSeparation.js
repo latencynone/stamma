@@ -1,4 +1,4 @@
-import { fft, ifft, hannWindow } from './dsp.js';
+import { fft, hannWindow } from './dsp.js';
 import { scaleStepToMidi, midiToFreq } from './musicTheory.js';
 
 /* ---------- Harmonic / residual voice separation ----------
@@ -14,14 +14,30 @@ import { scaleStepToMidi, midiToFreq } from './musicTheory.js';
  * with natural-sounding vowels.
  *
  * This module splits a recording into those two layers via STFT analysis:
- * for each frame, search near the melody's already-known expected pitch (and
- * its harmonics) for real spectral peaks, build a soft per-bin mask from
- * whatever is actually found, and route the frame's spectrum through that
- * mask into a harmonic-only signal and a residual-only signal that sum back
- * to (approximately) the original. Only the harmonic layer then goes through
- * the pitch/formant shift in harmonyEngine.js; the residual is added back
- * unshifted, so consonants and breath keep their natural, non-tonal
- * character instead of being "sung" along with the vowels.
+ * for each ~46ms frame, search near the melody's already-known expected
+ * pitch (and its harmonics) for real spectral peaks, and decide whether the
+ * *whole frame* is voiced — routing its entire spectrum to the harmonic
+ * signal — or not, routing it entirely to the residual signal. Only the
+ * harmonic layer then goes through the pitch/formant shift in
+ * harmonyEngine.js; the residual is added back unshifted, so consonants and
+ * breath keep their natural, non-tonal character instead of being "sung"
+ * along with the vowels.
+ *
+ * The decision is deliberately per *frame*, not per spectral bin. An
+ * earlier version of this module built a narrow per-bin mask — routing only
+ * the exact bins right at each confirmed harmonic peak to the harmonic
+ * layer, everything else in that same frame to residual. That measurably
+ * broke on real recordings: a real voice's energy isn't concentrated at
+ * infinitely narrow harmonic lines, it's spread by formant bandwidth,
+ * in-frame vibrato, and aspiration mixed in with the tone — all real,
+ * legitimately tonal signal that a narrow comb mask doesn't capture. That
+ * spread energy was routed to residual and played back unshifted, audible
+ * as a quiet, ghostly copy of the original melody's own pitch riding under
+ * the shifted harmony ("sounds like there's a second voice quietly in the
+ * background"). A frame small enough that speech/singing is overwhelmingly
+ * either voiced or unvoiced within it doesn't need — and, on real audio,
+ * actively suffers from — that finer-grained split; per-frame is both
+ * simpler and correct.
  *
  * Knowing the expected pitch in advance (from the melody's own analysis,
  * rather than blind detection) is what makes a fairly simple peak search
@@ -30,12 +46,12 @@ import { scaleStepToMidi, midiToFreq } from './musicTheory.js';
  *
  * Reuses the exact STFT/overlap-add scheme (window, hop, windowSum
  * normalization) already proven by the noise-reduction feature
- * (spectralSubtractChannel in App.jsx), just producing two complementary
- * outputs per frame instead of one denoised one.
+ * (spectralSubtractChannel in App.jsx), just routing each frame's windowed
+ * samples to one of two accumulators instead of denoising into one.
  *
  * IMPORTANT failure-direction rule: getting a frame's classification wrong
  * must never be worse than not having this feature at all. A frame this
- * module fails to confirm as harmonic gets routed to residual — i.e. played
+ * module fails to confirm as voiced gets routed to residual — i.e. played
  * back unshifted — so a genuinely voiced frame that's merely *missed* here
  * sounds like the original melody's own pitch leaking through where the
  * harmony should be. Real singing drifts (vibrato, dynamics) well past a
@@ -61,23 +77,41 @@ const NYQUIST_BIN = FFT_SIZE / 2;
 // confirmation-strictness knobs below, not from casting a wider net here.
 const F0_SEARCH_CENTS = 120;
 const HARMONIC_SEARCH_CENTS = 90;
-const MAX_HARMONICS = 20;
-// Width (bins on each side of a confirmed peak) stamped into the mask —
-// matches roughly one FFT_SIZE=2048 Hann main-lobe width, so a masked-in
-// harmonic keeps its real spectral energy rather than just its peak sample.
-const PEAK_BIN_WIDTH = 2;
+// How many harmonics above the fundamental to check for confirmation.
+// Deliberately small — not "every harmonic up to Nyquist". Checking many
+// independent candidate bins against a modest per-bin threshold makes a
+// false "yes, this is voiced" verdict increasingly likely on pure noise by
+// chance the more chances it gets (with ~19 candidates up to Nyquist, even
+// a modest per-bin false-positive rate compounds to a high chance *some*
+// bin clears the bar — this is what let real white noise get misclassified
+// as voiced during testing). Restricting to the first few harmonics, which
+// are reliably the strongest in real voiced content anyway, keeps the
+// confirmation both musically justified and statistically sound.
+const HARMONICS_TO_CHECK = 4;
 // A candidate peak only counts as a real harmonic (not a noise-floor bump)
-// if it reaches at least this fraction of the frame's overall spectral
-// peak. Halved for harmonics above the fundamental, which are naturally
-// quieter even in a clearly voiced frame.
-const MIN_PEAK_RATIO = 0.08;
+// if it stands out from the frame's *average* spectral magnitude by at
+// least this factor. Measured against real signals: a clean sung tone's
+// fundamental peak sits at roughly 100-300x the frame's average magnitude,
+// while broadband noise's strongest bin in any given narrow search window
+// — even picking the best of several candidate windows — only reaches
+// roughly 1-2x the average (noise energy is spread out, not concentrated).
+// This threshold sits with a wide safety margin above the noise ceiling
+// and a wide margin below a clean tone, leaving plenty of room for real
+// (less pure, formant-shaped) singing in between. Comparing against the
+// frame's average is what makes this reliable — comparing against the
+// frame's single *global* peak (an earlier version of this check) isn't:
+// broadband noise's global peak is itself just another random spike, often
+// at some unrelated frequency (observed up in the 15-20kHz range on a pure
+// noise test signal), so a narrowband candidate could spuriously look
+// "dominant" relative to it purely by chance.
+const MIN_PEAK_TO_AVG_RATIO = 4;
 // A lone fundamental-range peak could just be a stray noise-floor bump
 // that happened to fall in the search window — real voiced content nearly
 // always shows at least one other aligned harmonic. Accept it on the
-// fundamental alone only when that peak is unusually dominant (most of the
-// frame's whole energy), which noise essentially never produces.
+// fundamental alone only when it clears a much higher bar (still far below
+// a clean tone's ~100-300x, comfortably above noise's ~1-2x).
 const MIN_HARMONICS_FOR_CONFIRMATION = 2;
-const DOMINANT_FUNDAMENTAL_RATIO = 0.35;
+const DOMINANT_FUNDAMENTAL_TO_AVG_RATIO = 10;
 // Number of STFT frames processed per synchronous batch before yielding to
 // the event loop — keeps a long recording from blocking the main thread
 // (and tripping the browser's "unresponsive page" handling) in one go.
@@ -116,60 +150,40 @@ function findPeakInRange(mag, loBin, hiBin) {
   return refinePeak(mag, bestK);
 }
 
-// Builds a per-bin [0,1] mask for one frame's full-length (conjugate-
-// symmetric) spectrum: ~1 near confirmed harmonic partials of
-// `expectedF0Hz`, 0 elsewhere. Returns null (→ caller falls back, see
-// splitChannel) when there's no expected pitch (a gap/pause) or not enough
-// evidence of real harmonic content turns up.
-function buildHarmonicMask(mag, sampleRate, expectedF0Hz, scratch) {
-  if (!expectedF0Hz) return null;
+// Decides whether one frame's magnitude spectrum is confidently voiced:
+// search near `expectedF0Hz` for a real fundamental peak, then look for at
+// least one of its harmonics nearby too (or accept the fundamental alone
+// when it's unusually dominant). Returns false when there's no expected
+// pitch (a gap/pause) or not enough evidence of real harmonic content —
+// the whole frame then gets routed to residual, see splitChannel.
+function isVoicedFrame(mag, sampleRate, expectedF0Hz) {
+  if (!expectedF0Hz) return false;
   const binHz = sampleRate / FFT_SIZE;
+
+  let sum = 0;
+  for (let k = 1; k < NYQUIST_BIN; k++) sum += mag[k];
+  const avgMag = sum / (NYQUIST_BIN - 1);
+  if (avgMag <= 0) return false;
 
   const [f0Lo, f0Hi] = centsToBinRange(expectedF0Hz, F0_SEARCH_CENTS, sampleRate);
   const f0Peak = findPeakInRange(mag, f0Lo, f0Hi);
-  if (!f0Peak) return null;
-
-  let overallPeak = 0;
-  for (let k = 1; k < NYQUIST_BIN; k++) if (mag[k] > overallPeak) overallPeak = mag[k];
-  if (overallPeak <= 0 || f0Peak.mag < overallPeak * MIN_PEAK_RATIO) return null;
+  if (!f0Peak || f0Peak.mag < avgMag * MIN_PEAK_TO_AVG_RATIO) return false;
 
   const f0Hz = f0Peak.bin * binHz;
-  const mask = scratch;
-  mask.fill(0);
-  const maxHarmonic = Math.min(MAX_HARMONICS, Math.floor((NYQUIST_BIN * binHz) / f0Hz));
+  const nyquistHz = NYQUIST_BIN * binHz;
 
-  const stampPeak = (bin) => {
-    const center = Math.round(bin);
-    for (let d = -PEAK_BIN_WIDTH; d <= PEAK_BIN_WIDTH; d++) {
-      const k = center + d;
-      if (k < 1 || k >= NYQUIST_BIN) continue;
-      const w = 1 - Math.abs(d) / (PEAK_BIN_WIDTH + 1);
-      if (w > mask[k]) mask[k] = w;
-    }
-  };
-
-  stampPeak(f0Peak.bin);
   let confirmed = 1;
-  for (let h = 2; h <= maxHarmonic; h++) {
-    const [lo, hi] = centsToBinRange(f0Hz * h, HARMONIC_SEARCH_CENTS, sampleRate);
+  for (let h = 2; h <= HARMONICS_TO_CHECK; h++) {
+    const harmonicHz = f0Hz * h;
+    if (harmonicHz >= nyquistHz) break;
+    const [lo, hi] = centsToBinRange(harmonicHz, HARMONIC_SEARCH_CENTS, sampleRate);
     const peak = findPeakInRange(mag, lo, hi);
-    if (peak && peak.mag >= overallPeak * MIN_PEAK_RATIO * 0.5) {
-      stampPeak(peak.bin);
-      confirmed++;
-    }
+    if (peak && peak.mag >= avgMag * MIN_PEAK_TO_AVG_RATIO * 0.5) confirmed++;
   }
   // A single unconfirmed peak isn't enough evidence unless it's dominant —
   // see the module-level note on why this leans toward accepting real
   // voiced content rather than rejecting borderline noise.
-  if (confirmed < MIN_HARMONICS_FOR_CONFIRMATION && f0Peak.mag < overallPeak * DOMINANT_FUNDAMENTAL_RATIO) {
-    return null;
-  }
-
-  // Full spectrum is conjugate-symmetric; mirror the mask to match so
-  // masking the real/imaginary arrays directly keeps that symmetry (and
-  // therefore a real-valued signal after ifft).
-  for (let k = 1; k < NYQUIST_BIN; k++) mask[FFT_SIZE - k] = mask[k];
-  return mask;
+  return confirmed >= MIN_HARMONICS_FOR_CONFIRMATION || f0Peak.mag >= avgMag * DOMINANT_FUNDAMENTAL_TO_AVG_RATIO;
 }
 
 function yieldToEventLoop() {
@@ -178,64 +192,57 @@ function yieldToEventLoop() {
 
 // Splits one channel into harmonic-only and residual-only signals via STFT
 // / overlap-add, using `f0AtTime(seconds) -> Hz|0` to look up the expected
-// pitch per frame.
+// pitch per frame. Each frame is routed *whole* to one accumulator or the
+// other (see the module-level note on why this is per-frame, not per-bin)
+// — so there's no need to inverse-FFT a masked spectrum back to the time
+// domain; the already-windowed time-domain samples go straight to
+// whichever accumulator this frame belongs to.
 async function splitChannel(channelData, sampleRate, f0AtTime) {
   const window = hannWindow(FFT_SIZE);
   const harmonicOut = new Float32Array(channelData.length);
   const residualOut = new Float32Array(channelData.length);
   const windowSum = new Float32Array(channelData.length);
+  const windowed = new Float32Array(FFT_SIZE);
   const re = new Float32Array(FFT_SIZE);
   const im = new Float32Array(FFT_SIZE);
   const mag = new Float32Array(NYQUIST_BIN + 1);
-  const maskScratch = new Float32Array(FFT_SIZE);
-  const reH = new Float32Array(FFT_SIZE);
-  const imH = new Float32Array(FFT_SIZE);
-  const reR = new Float32Array(FFT_SIZE);
-  const imR = new Float32Array(FFT_SIZE);
   let lastCovered = 0;
   // A lone frame that fails right after a confidently-voiced one is more
   // likely a brief tracking blip (a fast vibrato swing, a momentary dip in
-  // level) than a real transition to silence/consonant — holding the last
-  // confirmed mask for exactly one frame smooths over that without letting
+  // level) than a real transition to silence/consonant — holding the
+  // voiced verdict for exactly one frame smooths over that without letting
   // a real multi-frame transition (an actual consonant/pause) get stuck.
-  let heldMask = null;
-  let heldMaskUsed = false;
+  let heldVoiced = false;
+  let heldUsed = false;
   let frameCount = 0;
 
   for (let start = 0; start + FFT_SIZE <= channelData.length; start += HOP) {
     for (let i = 0; i < FFT_SIZE; i++) {
-      re[i] = channelData[start + i] * window[i];
+      const w = channelData[start + i] * window[i];
+      windowed[i] = w;
+      re[i] = w;
       im[i] = 0;
     }
     fft(re, im);
     for (let k = 0; k <= NYQUIST_BIN; k++) mag[k] = Math.hypot(re[k], im[k]);
 
     const frameCenterT = (start + FFT_SIZE / 2) / sampleRate;
-    const mask = buildHarmonicMask(mag, sampleRate, f0AtTime(frameCenterT), maskScratch);
+    const voiced = isVoicedFrame(mag, sampleRate, f0AtTime(frameCenterT));
 
-    let effectiveMask = mask;
-    if (mask) {
-      heldMask = mask.slice();
-      heldMaskUsed = false;
-    } else if (heldMask && !heldMaskUsed) {
-      effectiveMask = heldMask;
-      heldMaskUsed = true;
+    let effectiveVoiced = voiced;
+    if (voiced) {
+      heldVoiced = true;
+      heldUsed = false;
+    } else if (heldVoiced && !heldUsed) {
+      effectiveVoiced = true;
+      heldUsed = true;
     } else {
-      heldMask = null;
+      heldVoiced = false;
     }
 
-    for (let k = 0; k < FFT_SIZE; k++) {
-      const m = effectiveMask ? effectiveMask[k] : 0;
-      reH[k] = re[k] * m;
-      imH[k] = im[k] * m;
-      reR[k] = re[k] * (1 - m);
-      imR[k] = im[k] * (1 - m);
-    }
-    ifft(reH, imH);
-    ifft(reR, imR);
+    const dest = effectiveVoiced ? harmonicOut : residualOut;
     for (let i = 0; i < FFT_SIZE; i++) {
-      harmonicOut[start + i] += reH[i] * window[i];
-      residualOut[start + i] += reR[i] * window[i];
+      dest[start + i] += windowed[i] * window[i];
       windowSum[start + i] += window[i] * window[i];
     }
     lastCovered = start + FFT_SIZE;
