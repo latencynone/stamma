@@ -647,6 +647,7 @@ const NOISE_COLOR = '#FF9F5A';
 function WaveformTrimmer({
   peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime,
   isPlaying, onPlayPause, onSeek, playDisabled,
+  onStop, loopEnabled, onToggleLoop, busy,
   noiseReductionMode, onToggleNoiseReductionMode, noiseSampleStart, noiseSampleEnd, onNoiseSampleChange,
   onApplyNoiseReduction, denoising, denoiseError, noiseReductionApplied,
 }) {
@@ -1028,20 +1029,15 @@ function WaveformTrimmer({
           covered by this fixed overlay once isFullscreen is true. */}
       {isFullscreen && onPlayPause && (
         <div className="mt-4">
-          <button
-            onClick={onPlayPause}
+          <TransportButtons
+            loopEnabled={loopEnabled}
+            onToggleLoop={onToggleLoop}
+            onStop={onStop}
+            isPlaying={isPlaying}
+            onPlayPause={onPlayPause}
             disabled={playDisabled}
-            className="stamma-btn w-full rounded-xl py-3 flex items-center justify-center gap-2 font-body font-medium text-sm"
-            style={{
-              backgroundColor: 'rgba(241,237,228,0.06)',
-              color: playDisabled ? 'rgba(241,237,228,0.3)' : '#C7CBDA',
-              border: '1px solid rgba(241,237,228,0.12)',
-              cursor: playDisabled ? 'not-allowed' : 'pointer',
-            }}
-          >
-            {isPlaying ? <PauseIcon size={19} /> : <PlayIcon size={19} />}
-            {isPlaying ? 'Pausa' : 'Spela mix'}
-          </button>
+            busy={busy}
+          />
           <div className="flex items-center gap-2 mt-2">
             <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
               {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
@@ -1318,8 +1314,9 @@ export default function App() {
   // can show a lasting "applied" confirmation, not just a brief spinner.
   const [noiseReductionApplied, setNoiseReductionApplied] = useState(false);
   const [effectsExpanded, setEffectsExpanded] = useState(false);
-  const [ljudExpanded, setLjudExpanded] = useState(true);
-  const [mixerExpanded, setMixerExpanded] = useState(true);
+  const [ljudExpanded, setLjudExpanded] = useState(false);
+  const [mixerExpanded, setMixerExpanded] = useState(false);
+  const [noteViewExpanded, setNoteViewExpanded] = useState(false);
   const [exportExpanded, setExportExpanded] = useState(false);
   const [metronomeEnabled, setMetronomeEnabled] = useState(false); // clicks during an actual recording
   const [metronomeBpm, setMetronomeBpm] = useState(100);
@@ -2735,25 +2732,38 @@ export default function App() {
 
         {/* Signature visualization */}
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-          <PitchCanvas melodyNotes={melodyNotes} harmonyLayers={harmonyLayers} keyInfo={keyInfo} keyLabel={keyLabel} duration={recordingDuration} playheadTime={playheadTime} />
-          {melodyNotes.length > 0 && (
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: MELODY_COLOR.line }} />
-                melodi
-              </span>
-              {harmonyLayers.map((layer) => (
-                <span key={layer.key} className="flex items-center gap-1.5">
-                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: layer.color }} />
-                  {HARMONY_TYPES[layer.key].label.toLowerCase()}
-                </span>
-              ))}
-              {playheadTime !== null && (
-                <span className="ml-auto" style={{ color: '#F1EDE4' }}>
-                  {playheadTime.toFixed(1)}s / {recordingDuration.toFixed(1)}s
-                </span>
+          <button
+            onClick={() => setNoteViewExpanded((v) => !v)}
+            className="stamma-btn w-full flex items-center justify-between"
+          >
+            <h2 className="font-display text-lg font-semibold">Tonhöjdskurva</h2>
+            <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: noteViewExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+          </button>
+          {noteViewExpanded && (
+            <>
+              <div className="mt-2">
+                <PitchCanvas melodyNotes={melodyNotes} harmonyLayers={harmonyLayers} keyInfo={keyInfo} keyLabel={keyLabel} duration={recordingDuration} playheadTime={playheadTime} />
+              </div>
+              {melodyNotes.length > 0 && (
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: MELODY_COLOR.line }} />
+                    melodi
+                  </span>
+                  {harmonyLayers.map((layer) => (
+                    <span key={layer.key} className="flex items-center gap-1.5">
+                      <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: layer.color }} />
+                      {HARMONY_TYPES[layer.key].label.toLowerCase()}
+                    </span>
+                  ))}
+                  {playheadTime !== null && (
+                    <span className="ml-auto" style={{ color: '#F1EDE4' }}>
+                      {playheadTime.toFixed(1)}s / {recordingDuration.toFixed(1)}s
+                    </span>
+                  )}
+                </div>
               )}
-            </div>
+            </>
           )}
           {phase === 'ready' && (
             <div className="mt-3">
@@ -3159,6 +3169,10 @@ export default function App() {
                     onPlayPause={togglePlayPause}
                     onSeek={seekTo}
                     playDisabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
+                    onStop={() => stopPlayback()}
+                    loopEnabled={loopEnabled}
+                    onToggleLoop={() => setLoopEnabled((v) => !v)}
+                    busy={anyHarmonyBusy || autotuneRendering}
                     noiseReductionMode={noiseReductionMode}
                     onToggleNoiseReductionMode={() => (noiseReductionMode ? setNoiseReductionMode(false) : enterNoiseReductionMode())}
                     noiseSampleStart={noiseSampleStart}
