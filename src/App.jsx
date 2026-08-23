@@ -1143,7 +1143,7 @@ function AboutPage() {
     {
       id: 'stammor',
       title: 'Stämmor: ters, kvint, sext',
-      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma. Varje stämmas röst får dessutom en egen liten, konsekvent karaktär (en aning över/under tonhöjden, med en långsam svävning) så den låter mindre som en perfekt klon av din egen röst.',
+      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma.',
     },
     {
       id: 'egen-stamma',
@@ -1159,6 +1159,11 @@ function AboutPage() {
       id: 'reverb',
       title: 'Reverb',
       body: 'Lägger på lite rymd på hela mixen (alla kanaler samtidigt, inte en i taget). Av som standard. Storleken — Liten, Medel eller Stor — styr hur lång och påtaglig efterklangen är.',
+    },
+    {
+      id: 'humanisera',
+      title: 'Humanisera stämmor',
+      body: 'På som standard under "Din röst". Ger ters, kvint och sext var sin egen, konsekventa röstkaraktär istället för att låta som en perfekt klonad kopia av din egen röst: en aning över/under tonhöjden, en långsam svävning, egen vibrato, och en liten formantförskjutning (ungefärlig röstlådestorlek) — som om det faktiskt vore tre olika sångare.',
     },
     {
       id: 'brusreducering',
@@ -3094,7 +3099,7 @@ export default function App() {
                         <div>
                           <div className="text-sm font-medium">Humanisera stämmor</div>
                           <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
-                            Ger ters/kvint/sext en liten egen tonhöjdskaraktär istället för att ligga perfekt låst på intervallet
+                            Ger ters/kvint/sext egen vibrato, formant och tonhöjdskaraktär istället för att låta som en klonad kopia av din röst
                           </div>
                         </div>
                         <ToggleSwitch

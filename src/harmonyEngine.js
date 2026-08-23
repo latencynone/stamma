@@ -175,34 +175,68 @@ export function buildRatioCurveFromSegments(segments, totalDuration, energyEnvel
 // (or, for another harmony type, would be) shifted from is otherwise a
 // perfect clone in every way pitch-shifting can't touch: identical timing,
 // identical micro-pitch behavior, laser-locked to the target ratio for the
-// full length of every note. Real double-tracked/harmony singers never
-// actually agree that precisely — a small fixed "this voice tends slightly
-// sharp/flat" detune, plus a slow (sub-1Hz, well below vibrato rate) pitch
-// drift, is what a live harmony pedal's "humanize"/voice-character controls
-// are doing too. One fixed profile per interval keeps a given type's
+// full length of every note, and — since it's literally the same audio —
+// carrying the melody's own vibrato through at the *exact same phase*,
+// which two independent singers never do. A live harmony pedal's
+// "humanize"/voice-character controls address the pitch side of this with
+// a small fixed "this voice tends slightly sharp/flat" detune plus a slow
+// (sub-1Hz, well below vibrato rate) drift; on top of that, `vibratoCents`/
+// `vibratoHz` add a second, faster (~5-6Hz) oscillation at this voice's own
+// phase, so it beats against the melody's carried-through vibrato instead
+// of moving in lockstep with it. `formantSemitones` (passed separately to
+// SignalsmithStretch, not part of the ratio curve — see renderHarmonyOffline)
+// gives the voice its own rough vocal-tract size, since a real other singer
+// doesn't share yours. One fixed profile per interval keeps a given type's
 // character consistent across renders instead of it just adding random
 // per-render noise.
 const HARMONY_HUMANIZE_PROFILES = {
-  ters: { detuneCents: -3, wobbleCents: 4, wobbleHz: 0.22, phase: 0.4 },
-  kvint: { detuneCents: 4, wobbleCents: 3, wobbleHz: 0.31, phase: 2.1 },
-  sext: { detuneCents: -2, wobbleCents: 5, wobbleHz: 0.18, phase: 4.7 },
+  ters: {
+    detuneCents: -3, wobbleCents: 4, wobbleHz: 0.22, phase: 0.4,
+    vibratoCents: 9, vibratoHz: 5.4, vibratoPhase: 1.2,
+    formantSemitones: -1.3,
+  },
+  kvint: {
+    detuneCents: 4, wobbleCents: 3, wobbleHz: 0.31, phase: 2.1,
+    vibratoCents: 7, vibratoHz: 5.9, vibratoPhase: 3.6,
+    formantSemitones: 1.8,
+  },
+  sext: {
+    detuneCents: -2, wobbleCents: 5, wobbleHz: 0.18, phase: 4.7,
+    vibratoCents: 11, vibratoHz: 4.8, vibratoPhase: 0.7,
+    formantSemitones: -0.9,
+  },
 };
 
-// Multiplies every keyframe's ratio by a small detune+wobble factor (in
-// cents, so it composes with the existing ratio regardless of interval
+// Multiplies every keyframe's ratio by a small detune+wobble+vibrato factor
+// (in cents, so it composes with the existing ratio regardless of interval
 // size), and — since the source curve holds a single flat ratio for a
 // whole sustained note or pause, with no intermediate keyframes — inserts
 // extra samples through any gap wider than `maxGapForInsertion` so the
-// wobble is actually audible during a held note, not just at its two
-// endpoints. Ramp/onset sections already have keyframes closer together
-// than that gap, so their carefully-tuned shape is untouched beyond the
-// same small multiplicative wobble every other keyframe gets.
-function humanizeKeyframes(keyframes, { detuneCents = 0, wobbleCents = 0, wobbleHz = 0.25, phase = 0 } = {}) {
-  if (!detuneCents && !wobbleCents) return keyframes;
+// modulation is actually audible during a held note, not just at its two
+// endpoints. The insertion hop is fine enough (20ms, matching the ramp
+// keyframe resolution elsewhere in this file) to resolve the ~5-6Hz
+// vibrato term smoothly rather than as an aliased/stepped wobble. Ramp/
+// onset sections already have keyframes closer together than that gap, so
+// their carefully-tuned shape is untouched beyond the same small
+// multiplicative factor every other keyframe gets.
+function humanizeKeyframes(keyframes, {
+  detuneCents = 0, wobbleCents = 0, wobbleHz = 0.25, phase = 0,
+  vibratoCents = 0, vibratoHz = 5.5, vibratoPhase = 0,
+} = {}) {
+  if (!detuneCents && !wobbleCents && !vibratoCents) return keyframes;
   const maxGapForInsertion = 0.15;
-  const insertHop = 0.06;
+  const insertHop = 0.02;
+  // OfflineAudioContext.suspend() (see renderWithRatioCurve) rejects a
+  // second suspend scheduled at the same sample frame — two keyframes only
+  // a fraction of a millisecond apart can round to that same frame. Never
+  // insert a point closer than this to a keyframe that's already there
+  // (comfortably more than one sample even at a high sample rate, and far
+  // below the ~180ms period of the fastest vibrato this modulates).
+  const minGap = 0.005;
   const factorAt = (t) => {
-    const cents = detuneCents + wobbleCents * Math.sin(2 * Math.PI * wobbleHz * t + phase);
+    const cents = detuneCents
+      + wobbleCents * Math.sin(2 * Math.PI * wobbleHz * t + phase)
+      + vibratoCents * Math.sin(2 * Math.PI * vibratoHz * t + vibratoPhase);
     return Math.pow(2, cents / 1200);
   };
   const out = [];
@@ -211,14 +245,25 @@ function humanizeKeyframes(keyframes, { detuneCents = 0, wobbleCents = 0, wobble
     out.push({ t: k.t, ratio: k.ratio * factorAt(k.t) });
     const next = keyframes[i + 1];
     if (next && next.t - k.t > maxGapForInsertion) {
-      for (let t = k.t + insertHop; t < next.t; t += insertHop) {
+      for (let t = k.t + insertHop; t < next.t - minGap; t += insertHop) {
         const f = (t - k.t) / (next.t - k.t);
         const base = k.ratio + (next.ratio - k.ratio) * f;
         out.push({ t, ratio: base * factorAt(t) });
       }
     }
   }
-  return out;
+  // Defensive backstop: collapse any two keyframes left closer than minGap
+  // (e.g. two already-close points in the source curve) into one, same
+  // idea as the cleanup pass in buildRatioCurveFromSegments.
+  const cleaned = [];
+  out.forEach((k) => {
+    if (cleaned.length && k.t - cleaned[cleaned.length - 1].t < minGap) {
+      cleaned[cleaned.length - 1] = k;
+    } else {
+      cleaned.push(k);
+    }
+  });
+  return cleaned;
 }
 
 // Per-note targets for the harmony engine: a fixed interval (harmonyNotes'
@@ -257,7 +302,7 @@ export function buildAutotuneRatioCurve(melodyNotes, keyInfo, totalDuration, ene
 // Stretch in one continuous offline pass — no per-note clipping,
 // crossfading, or loudness patching, because there are no block boundaries
 // for artifacts to hide at. Used by both the harmony and autotune engines.
-async function renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHz) {
+async function renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHz, formantSemitones = 0) {
   const sr = recordedBuffer.sampleRate;
   const channels = recordedBuffer.numberOfChannels;
   const totalLen = recordedBuffer.length;
@@ -294,7 +339,7 @@ async function renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHz) {
     active: true,
     rate: 1,
     semitones: 12 * Math.log2(k.ratio),
-    formantSemitones: 0,
+    formantSemitones,
     formantCompensation: true,
     formantBaseHz,
   });
@@ -329,7 +374,9 @@ export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyN
   const totalDuration = recordedBuffer.length / recordedBuffer.sampleRate;
   const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), recordedBuffer.sampleRate);
   const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope, harmonyType);
-  return renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo));
+  const profile = harmonyType && HARMONY_HUMANIZE_PROFILES[harmonyType];
+  const formantSemitones = profile ? profile.formantSemitones : 0;
+  return renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo), formantSemitones);
 }
 
 // Renders a lightly pitch-corrected copy of the recording itself: each note
