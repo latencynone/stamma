@@ -21,6 +21,7 @@ import {
 } from './pitchAnalysis.js';
 import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
+import { fft, ifft, hannWindow } from './dsp.js';
 
 const HARMONY_KEYS = Object.keys(HARMONY_TYPES);
 
@@ -109,57 +110,6 @@ function createReverbBus(ctx, reverbOn, reverbLevel) {
  * (or auto-detected) quiet region, then subtracts that spectrum from every
  * analysis frame across the whole recording via STFT / overlap-add.
  */
-
-// In-place radix-2 Cooley-Tukey FFT. `re`/`im` length must be a power of 2.
-function fft(re, im) {
-  const n = re.length;
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      let t = re[i]; re[i] = re[j]; re[j] = t;
-      t = im[i]; im[i] = im[j]; im[j] = t;
-    }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = (-2 * Math.PI) / len;
-    const wr = Math.cos(ang), wi = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let curWr = 1, curWi = 0;
-      const half = len / 2;
-      for (let j = 0; j < half; j++) {
-        const uRe = re[i + j], uIm = im[i + j];
-        const vRe = re[i + j + half] * curWr - im[i + j + half] * curWi;
-        const vIm = re[i + j + half] * curWi + im[i + j + half] * curWr;
-        re[i + j] = uRe + vRe;
-        im[i + j] = uIm + vIm;
-        re[i + j + half] = uRe - vRe;
-        im[i + j + half] = uIm - vIm;
-        const nextWr = curWr * wr - curWi * wi;
-        const nextWi = curWr * wi + curWi * wr;
-        curWr = nextWr;
-        curWi = nextWi;
-      }
-    }
-  }
-}
-
-function ifft(re, im) {
-  const n = re.length;
-  for (let i = 0; i < n; i++) im[i] = -im[i];
-  fft(re, im);
-  for (let i = 0; i < n; i++) {
-    re[i] /= n;
-    im[i] = -im[i] / n;
-  }
-}
-
-function hannWindow(size) {
-  const w = new Float32Array(size);
-  for (let i = 0; i < size; i++) w[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (size - 1));
-  return w;
-}
 
 // Average magnitude spectrum over [startSec, endSec) — the "what does the
 // room/hiss sound like" fingerprint that gets subtracted from every frame
@@ -1139,7 +1089,7 @@ function AboutPage() {
     {
       id: 'stammor',
       title: 'Stämmor: ters, kvint, sext',
-      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma.',
+      body: 'Appen bygger tre extra röster som följer din melodi på ett fast musikaliskt avstånd: en ters, en kvint och en sext. Varje stämma kan ligga över eller under melodin (Överstämma/Understämma) — det väljer du per stämma. Under "Din röst" särskiljs andning och konsonanter från själva sångtonen innan tonhöjden skiftas, så bara det som faktiskt har en tonhöjd stäms om — andningen och s/f/h-ljuden spelas tillbaka som de är, vilket gör stämman mindre metallisk.',
     },
     {
       id: 'egen-stamma',

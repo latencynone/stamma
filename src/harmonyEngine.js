@@ -1,5 +1,6 @@
 import SignalsmithStretch from 'signalsmith-stretch';
 import { scaleStepToMidi, midiToFreq } from './musicTheory.js';
+import { getOrComputeHarmonicSplit } from './harmonicSeparation.js';
 
 // Short gaps (a consonant, a quick breath) are bridged smoothly into the
 // neighboring note's ratio instead of ever dropping to "no shift" — this is
@@ -368,15 +369,38 @@ function formantBaseHzFor(melodyNotes, keyInfo) {
   return melodyFreqs.length ? median(melodyFreqs) : 200;
 }
 
+function sumBuffers(a, b) {
+  const out = new AudioBuffer({ length: a.length, numberOfChannels: a.numberOfChannels, sampleRate: a.sampleRate });
+  for (let c = 0; c < a.numberOfChannels; c++) {
+    const ca = a.getChannelData(c);
+    const cb = b.getChannelData(c);
+    const sum = new Float32Array(ca.length);
+    for (let i = 0; i < ca.length; i++) sum[i] = ca[i] + cb[i];
+    out.copyToChannel(sum, c);
+  }
+  return out;
+}
+
 // Renders the harmony as a full-length AudioBuffer: the original recording,
 // continuously pitch-shifted to a fixed interval above/below the melody.
+//
+// Only the harmonic (tonal) layer of the recording is actually fed through
+// the pitch/formant shift — see harmonicSeparation.js for why: pitch-
+// shifting the residual (breath, consonants — content with no real pitch of
+// its own) is what makes a shifted voice sound metallic/robotic. The
+// residual is added back afterward unshifted, so it keeps its natural
+// character. This runs unconditionally (unlike the vibrato/formant/detune
+// "humanize" character, which is opt-in) since it's a pitch-shift quality
+// fix, not a voice-character choice.
 export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyNotes, keyInfo, harmonyType = null) {
   const totalDuration = recordedBuffer.length / recordedBuffer.sampleRate;
   const energyEnvelope = computeEnergyEnvelope(recordedBuffer.getChannelData(0), recordedBuffer.sampleRate);
   const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope, harmonyType);
   const profile = harmonyType && HARMONY_HUMANIZE_PROFILES[harmonyType];
   const formantSemitones = profile ? profile.formantSemitones : 0;
-  return renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo), formantSemitones);
+  const { harmonicBuffer, residualBuffer } = getOrComputeHarmonicSplit(recordedBuffer, melodyNotes, keyInfo);
+  const shiftedHarmonic = await renderWithRatioCurve(harmonicBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo), formantSemitones);
+  return sumBuffers(shiftedHarmonic, residualBuffer);
 }
 
 // Renders a lightly pitch-corrected copy of the recording itself: each note

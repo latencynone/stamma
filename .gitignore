@@ -25,3 +25,4 @@ dist-ssr
 
 # Vitest browser-mode failure screenshots
 .vitest-attachments
+src/__screenshots__
