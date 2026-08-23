@@ -2257,6 +2257,47 @@ export default function App() {
     }
   }
 
+  // Renders exactly what the mixer would currently play — every channel
+  // that's on (or, if something's soloed, every soloed one) at its own
+  // volume/pan, through the same trim window, fades, and reverb bus as live
+  // playback — down to one WAV. Built on the same resolveChannelContent +
+  // startMixChannelWithContent machinery startMix() uses, so this can't
+  // silently drift from what "play" actually sounds like.
+  async function exportMixdown() {
+    if (exporting) return;
+    const activeKeys = Object.keys(channels).filter((k) => isChannelAudible(channels, k));
+    if (!activeKeys.length) return;
+    setExporting('mixdown');
+    try {
+      const resolved = await Promise.all(
+        activeKeys.map(async (key) => ({ key, content: await resolveChannelContent(key) }))
+      );
+      const usable = resolved.filter((r) => r.content);
+      if (!usable.length) return;
+
+      const rangeStart = Math.max(0, Math.min(trimStart, recordingDuration));
+      const rangeEnd = Math.max(rangeStart + 0.05, Math.min(effectiveTrimEnd, recordingDuration));
+      const sampleRate = exportSampleRate();
+      // Extra tail past the trim window so a release ramp or the reverb's
+      // own decay isn't cut off mid-fade the way it would be at exactly
+      // rangeEnd.
+      const tail = 0.4 + (reverbOn ? REVERB_LEVELS[reverbLevelIndex].decay : 0);
+      const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      const offlineCtx = new OfflineCtx(2, Math.max(1, Math.ceil((rangeEnd - rangeStart + tail) * sampleRate)), sampleRate);
+
+      const reverbBus = createReverbBus(offlineCtx, reverbOn, REVERB_LEVELS[reverbLevelIndex]);
+      const now = 0.05;
+      usable.forEach(({ key, content }) => {
+        startMixChannelWithContent(offlineCtx, key, now, channels[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, rangeStart, reverbBus.input, false);
+      });
+
+      const rendered = await offlineCtx.startRendering();
+      downloadBlob(audioBufferToWavBlob(rendered), 'stamma-mix.wav');
+    } finally {
+      setExporting(null);
+    }
+  }
+
   // Resolves what a channel should actually play right now: a ready-made
   // buffer (the real recording, its autotuned version, or a rendered
   // harmony), or a note list for the synthesizer, depending on the current
@@ -2304,7 +2345,10 @@ export default function App() {
   // `destNode` is the reverb bus's input (see createReverbBus) rather than
   // ctx.destination directly — reverb is mix-wide, so every channel feeds
   // the same bus instead of each needing its own send.
-  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur, playFrom, destNode) {
+  // `trackMeter` is false for an offline render (see exportMixdown) — an
+  // offline context's nodes have no business overwriting mixNodesRef, which
+  // the live meter loop reads from mid-playback.
+  function startMixChannelWithContent(ctx, key, now, channelState, content, rangeStart, rangeEnd, fadeInDur, fadeOutDur, playFrom, destNode, trackMeter = true) {
     const gainNode = ctx.createGain();
     gainNode.gain.value = channelState.volume;
 
@@ -2336,7 +2380,7 @@ export default function App() {
       sourceNode = makeVoice(ctx, gainNode, now, content.notes, soundType, playFrom, rangeEnd);
     }
 
-    mixNodesRef.current[key] = { gainNode, fadeGainNode, analyserNode, pannerNode, sourceNode };
+    if (trackMeter) mixNodesRef.current[key] = { gainNode, fadeGainNode, analyserNode, pannerNode, sourceNode };
     return sourceNode;
   }
 
@@ -3398,9 +3442,15 @@ export default function App() {
               {exportExpanded && (
                 <>
                   <p className="text-sm leading-relaxed mb-2" style={{ color: '#C7CBDA' }}>
-                    Ladda ner sång och stämmor som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
+                    Ladda ner hela mixen som den låter nu, eller sång och stämmor var för sig som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
                   </p>
                   <div className="grid grid-cols-1 gap-2">
+                    <ExportButton
+                      label="Hela mixen"
+                      busy={exporting === 'mixdown'}
+                      disabled={!anyChannelEnabled || !!exporting || anyHarmonyBusy || autotuneRendering}
+                      onClick={exportMixdown}
+                    />
                     <ExportButton
                       label="Sång (original)"
                       busy={exporting === 'song'}
