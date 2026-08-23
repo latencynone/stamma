@@ -103,6 +103,109 @@ describe('separateHarmonicResidual', async () => {
     expect(rmsOf(h, from, to)).toBeGreaterThan(rmsOf(r, from, to) * 2);
   });
 
+  // The four tests below reproduce the exact gap the 2026-08-23 "audio
+  // breaks through" regression fix (see harmonicSeparation.js's module
+  // comment on MIN_PEAK_RATIO/MIN_HARMONICS_FOR_CONFIRMATION) closed: every
+  // earlier test signal here is a flat, unwavering tone, which real singing
+  // never is. A frame this module fails to confirm as harmonic falls
+  // through to the residual layer and plays back at the *original*
+  // melody's pitch instead of the shifted harmony — audibly "the original
+  // voice breaking through" — so these check harmonic-dominance in several
+  // separate windows across a note, not just one aggregate measurement,
+  // since a regression here typically only shows up during part of a note
+  // (a vibrato phase, an amplitude dip), not the whole thing.
+  const windowSec = 0.15;
+  // Checks harmonic-vs-residual dominance in a series of short windows
+  // across [from, totalDur), returning the ones that failed — used instead
+  // of one aggregate RMS check so a regression that only breaks part of a
+  // note (a vibrato phase, an amplitude dip) is still caught.
+  function findFailedWindows(h, r, from, totalDur, dominanceRatio = 1.5) {
+    const failed = [];
+    // Stops well short of totalDur: the note's own fade-out (10ms, see
+    // synthesizeVoice) and this module's documented "last partial hop
+    // always routes to residual" tail handling both make the very end of
+    // a note genuinely, correctly residual-dominant — not a classification
+    // failure worth catching here.
+    for (let t = from; t < totalDur - 0.2; t += windowSec) {
+      const s0 = Math.round(t * SR);
+      const s1 = Math.round(Math.min(t + windowSec, totalDur) * SR);
+      const hRms = rmsOf(h, s0, s1);
+      const rRms = rmsOf(r, s0, s1);
+      if (hRms <= rRms * dominanceRatio) failed.push({ t: t.toFixed(2), hRms, rRms });
+    }
+    return failed;
+  }
+
+  it('stays harmonic-dominant throughout a note with realistic vibrato, not just where the pitch happens to sit still at the note\'s one averaged measuredFreq', async () => {
+    const freq = midiToFreq(scaleStepToMidi(2, 0, 'major'));
+    const totalDur = 2.0;
+    const raw = synthesizeVoice([{ freq, start: 0, end: totalDur }], totalDur, SR, {
+      gapNoiseAmp: 0,
+      vibratoDepthCents: 55, // wide, realistic vibrato — well inside the 120c f0 search window but far from motionless
+      vibratoRateHz: 5.5,
+      breathNoiseAmp: 0.05,
+      harmonicAmps: [0.11, 1.0, 0.45, 0.22, 0.1], // formant-boosted: fundamental deliberately weak relative to a strong 2nd harmonic, like a real vowel's formant structure
+    });
+    const buffer = makeBuffer(raw);
+    const melodyNotes = [{ step: 2, start: 0, end: totalDur, measuredFreq: freq }];
+
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfo);
+    const failed = findFailedWindows(harmonicBuffer.getChannelData(0), residualBuffer.getChannelData(0), 0.1, totalDur);
+    expect(failed, `windows where the vibrato-swung tone wasn't routed harmonic: ${JSON.stringify(failed)}`).toEqual([]);
+  });
+
+  it('stays harmonic-dominant through a quiet dynamic dip, not just at the note\'s loudest moments', async () => {
+    const freq = midiToFreq(scaleStepToMidi(4, 0, 'major'));
+    const totalDur = 2.0;
+    const raw = synthesizeVoice([{ freq, start: 0, end: totalDur }], totalDur, SR, {
+      gapNoiseAmp: 0,
+      dynamicsDepth: 0.75, // dips to 25% of peak amplitude, periodically
+      dynamicsRateHz: 2.2,
+      breathNoiseAmp: 0.05,
+      harmonicAmps: [0.11, 1.0, 0.45, 0.22, 0.1], // formant-boosted, see the vibrato test above
+    });
+    const buffer = makeBuffer(raw);
+    const melodyNotes = [{ step: 4, start: 0, end: totalDur, measuredFreq: freq }];
+
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfo);
+    const failed = findFailedWindows(harmonicBuffer.getChannelData(0), residualBuffer.getChannelData(0), 0.1, totalDur);
+    expect(failed, `windows where the quiet dip wasn't routed harmonic: ${JSON.stringify(failed)}`).toEqual([]);
+  });
+
+  it('stays harmonic-dominant with vibrato and dynamics together — the actual reported regression (a real recording, not a synthetic tone)', async () => {
+    const freq = midiToFreq(scaleStepToMidi(1, 0, 'major'));
+    const totalDur = 2.5;
+    const raw = synthesizeVoice([{ freq, start: 0, end: totalDur }], totalDur, SR, {
+      gapNoiseAmp: 0,
+      vibratoDepthCents: 45,
+      vibratoRateHz: 5.8,
+      dynamicsDepth: 0.55,
+      dynamicsRateHz: 1.8,
+      breathNoiseAmp: 0.05,
+      harmonicAmps: [0.11, 1.0, 0.45, 0.22, 0.1], // formant-boosted, see the vibrato test above
+    });
+    const buffer = makeBuffer(raw);
+    const melodyNotes = [{ step: 1, start: 0, end: totalDur, measuredFreq: freq }];
+
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfo);
+    const h = harmonicBuffer.getChannelData(0);
+    const r = residualBuffer.getChannelData(0);
+
+    const failed = findFailedWindows(h, r, 0.1, totalDur);
+    expect(failed, `windows where the real-singing-like tone wasn't routed harmonic: ${JSON.stringify(failed)}`).toEqual([]);
+
+    // A fix that widens confirmation to chase dominance could do so at the
+    // cost of corrupting the split itself — reconstruction must still hold.
+    let sumSqErr = 0;
+    let sumSqOrig = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const err = (h[i] + r[i]) - raw[i];
+      sumSqErr += err * err;
+      sumSqOrig += raw[i] * raw[i];
+    }
+    expect(Math.sqrt(sumSqErr / sumSqOrig)).toBeLessThan(0.01);
+  });
+
   it('leaves genuine silence as (near-)silent in both layers, not shifted-sounding harmonic content', async () => {
     const totalDur = 1.5;
     const data = new Float32Array(Math.round(SR * totalDur)); // all zero — true digital silence
