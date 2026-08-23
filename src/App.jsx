@@ -22,6 +22,7 @@ import {
 import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 import { fft, ifft, hannWindow } from './dsp.js';
+import { saveSession, loadSession, clearSession } from './indexedDb.js';
 
 const HARMONY_KEYS = Object.keys(HARMONY_TYPES);
 
@@ -1285,6 +1286,11 @@ export default function App() {
   const [expandedChannels, setExpandedChannels] = useState({});
   const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countingIn, countInBeat, countdown } | null
   const [ownTakeError, setOwnTakeError] = useState('');
+  // A session found in IndexedDB at mount, offered via a dismissible
+  // banner — never applied automatically. Cleared (both from state and the
+  // DB) once the user restores or dismisses it.
+  const [restorableSession, setRestorableSession] = useState(null);
+  const [restoringSession, setRestoringSession] = useState(false);
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -1382,6 +1388,53 @@ export default function App() {
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
+
+  // Checks IndexedDB once at mount for a session left behind by a crash or
+  // an accidental refresh. Only ever surfaces it via the restore banner —
+  // never applies it silently.
+  useEffect(() => {
+    let cancelled = false;
+    loadSession().then((session) => {
+      if (!cancelled && session) setRestorableSession(session);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Autosaves the current recording + settings to IndexedDB (debounced)
+  // whenever there's a ready take to save. `waveformPeaks` stands in for
+  // "the recorded audio itself changed" — it's recomputed by every path
+  // that replaces recordedBufferRef.current (new recording/upload,
+  // normalize, noise reduction, revert). Skipped while a previous session
+  // is still waiting to be restored/dismissed, so it can't be clobbered
+  // before the user decides on it.
+  useEffect(() => {
+    if (phase !== 'ready' || !recordedBufferRef.current || restorableSession) return undefined;
+    const buffer = recordedBufferRef.current;
+    const timer = setTimeout(() => {
+      saveSession({
+        version: 1,
+        savedAt: Date.now(),
+        audio: audioBufferToWavBlob(buffer),
+        soundType,
+        autotuneOn,
+        autotuneLevelIndex,
+        reverbOn,
+        reverbLevelIndex,
+        humanizeOn,
+        fadeIn,
+        fadeOut,
+        trimStart,
+        trimEnd,
+        loopEnabled,
+        channels,
+      }).catch(() => {});
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [
+    phase, waveformPeaks, restorableSession, soundType, autotuneOn, autotuneLevelIndex,
+    reverbOn, reverbLevelIndex, humanizeOn, fadeIn, fadeOut, trimStart, trimEnd,
+    loopEnabled, channels,
+  ]);
 
   function harmonyNotesFor(type) {
     if (!melodyNotes.length) return [];
@@ -1610,6 +1663,10 @@ export default function App() {
     ownTakeBuffersRef.current = {};
     setOwnTakeError('');
     stopPlayback();
+    // The previous take is being discarded (new recording/upload, or an
+    // explicit reset) — drop its autosave too, so a later crash doesn't
+    // offer to restore audio that's no longer this session's.
+    clearSession().catch(() => {});
   }
 
   // Downsamples a recording into per-column peak amplitudes for the
@@ -1997,6 +2054,36 @@ export default function App() {
     return trimmed;
   }
 
+  // Shared by file-upload and session-restore: takes a fully-decoded
+  // buffer, wires it up as the current recording, and runs it through the
+  // same pitch-analysis pipeline a fresh recording would go through.
+  // Returns whether analysis succeeded (on failure, phase/errorMsg are
+  // already set to 'error' and the caller's own message).
+  function finalizeLoadedBuffer(buffer) {
+    recordedBufferRef.current = buffer;
+    originalRecordingBufferRef.current = buffer;
+    setVoiceReady(true);
+    setRecordingDuration(Math.max(0.3, buffer.duration));
+    setWaveformPeaks(computeWaveformPeaks(buffer));
+
+    const frames = extractFramesFromBuffer(buffer.getChannelData(0), buffer.sampleRate);
+    const result = analyzeFrames(frames);
+    if (result.error) {
+      setPhase('error');
+      setErrorMsg(
+        result.error === 'no-pitch'
+          ? 'Vi kunde inte hitta en tydlig tonhöjd i ljudfilen. Prova en fil med en tydlig, enkel melodi.'
+          : ANALYSIS_ERROR_MESSAGES[result.error]
+      );
+      return false;
+    }
+    setKeyInfo(result.key);
+    setMelodyNotes(result.notes);
+    applyDetectedTempo(result.notes);
+    setPhase('ready');
+    return true;
+  }
+
   async function handleFileUpload(file) {
     if (!file) return;
     setErrorMsg('');
@@ -2017,28 +2104,7 @@ export default function App() {
         return;
       }
       buffer = trimAudioBuffer(decodeCtx, buffer, DURATION);
-
-      recordedBufferRef.current = buffer;
-      originalRecordingBufferRef.current = buffer;
-      setVoiceReady(true);
-      setRecordingDuration(Math.max(0.3, buffer.duration));
-      setWaveformPeaks(computeWaveformPeaks(buffer));
-
-      const frames = extractFramesFromBuffer(buffer.getChannelData(0), buffer.sampleRate);
-      const result = analyzeFrames(frames);
-      if (result.error) {
-        setPhase('error');
-        setErrorMsg(
-          result.error === 'no-pitch'
-            ? 'Vi kunde inte hitta en tydlig tonhöjd i ljudfilen. Prova en fil med en tydlig, enkel melodi.'
-            : ANALYSIS_ERROR_MESSAGES[result.error]
-        );
-        return;
-      }
-      setKeyInfo(result.key);
-      setMelodyNotes(result.notes);
-      applyDetectedTempo(result.notes);
-      setPhase('ready');
+      finalizeLoadedBuffer(buffer);
     } catch (e) {
       setPhase('error');
       setErrorMsg('Kunde inte läsa ljudfilen. Kontrollera att det är en vanlig ljudfil (t.ex. WAV, MP3 eller M4A).');
@@ -2048,6 +2114,49 @@ export default function App() {
       // closed rather than left open for the rest of the session.
       if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
     }
+  }
+
+  // Decodes a restorable session's saved audio and re-applies its
+  // settings on top of the freshly analyzed recording. Always consumes
+  // (clears) the offer, whether it succeeds or not, so the banner can't
+  // get stuck.
+  async function restoreSession() {
+    if (!restorableSession || restoringSession) return;
+    setRestoringSession(true);
+    let decodeCtx = null;
+    try {
+      const arrayBuf = await restorableSession.audio.arrayBuffer();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      decodeCtx = new AC();
+      const buffer = await decodeCtx.decodeAudioData(arrayBuf);
+      const ok = finalizeLoadedBuffer(buffer);
+      if (ok) {
+        setSoundType(restorableSession.soundType ?? 'recording');
+        setAutotuneOn(!!restorableSession.autotuneOn);
+        setAutotuneLevelIndex(restorableSession.autotuneLevelIndex ?? 0);
+        setReverbOn(!!restorableSession.reverbOn);
+        setReverbLevelIndex(restorableSession.reverbLevelIndex ?? 0);
+        setHumanizeOn(restorableSession.humanizeOn ?? true);
+        setFadeIn(restorableSession.fadeIn ?? 0);
+        setFadeOut(restorableSession.fadeOut ?? 0);
+        setTrimStart(restorableSession.trimStart ?? 0);
+        setTrimEnd(restorableSession.trimEnd ?? null);
+        setLoopEnabled(!!restorableSession.loopEnabled);
+        setChannels(restorableSession.channels || defaultChannels());
+      }
+    } catch (e) {
+      setPhase('error');
+      setErrorMsg('Kunde inte återställa förra sessionen.');
+    } finally {
+      if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
+      setRestorableSession(null);
+      setRestoringSession(false);
+    }
+  }
+
+  function dismissRestorableSession() {
+    setRestorableSession(null);
+    clearSession().catch(() => {});
   }
 
   function resetAll() {
@@ -2690,6 +2799,15 @@ export default function App() {
       `}</style>
 
       <div className="w-full max-w-md px-5 py-8 font-body">
+        {restorableSession && phase === 'idle' && (
+          <RestoreBanner
+            savedAt={restorableSession.savedAt}
+            restoring={restoringSession}
+            onRestore={restoreSession}
+            onDismiss={dismissRestorableSession}
+          />
+        )}
+
         {/* Header */}
         <header className="mb-6">
           <h1 className="font-display text-4xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
@@ -3550,6 +3668,45 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
       >
         <LoopIcon size={19} />
       </button>
+    </div>
+  );
+}
+
+// Offers to bring back a session an earlier crash/refresh left behind in
+// IndexedDB. Purely a prompt — restoring or dismissing is always an
+// explicit click, never automatic.
+function RestoreBanner({ savedAt, onRestore, onDismiss, restoring }) {
+  const label = new Date(savedAt).toLocaleString('sv-SE', {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  return (
+    <div
+      className="rounded-xl p-4 mb-5 text-sm"
+      style={{ backgroundColor: 'rgba(85,214,192,0.08)', border: '1px solid rgba(85,214,192,0.3)', color: '#F1EDE4' }}
+    >
+      <p className="leading-relaxed font-medium">Återställ förra sessionen?</p>
+      <p className="mt-0.5 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Sparad {label}</p>
+      <div className="mt-3 flex gap-3">
+        <button
+          onClick={onRestore}
+          disabled={restoring}
+          className="stamma-btn rounded-lg py-2 px-4 font-body font-medium text-sm"
+          style={{ backgroundColor: '#55D6C0', color: '#10131A', opacity: restoring ? 0.7 : 1 }}
+        >
+          {restoring ? 'Återställer…' : 'Återställ'}
+        </button>
+        <button
+          onClick={onDismiss}
+          disabled={restoring}
+          className="stamma-btn font-mono-ui text-xs"
+          style={{ color: '#C7CBDA' }}
+        >
+          Avfärda
+        </button>
+      </div>
     </div>
   );
 }
