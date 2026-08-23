@@ -398,7 +398,7 @@ export async function renderHarmonyOffline(recordedBuffer, melodyNotes, harmonyN
   const keyframes = buildRatioCurve(melodyNotes, harmonyNotes, keyInfo, totalDuration, energyEnvelope, harmonyType);
   const profile = harmonyType && HARMONY_HUMANIZE_PROFILES[harmonyType];
   const formantSemitones = profile ? profile.formantSemitones : 0;
-  const { harmonicBuffer, residualBuffer } = getOrComputeHarmonicSplit(recordedBuffer, melodyNotes, keyInfo);
+  const { harmonicBuffer, residualBuffer } = await getOrComputeHarmonicSplit(recordedBuffer, melodyNotes, keyInfo);
   const shiftedHarmonic = await renderWithRatioCurve(harmonicBuffer, keyframes, formantBaseHzFor(melodyNotes, keyInfo), formantSemitones);
   return sumBuffers(shiftedHarmonic, residualBuffer);
 }

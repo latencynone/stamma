@@ -1230,7 +1230,7 @@ export default function App() {
   const [melodyNotes, setMelodyNotes] = useState([]);
   const [channels, setChannels] = useState(defaultChannels);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [soundType, setSoundType] = useState('sine');
+  const [soundType, setSoundType] = useState('recording');
   const [voiceReady, setVoiceReady] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(DURATION);
   const [playheadTime, setPlayheadTime] = useState(null);
@@ -1562,7 +1562,7 @@ export default function App() {
     setKeyInfo(null);
     setMelodyNotes([]);
     setChannels(defaultChannels());
-    setSoundType('sine');
+    setSoundType('recording');
     setVoiceReady(false);
     setAutotuneOn(false);
     setAutotuneLevelIndex(0);

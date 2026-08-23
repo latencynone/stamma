@@ -32,19 +32,35 @@ import { scaleStepToMidi, midiToFreq } from './musicTheory.js';
  * normalization) already proven by the noise-reduction feature
  * (spectralSubtractChannel in App.jsx), just producing two complementary
  * outputs per frame instead of one denoised one.
+ *
+ * IMPORTANT failure-direction rule: getting a frame's classification wrong
+ * must never be worse than not having this feature at all. A frame this
+ * module fails to confirm as harmonic gets routed to residual — i.e. played
+ * back unshifted — so a genuinely voiced frame that's merely *missed* here
+ * sounds like the original melody's own pitch leaking through where the
+ * harmony should be. Real singing drifts (vibrato, dynamics) well past a
+ * tight search window around a single per-note frequency, so the search
+ * tolerances below are deliberately generous, and a frame only needs to
+ * confirm *one* other harmonic alongside the fundamental (or a very
+ * dominant fundamental on its own) to count as voiced — the goal is to
+ * separate out unambiguous noise, not to be a strict voiced/unvoiced
+ * classifier.
  */
 
 const FFT_SIZE = 2048;
 const HOP = FFT_SIZE / 2;
 const NYQUIST_BIN = FFT_SIZE / 2;
-// Generous search window around the expected fundamental — wide enough to
-// track natural pitch drift/vibrato within a note, narrow enough to stay
-// locked onto the right partial rather than a neighboring one.
-const F0_SEARCH_CENTS = 100;
-// Tighter per-harmonic tolerance: real vibrato/inharmonicity moves a high
-// harmonic by more absolute Hz than the fundamental, but by roughly the same
-// *cents* amount, so a flat cents window works across the whole series.
-const HARMONIC_SEARCH_CENTS = 65;
+// Search window around the expected fundamental — wide enough to absorb
+// vibrato and a note-level measuredFreq that's only an average of what the
+// singer actually did across the whole note, not a frame-accurate reading.
+// Deliberately *not* wider than this: adjacent scale steps in a melody can
+// be as little as a semitone (100 cents) apart, and a wider window risks
+// locking onto a neighboring note's pitch instead of missing this one —
+// which corrupts that stretch far more audibly than routing it to residual
+// would have. Real robustness against missed detections comes from the
+// confirmation-strictness knobs below, not from casting a wider net here.
+const F0_SEARCH_CENTS = 120;
+const HARMONIC_SEARCH_CENTS = 90;
 const MAX_HARMONICS = 20;
 // Width (bins on each side of a confirmed peak) stamped into the mask —
 // matches roughly one FFT_SIZE=2048 Hann main-lobe width, so a masked-in
@@ -54,7 +70,18 @@ const PEAK_BIN_WIDTH = 2;
 // if it reaches at least this fraction of the frame's overall spectral
 // peak. Halved for harmonics above the fundamental, which are naturally
 // quieter even in a clearly voiced frame.
-const MIN_PEAK_RATIO = 0.12;
+const MIN_PEAK_RATIO = 0.08;
+// A lone fundamental-range peak could just be a stray noise-floor bump
+// that happened to fall in the search window — real voiced content nearly
+// always shows at least one other aligned harmonic. Accept it on the
+// fundamental alone only when that peak is unusually dominant (most of the
+// frame's whole energy), which noise essentially never produces.
+const MIN_HARMONICS_FOR_CONFIRMATION = 2;
+const DOMINANT_FUNDAMENTAL_RATIO = 0.35;
+// Number of STFT frames processed per synchronous batch before yielding to
+// the event loop — keeps a long recording from blocking the main thread
+// (and tripping the browser's "unresponsive page" handling) in one go.
+const FRAMES_PER_YIELD = 24;
 
 function centsToBinRange(freqHz, cents, sampleRate) {
   const lo = freqHz * Math.pow(2, -cents / 1200);
@@ -91,10 +118,9 @@ function findPeakInRange(mag, loBin, hiBin) {
 
 // Builds a per-bin [0,1] mask for one frame's full-length (conjugate-
 // symmetric) spectrum: ~1 near confirmed harmonic partials of
-// `expectedF0Hz`, 0 elsewhere. Returns null (→ treat the whole frame as
-// residual) when there's no expected pitch (a gap/pause) or no convincing
-// fundamental peak turns up (an unvoiced/noisy frame) — in both cases
-// there's nothing tonal here to preserve a shift for.
+// `expectedF0Hz`, 0 elsewhere. Returns null (→ caller falls back, see
+// splitChannel) when there's no expected pitch (a gap/pause) or not enough
+// evidence of real harmonic content turns up.
 function buildHarmonicMask(mag, sampleRate, expectedF0Hz, scratch) {
   if (!expectedF0Hz) return null;
   const binHz = sampleRate / FFT_SIZE;
@@ -123,10 +149,20 @@ function buildHarmonicMask(mag, sampleRate, expectedF0Hz, scratch) {
   };
 
   stampPeak(f0Peak.bin);
+  let confirmed = 1;
   for (let h = 2; h <= maxHarmonic; h++) {
     const [lo, hi] = centsToBinRange(f0Hz * h, HARMONIC_SEARCH_CENTS, sampleRate);
     const peak = findPeakInRange(mag, lo, hi);
-    if (peak && peak.mag >= overallPeak * MIN_PEAK_RATIO * 0.5) stampPeak(peak.bin);
+    if (peak && peak.mag >= overallPeak * MIN_PEAK_RATIO * 0.5) {
+      stampPeak(peak.bin);
+      confirmed++;
+    }
+  }
+  // A single unconfirmed peak isn't enough evidence unless it's dominant —
+  // see the module-level note on why this leans toward accepting real
+  // voiced content rather than rejecting borderline noise.
+  if (confirmed < MIN_HARMONICS_FOR_CONFIRMATION && f0Peak.mag < overallPeak * DOMINANT_FUNDAMENTAL_RATIO) {
+    return null;
   }
 
   // Full spectrum is conjugate-symmetric; mirror the mask to match so
@@ -136,10 +172,14 @@ function buildHarmonicMask(mag, sampleRate, expectedF0Hz, scratch) {
   return mask;
 }
 
+function yieldToEventLoop() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 // Splits one channel into harmonic-only and residual-only signals via STFT
 // / overlap-add, using `f0AtTime(seconds) -> Hz|0` to look up the expected
 // pitch per frame.
-function splitChannel(channelData, sampleRate, f0AtTime) {
+async function splitChannel(channelData, sampleRate, f0AtTime) {
   const window = hannWindow(FFT_SIZE);
   const harmonicOut = new Float32Array(channelData.length);
   const residualOut = new Float32Array(channelData.length);
@@ -153,6 +193,14 @@ function splitChannel(channelData, sampleRate, f0AtTime) {
   const reR = new Float32Array(FFT_SIZE);
   const imR = new Float32Array(FFT_SIZE);
   let lastCovered = 0;
+  // A lone frame that fails right after a confidently-voiced one is more
+  // likely a brief tracking blip (a fast vibrato swing, a momentary dip in
+  // level) than a real transition to silence/consonant — holding the last
+  // confirmed mask for exactly one frame smooths over that without letting
+  // a real multi-frame transition (an actual consonant/pause) get stuck.
+  let heldMask = null;
+  let heldMaskUsed = false;
+  let frameCount = 0;
 
   for (let start = 0; start + FFT_SIZE <= channelData.length; start += HOP) {
     for (let i = 0; i < FFT_SIZE; i++) {
@@ -165,8 +213,19 @@ function splitChannel(channelData, sampleRate, f0AtTime) {
     const frameCenterT = (start + FFT_SIZE / 2) / sampleRate;
     const mask = buildHarmonicMask(mag, sampleRate, f0AtTime(frameCenterT), maskScratch);
 
+    let effectiveMask = mask;
+    if (mask) {
+      heldMask = mask.slice();
+      heldMaskUsed = false;
+    } else if (heldMask && !heldMaskUsed) {
+      effectiveMask = heldMask;
+      heldMaskUsed = true;
+    } else {
+      heldMask = null;
+    }
+
     for (let k = 0; k < FFT_SIZE; k++) {
-      const m = mask ? mask[k] : 0;
+      const m = effectiveMask ? effectiveMask[k] : 0;
       reH[k] = re[k] * m;
       imH[k] = im[k] * m;
       reR[k] = re[k] * (1 - m);
@@ -180,6 +239,9 @@ function splitChannel(channelData, sampleRate, f0AtTime) {
       windowSum[start + i] += window[i] * window[i];
     }
     lastCovered = start + FFT_SIZE;
+
+    frameCount++;
+    if (frameCount % FRAMES_PER_YIELD === 0) await yieldToEventLoop();
   }
   for (let i = 0; i < channelData.length; i++) {
     if (windowSum[i] > 1e-6) {
@@ -212,10 +274,7 @@ function splitChannel(channelData, sampleRate, f0AtTime) {
 // energy-backed gap it can't otherwise explain as a continuation, not a
 // pause, for exactly this reason): a singer who's still audibly going past
 // where note detection gave up is far more likely to still be near that
-// note's pitch than to have no expected pitch at all. Giving up here would
-// mean that audio finds no harmonic peak, gets routed entirely to the
-// residual layer, and plays back unshifted — i.e. the original melody
-// leaking through where the harmony should be.
+// note's pitch than to have no expected pitch at all.
 function f0LookupFromNotes(melodyNotes, keyInfo) {
   const freqFor = (note) => note.measuredFreq || midiToFreq(scaleStepToMidi(note.step, keyInfo.tonic, keyInfo.mode));
   return (t) => {
@@ -232,7 +291,7 @@ function f0LookupFromNotes(melodyNotes, keyInfo) {
   };
 }
 
-export function separateHarmonicResidual(recordedBuffer, melodyNotes, keyInfo) {
+export async function separateHarmonicResidual(recordedBuffer, melodyNotes, keyInfo) {
   const sampleRate = recordedBuffer.sampleRate;
   const channels = recordedBuffer.numberOfChannels;
   const length = recordedBuffer.length;
@@ -241,7 +300,7 @@ export function separateHarmonicResidual(recordedBuffer, melodyNotes, keyInfo) {
   const harmonicBuffer = new AudioBuffer({ length, numberOfChannels: channels, sampleRate });
   const residualBuffer = new AudioBuffer({ length, numberOfChannels: channels, sampleRate });
   for (let c = 0; c < channels; c++) {
-    const { harmonicOut, residualOut } = splitChannel(recordedBuffer.getChannelData(c), sampleRate, f0AtTime);
+    const { harmonicOut, residualOut } = await splitChannel(recordedBuffer.getChannelData(c), sampleRate, f0AtTime);
     harmonicBuffer.copyToChannel(harmonicOut, c);
     residualBuffer.copyToChannel(residualOut, c);
   }
@@ -254,13 +313,15 @@ export function separateHarmonicResidual(recordedBuffer, melodyNotes, keyInfo) {
 // Keyed by the AudioBuffer object itself: a new recording, upload, or
 // normalize/denoise pass always produces a new buffer object, which
 // naturally (and automatically, via WeakMap) invalidates the cache without
-// any manual bookkeeping in App.jsx.
+// any manual bookkeeping in App.jsx. Caches the in-flight promise (not just
+// the resolved result), so concurrent calls for different harmony types
+// share one computation instead of racing to start it multiple times.
 const splitCache = new WeakMap();
 
 export function getOrComputeHarmonicSplit(recordedBuffer, melodyNotes, keyInfo) {
   const cached = splitCache.get(recordedBuffer);
   if (cached) return cached;
-  const split = separateHarmonicResidual(recordedBuffer, melodyNotes, keyInfo);
-  splitCache.set(recordedBuffer, split);
-  return split;
+  const promise = separateHarmonicResidual(recordedBuffer, melodyNotes, keyInfo);
+  splitCache.set(recordedBuffer, promise);
+  return promise;
 }

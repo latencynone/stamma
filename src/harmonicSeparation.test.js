@@ -37,17 +37,17 @@ function toneNoiseToneSignal() {
   return data;
 }
 
-describe('separateHarmonicResidual', () => {
+describe('separateHarmonicResidual', async () => {
   const keyInfo = { tonic: 0, mode: 'major' };
 
-  it('routes a tonal segment mostly to the harmonic layer and a noise burst mostly to the residual layer', () => {
+  it('routes a tonal segment mostly to the harmonic layer and a noise burst mostly to the residual layer', async () => {
     const data = toneNoiseToneSignal();
     const buffer = makeBuffer(data);
     // One note covering the whole duration at the tone's pitch — the noise
     // burst sits *inside* it, exercising the peak-ratio "no real harmonic
     // here" rejection rather than a note-boundary gap.
     const melodyNotes = [{ step: 0, start: 0, end: 2.0, measuredFreq: 220 }];
-    const { harmonicBuffer, residualBuffer } = separateHarmonicResidual(buffer, melodyNotes, keyInfo);
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfo);
 
     const h = harmonicBuffer.getChannelData(0);
     const r = residualBuffer.getChannelData(0);
@@ -60,11 +60,11 @@ describe('separateHarmonicResidual', () => {
     expect(noiseResidualRms).toBeGreaterThan(noiseHarmonicRms * 2);
   });
 
-  it('reconstructs (harmonic + residual) back to essentially the original signal', () => {
+  it('reconstructs (harmonic + residual) back to essentially the original signal', async () => {
     const data = toneNoiseToneSignal();
     const buffer = makeBuffer(data);
     const melodyNotes = [{ step: 0, start: 0, end: 2.0, measuredFreq: 220 }];
-    const { harmonicBuffer, residualBuffer } = separateHarmonicResidual(buffer, melodyNotes, keyInfo);
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfo);
 
     const h = harmonicBuffer.getChannelData(0);
     const r = residualBuffer.getChannelData(0);
@@ -79,7 +79,7 @@ describe('separateHarmonicResidual', () => {
     expect(relError).toBeLessThan(0.01);
   });
 
-  it('still finds the harmonic layer past the last detected note when the singer audibly keeps going (nearest-note fallback)', () => {
+  it('still finds the harmonic layer past the last detected note when the singer audibly keeps going (nearest-note fallback)', async () => {
     // Mirrors the exact scenario renderHarmonyOffline's own test suite
     // guards against: note detection only covers 0.3-1.0s, but the source
     // audio keeps singing the same pitch to 2.5s. Without a fallback, every
@@ -95,7 +95,7 @@ describe('separateHarmonicResidual', () => {
     const buffer = makeBuffer(raw);
     const melodyNotes = [{ step: 0, start: 0.3, end: 1.0 }]; // detector "missed" the rest
 
-    const { harmonicBuffer, residualBuffer } = separateHarmonicResidual(buffer, melodyNotes, keyInfoLocal);
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfoLocal);
     const h = harmonicBuffer.getChannelData(0);
     const r = residualBuffer.getChannelData(0);
     const from = Math.round(1.8 * SR);
@@ -103,12 +103,12 @@ describe('separateHarmonicResidual', () => {
     expect(rmsOf(h, from, to)).toBeGreaterThan(rmsOf(r, from, to) * 2);
   });
 
-  it('leaves genuine silence as (near-)silent in both layers, not shifted-sounding harmonic content', () => {
+  it('leaves genuine silence as (near-)silent in both layers, not shifted-sounding harmonic content', async () => {
     const totalDur = 1.5;
     const data = new Float32Array(Math.round(SR * totalDur)); // all zero — true digital silence
     const buffer = makeBuffer(data);
     const melodyNotes = [{ step: 0, start: 0, end: 1.5, measuredFreq: 220 }];
-    const { harmonicBuffer, residualBuffer } = separateHarmonicResidual(buffer, melodyNotes, keyInfo);
+    const { harmonicBuffer, residualBuffer } = await separateHarmonicResidual(buffer, melodyNotes, keyInfo);
 
     const h = harmonicBuffer.getChannelData(0);
     const r = residualBuffer.getChannelData(0);
