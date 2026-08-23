@@ -2139,8 +2139,10 @@ export default function App() {
     setMetronomeListening(true);
   }
 
-  function adjustMetronomeBpm(delta) {
-    const next = Math.max(40, Math.min(240, metronomeBpm + delta));
+  // Shared by the +/- steppers and the tap-to-type BPM field — takes an
+  // absolute target rather than a delta.
+  function setMetronomeBpmTo(target) {
+    const next = Math.max(40, Math.min(240, Math.round(target)));
     setMetronomeBpm(next);
     setTempoDetected(false);
     // The scheduler captured the old tempo at start time — restart it so a
@@ -2150,6 +2152,10 @@ export default function App() {
       stopMetronomeScheduler(metronomeSchedulerRef.current);
       metronomeSchedulerRef.current = ctx ? startMetronomeScheduler(ctx, next) : null;
     }
+  }
+
+  function adjustMetronomeBpm(delta) {
+    setMetronomeBpmTo(metronomeBpm + delta);
   }
 
   // `keepPosition`: true for pause (freeze playheadTime so Play resumes
@@ -2684,6 +2690,7 @@ export default function App() {
         .stamma-fader { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px; background: rgba(241,237,228,0.15); outline: none; }
         .stamma-fader::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #F1EDE4; cursor: pointer; }
         .stamma-fader::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #F1EDE4; border: none; cursor: pointer; }
+        input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
       `}</style>
 
       <div className="w-full max-w-md px-5 py-8 font-body">
@@ -2810,7 +2817,15 @@ export default function App() {
                       >
                         −
                       </button>
-                      <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4', minWidth: 90, textAlign: 'center' }}>{metronomeBpm} BPM</span>
+                      <span className="flex items-center justify-center gap-1" style={{ minWidth: 90 }}>
+                        <BpmInput
+                          value={metronomeBpm}
+                          onCommit={setMetronomeBpmTo}
+                          className="font-mono-ui text-xl"
+                          style={{ width: 46, color: '#F1EDE4' }}
+                        />
+                        <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4' }}>BPM</span>
+                      </span>
                       <button
                         onClick={() => adjustMetronomeBpm(1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
@@ -3252,7 +3267,12 @@ export default function App() {
                         >
                           −
                         </button>
-                        <span className="font-mono-ui text-lg" style={{ color: '#F1EDE4', minWidth: 56, textAlign: 'center' }}>{metronomeBpm}</span>
+                        <BpmInput
+                          value={metronomeBpm}
+                          onCommit={setMetronomeBpmTo}
+                          className="font-mono-ui text-lg"
+                          style={{ minWidth: 56, color: '#F1EDE4' }}
+                        />
                         <button
                           onClick={() => adjustMetronomeBpm(1)}
                           className="stamma-btn rounded-md flex items-center justify-center"
@@ -3545,6 +3565,58 @@ function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled }) 
         }}
       />
     </button>
+  );
+}
+
+// A tap-to-type BPM number, alongside the +/- steppers — keeps its own
+// draft text while focused (so a mid-edit value like "1" isn't clamped/
+// clobbered by a re-render before the user finishes typing) and only
+// commits (clamped, via onCommit) on blur or Enter. Esc reverts.
+function BpmInput({ value, onCommit, className, style }) {
+  const [draft, setDraft] = useState(String(value));
+  const [editing, setEditing] = useState(false);
+
+  useEffect(() => {
+    if (!editing) setDraft(String(value));
+  }, [value, editing]);
+
+  const commit = () => {
+    const n = parseInt(draft, 10);
+    if (!Number.isNaN(n)) onCommit(n);
+    setEditing(false);
+  };
+
+  return (
+    <input
+      type="number"
+      inputMode="numeric"
+      value={draft}
+      onFocus={(e) => { setEditing(true); e.target.select(); }}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.currentTarget.blur();
+        } else if (e.key === 'Escape') {
+          setDraft(String(value));
+          setEditing(false);
+          e.currentTarget.blur();
+        }
+      }}
+      aria-label="Takt i BPM"
+      className={`stamma-btn ${className || ''}`}
+      style={{
+        background: 'transparent',
+        border: 'none',
+        outline: 'none',
+        textAlign: 'center',
+        font: 'inherit',
+        color: 'inherit',
+        appearance: 'textfield',
+        MozAppearance: 'textfield',
+        ...style,
+      }}
+    />
   );
 }
 
