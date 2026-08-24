@@ -252,10 +252,15 @@ function playMetronomeClick(ctx, whenTime, accent) {
 // Standard "lookahead" scheduler (setInterval polling ahead of playback
 // time with sample-accurate start() calls) rather than one setTimeout per
 // click — setTimeout alone drifts audibly over even a few bars.
-function startMetronomeScheduler(ctx, bpm) {
+// `startTime`: when the first click should land. Defaults to a fixed
+// lookahead from now (the count-in/listen-preview use case); passing the
+// same timestamp another scheduled event starts at (e.g. mix playback)
+// makes the two sample-accurately simultaneous instead of each just
+// starting "soon".
+function startMetronomeScheduler(ctx, bpm, startTime) {
   const beatDur = 60 / Math.max(20, bpm);
   const lookahead = 0.1;
-  const state = { nextClickTime: ctx.currentTime + 0.1, beatCount: 0 };
+  const state = { nextClickTime: startTime ?? ctx.currentTime + 0.1, beatCount: 0 };
   state.intervalId = setInterval(() => {
     while (state.nextClickTime < ctx.currentTime + lookahead) {
       playMetronomeClick(ctx, state.nextClickTime, state.beatCount % 4 === 0);
@@ -1032,7 +1037,7 @@ function AboutPage() {
     {
       id: 'metronom',
       title: 'Metronom',
-      body: 'Innan du spelar in kan du slå på ett klickspår som hörs medan du sjunger, med en egen takt (BPM) du ställer med +/− eller lyssnar dig fram till i förväg. Har du redan spelat in en gång försöker appen räkna ut takten själv utifrån tonerna — går det inte, går det alltid att sätta den manuellt.',
+      body: 'Innan du spelar in kan du slå på ett klickspår som hörs medan du sjunger, med en egen takt (BPM) du ställer med +/− eller lyssnar dig fram till i förväg. Har du redan spelat in en gång försöker appen räkna ut takten själv utifrån tonerna — går det inte, går det alltid att sätta den manuellt. Är klickspåret på när du sedan spelar upp inspelningen hörs det också då, i exakt takt med uppspelningen.',
     },
     {
       id: 'tonhojdskurva',
@@ -1231,7 +1236,7 @@ export default function App() {
   const [mixerExpanded, setMixerExpanded] = useState(false);
   const [noteViewExpanded, setNoteViewExpanded] = useState(false);
   const [exportExpanded, setExportExpanded] = useState(false);
-  const [metronomeEnabled, setMetronomeEnabled] = useState(false); // clicks during an actual recording
+  const [metronomeEnabled, setMetronomeEnabled] = useState(false); // clicks during recording, and along with mix playback
   const [metronomeBpm, setMetronomeBpm] = useState(100);
   const [metronomeListening, setMetronomeListening] = useState(false); // preview click loop, not recording
   const [metronomeExpanded, setMetronomeExpanded] = useState(false);
@@ -2157,6 +2162,13 @@ export default function App() {
       setMetronomeListening(false);
       return;
     }
+    // Also supersedes a playback-synced click (started by startMix) still
+    // running from the mix — without stopping it first, its interval would
+    // leak and both would click at once.
+    if (metronomeSchedulerRef.current) {
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = null;
+    }
     const ctx = await getPlaybackContext();
     metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpm);
     setMetronomeListening(true);
@@ -2203,6 +2215,14 @@ export default function App() {
       try { node.stop(); } catch (e) { /* already stopped/ended */ }
     });
     activeSourcesRef.current = [];
+    // Stops the playback-synced click along with everything else — a
+    // "Lyssna" preview loop never reaches here (it's not routed through
+    // startMix/stopPlayback), so this only ever cuts off a click that
+    // startMix itself started.
+    if (metronomeSchedulerRef.current) {
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = null;
+    }
     Object.values(mixNodesRef.current).forEach((nodes) => {
       try { nodes.gainNode.disconnect(); } catch (e) { /* already disconnected */ }
       try { nodes.fadeGainNode.disconnect(); } catch (e) { /* already disconnected */ }
@@ -2520,6 +2540,21 @@ export default function App() {
 
     const now = ctx.currentTime + 0.05;
     const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom, reverbBus.input));
+
+    // The click-track toggle (used for a recording's count-in/click) also
+    // doubles as a "click along with playback" aid — started at the exact
+    // same `now` the mix itself starts at, on the same context/clock, so
+    // it's sample-accurately synced rather than just "roughly around the
+    // same time". Any independent "Lyssna" preview scheduler is stopped
+    // and superseded here, since they share the one ref/context.
+    if (metronomeSchedulerRef.current) {
+      stopMetronomeScheduler(metronomeSchedulerRef.current);
+      metronomeSchedulerRef.current = null;
+    }
+    if (metronomeEnabled) {
+      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpm, now);
+      if (metronomeListening) setMetronomeListening(false);
+    }
 
     activeSourcesRef.current = started;
     setIsPlaying(true);
@@ -3332,8 +3367,8 @@ export default function App() {
                         border: metronomeEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.15)',
                       }}
                       aria-pressed={metronomeEnabled}
-                      aria-label="Metronom vid inspelning"
-                      title="Metronom vid inspelning"
+                      aria-label="Metronom vid inspelning och uppspelning"
+                      title="Metronom vid inspelning och uppspelning"
                     >
                       <MetronomeIcon size={14} />
                     </button>
