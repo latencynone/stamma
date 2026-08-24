@@ -18,6 +18,7 @@ import {
   filterOutlierNotes,
   attachMeasuredFreq,
   extractFramesFromBuffer,
+  detectTempoBpm,
 } from './pitchAnalysis.js';
 import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } from './harmonyEngine.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
@@ -231,45 +232,6 @@ function detectNoiseRegion(channelData, sampleRate, duration) {
 }
 
 /* ---------- Tempo detection & metronome ---------- */
-
-// A simple, honest-about-being-approximate tempo estimate: the gaps
-// between consecutive note onsets (inter-onset intervals) cluster around
-// the beat duration (or a simple fraction/multiple of it) for anything
-// with a steady pulse, so the most common gap — found via a coarse
-// histogram rather than exact-match counting, since real timing always
-// has some jitter — is taken as the beat. Folded into a 60–180 BPM range
-// by doubling/halving, since raw IOI clustering can't tell a beat from a
-// half- or double-time reading of it.
-function detectTempoBpm(melodyNotes) {
-  if (!melodyNotes || melodyNotes.length < 3) return null;
-  const onsets = melodyNotes.map((n) => n.start).slice().sort((a, b) => a - b);
-  const iois = [];
-  for (let i = 1; i < onsets.length; i++) {
-    const d = onsets[i] - onsets[i - 1];
-    if (d > 0.15 && d < 2.0) iois.push(d);
-  }
-  if (iois.length < 2) return null;
-
-  const bucketSize = 0.05;
-  const buckets = {};
-  iois.forEach((ioi) => {
-    const key = Math.round(ioi / bucketSize);
-    buckets[key] = (buckets[key] || 0) + 1;
-  });
-  let bestKey = null;
-  let bestCount = 0;
-  Object.entries(buckets).forEach(([k, count]) => {
-    if (count > bestCount) { bestCount = count; bestKey = k; }
-  });
-  if (bestKey === null) return null;
-
-  const beatDur = Number(bestKey) * bucketSize;
-  if (beatDur <= 0) return null;
-  let bpm = 60 / beatDur;
-  while (bpm < 60) bpm *= 2;
-  while (bpm > 180) bpm /= 2;
-  return Math.round(bpm);
-}
 
 // One metronome tick — a short sine blip, accented (higher pitch, a touch
 // louder) on the first beat of every 4 so the pulse reads as a bar, not

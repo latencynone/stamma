@@ -187,3 +187,43 @@ export function attachMeasuredFreq(notes, voicedFrames) {
     return { ...n, measuredFreq };
   });
 }
+
+/* ---------- Tempo detection ---------- */
+
+// A simple, honest-about-being-approximate tempo estimate: the gaps
+// between consecutive note onsets (inter-onset intervals) cluster around
+// the beat duration (or a simple fraction/multiple of it) for anything
+// with a steady pulse. Uses the *median* IOI rather than requiring several
+// onsets to land in the same narrow histogram bucket — a short recording
+// (the app caps at 10s) with only a handful of held notes rarely produces
+// two IOIs within 50ms of each other even when sung at a rock-steady
+// tempo, since human timing isn't machine-quantized; the old bucket-vote
+// approach needed that near-exact repeat to ever return anything, so most
+// real (as opposed to metronomically clean) recordings silently got no
+// tempo guess at all. A single IOI is still a usable (if rougher) estimate,
+// so only one onset gap is required. Folded into a 60–180 BPM range by
+// doubling/halving, since a raw IOI can't tell a beat from a half- or
+// double-time reading of it.
+export function detectTempoBpm(melodyNotes) {
+  if (!melodyNotes || melodyNotes.length < 2) return null;
+  const onsets = melodyNotes.map((n) => n.start).slice().sort((a, b) => a - b);
+  const iois = [];
+  for (let i = 1; i < onsets.length; i++) {
+    const d = onsets[i] - onsets[i - 1];
+    // Upper bound wide enough to admit a breath/phrase pause on a slow
+    // ballad (a real beat this long is implausible, but the fold-into-
+    // range loop below recovers a sane guess from it anyway) while still
+    // excluding within-syllable pitch-tracker blips via the lower bound.
+    if (d > 0.15 && d < 4.0) iois.push(d);
+  }
+  if (iois.length < 1) return null;
+
+  const sorted = iois.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const beatDur = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  if (beatDur <= 0) return null;
+  let bpm = 60 / beatDur;
+  while (bpm < 60) bpm *= 2;
+  while (bpm > 180) bpm /= 2;
+  return Math.round(bpm);
+}
