@@ -2845,7 +2845,7 @@ export default function App() {
             onClick={() => setNoteViewExpanded((v) => !v)}
             className="stamma-btn w-full flex items-center justify-between"
           >
-            <h2 className="font-display text-lg font-semibold">Tonhöjdskurva</h2>
+            <h2 className="font-display text-lg font-semibold">Tonhöjdskurva &amp; Vågform</h2>
             <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: noteViewExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
           </button>
           {noteViewExpanded && (
@@ -2872,9 +2872,107 @@ export default function App() {
                   )}
                 </div>
               )}
+              {voiceReady && soundType === 'recording' && waveformPeaks && (
+                <div className="mt-3 rounded-2xl p-3" style={{ backgroundColor: '#10131A', border: '1px solid rgba(241,237,228,0.08)' }}>
+                  <WaveformTrimmer
+                    peaks={waveformPeaks}
+                    duration={recordingDuration}
+                    trimStart={trimStart}
+                    trimEnd={effectiveTrimEnd}
+                    onTrimChange={(start, end) => {
+                      setTrimStart(start);
+                      setTrimEnd(end);
+                      if (isPlaying) stopPlayback();
+                    }}
+                    fadeIn={fadeIn}
+                    fadeOut={fadeOut}
+                    onFadeChange={(fi, fo) => {
+                      setFadeIn(fi);
+                      setFadeOut(fo);
+                      if (isPlaying) stopPlayback();
+                    }}
+                    playheadTime={playheadTime}
+                    isPlaying={isPlaying}
+                    onPlayPause={togglePlayPause}
+                    onSeek={seekTo}
+                    playDisabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
+                    onStop={() => stopPlayback()}
+                    loopEnabled={loopEnabled}
+                    onToggleLoop={() => setLoopEnabled((v) => !v)}
+                    busy={anyHarmonyBusy || autotuneRendering}
+                    noiseReductionMode={noiseReductionMode}
+                    onToggleNoiseReductionMode={() => (noiseReductionMode ? setNoiseReductionMode(false) : enterNoiseReductionMode())}
+                    noiseSampleStart={noiseSampleStart}
+                    noiseSampleEnd={noiseSampleEnd}
+                    onNoiseSampleChange={(s, e) => { setNoiseSampleStart(s); setNoiseSampleEnd(e); }}
+                    onApplyNoiseReduction={applyNoiseReduction}
+                    denoising={denoising}
+                    denoiseError={denoiseError}
+                    noiseReductionApplied={noiseReductionApplied}
+                  />
+
+                  <div className="flex items-center gap-2 mt-3">
+                    <button
+                      onClick={normalizeRecording}
+                      disabled={normalizing}
+                      className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
+                      style={{
+                        backgroundColor: 'rgba(241,237,228,0.06)',
+                        color: normalizing ? 'rgba(241,237,228,0.3)' : '#F1EDE4',
+                        border: '1px solid rgba(241,237,228,0.12)',
+                        cursor: normalizing ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      {normalizing ? 'Normaliserar …' : 'Normalisera'}
+                    </button>
+                    {isProcessed && (
+                      <button
+                        onClick={revertToOriginalRecording}
+                        className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
+                        style={{ backgroundColor: 'rgba(255,107,107,0.1)', color: '#FFB4B4', border: '1px solid rgba(255,107,107,0.3)' }}
+                      >
+                        Återställ till original
+                      </button>
+                    )}
+                  </div>
+                  {normalizeError && (
+                    <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{normalizeError}</div>
+                  )}
+
+                  <div className="mt-3">
+                    <TransportButtons
+                      loopEnabled={loopEnabled}
+                      onToggleLoop={() => setLoopEnabled((v) => !v)}
+                      onStop={() => stopPlayback()}
+                      isPlaying={isPlaying}
+                      onPlayPause={togglePlayPause}
+                      disabled={!anyChannelEnabled}
+                      busy={anyHarmonyBusy || autotuneRendering}
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-2 mt-2">
+                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
+                      {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
+                    </span>
+                    <input
+                      type="range"
+                      min={trimStart}
+                      max={effectiveTrimEnd}
+                      step="0.01"
+                      value={playheadTime !== null ? playheadTime : trimStart}
+                      onChange={(e) => seekTo(parseFloat(e.target.value))}
+                      className="stamma-fader w-full"
+                      style={{ accentColor: '#FFB454' }}
+                      aria-label="Spola i vågformen"
+                    />
+                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{effectiveTrimEnd.toFixed(1)}s</span>
+                  </div>
+                </div>
+              )}
             </>
           )}
-          {phase === 'ready' && (
+          {phase === 'ready' && !(noteViewExpanded && voiceReady && soundType === 'recording' && waveformPeaks) && (
             <div className="mt-3">
               <TransportButtons
                 loopEnabled={loopEnabled}
@@ -3253,105 +3351,6 @@ export default function App() {
               <p className="text-sm leading-relaxed mb-3" style={{ color: '#C7CBDA' }}>
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
               </p>
-
-              {voiceReady && soundType === 'recording' && waveformPeaks && (
-                <div className="mb-3 rounded-2xl p-3" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
-                  <WaveformTrimmer
-                    peaks={waveformPeaks}
-                    duration={recordingDuration}
-                    trimStart={trimStart}
-                    trimEnd={effectiveTrimEnd}
-                    onTrimChange={(start, end) => {
-                      setTrimStart(start);
-                      setTrimEnd(end);
-                      if (isPlaying) stopPlayback();
-                    }}
-                    fadeIn={fadeIn}
-                    fadeOut={fadeOut}
-                    onFadeChange={(fi, fo) => {
-                      setFadeIn(fi);
-                      setFadeOut(fo);
-                      if (isPlaying) stopPlayback();
-                    }}
-                    playheadTime={playheadTime}
-                    isPlaying={isPlaying}
-                    onPlayPause={togglePlayPause}
-                    onSeek={seekTo}
-                    playDisabled={!anyChannelEnabled || anyHarmonyBusy || autotuneRendering}
-                    onStop={() => stopPlayback()}
-                    loopEnabled={loopEnabled}
-                    onToggleLoop={() => setLoopEnabled((v) => !v)}
-                    busy={anyHarmonyBusy || autotuneRendering}
-                    noiseReductionMode={noiseReductionMode}
-                    onToggleNoiseReductionMode={() => (noiseReductionMode ? setNoiseReductionMode(false) : enterNoiseReductionMode())}
-                    noiseSampleStart={noiseSampleStart}
-                    noiseSampleEnd={noiseSampleEnd}
-                    onNoiseSampleChange={(s, e) => { setNoiseSampleStart(s); setNoiseSampleEnd(e); }}
-                    onApplyNoiseReduction={applyNoiseReduction}
-                    denoising={denoising}
-                    denoiseError={denoiseError}
-                    noiseReductionApplied={noiseReductionApplied}
-                  />
-
-                  <div className="flex items-center gap-2 mt-3">
-                    <button
-                      onClick={normalizeRecording}
-                      disabled={normalizing}
-                      className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
-                      style={{
-                        backgroundColor: 'rgba(241,237,228,0.06)',
-                        color: normalizing ? 'rgba(241,237,228,0.3)' : '#F1EDE4',
-                        border: '1px solid rgba(241,237,228,0.12)',
-                        cursor: normalizing ? 'not-allowed' : 'pointer',
-                      }}
-                    >
-                      {normalizing ? 'Normaliserar …' : 'Normalisera'}
-                    </button>
-                    {isProcessed && (
-                      <button
-                        onClick={revertToOriginalRecording}
-                        className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
-                        style={{ backgroundColor: 'rgba(255,107,107,0.1)', color: '#FFB4B4', border: '1px solid rgba(255,107,107,0.3)' }}
-                      >
-                        Återställ till original
-                      </button>
-                    )}
-                  </div>
-                  {normalizeError && (
-                    <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{normalizeError}</div>
-                  )}
-
-                  <div className="mt-3">
-                    <TransportButtons
-                      loopEnabled={loopEnabled}
-                      onToggleLoop={() => setLoopEnabled((v) => !v)}
-                      onStop={() => stopPlayback()}
-                      isPlaying={isPlaying}
-                      onPlayPause={togglePlayPause}
-                      disabled={!anyChannelEnabled}
-                      busy={anyHarmonyBusy || autotuneRendering}
-                    />
-                  </div>
-
-                  <div className="flex items-center gap-2 mt-2">
-                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
-                      {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
-                    </span>
-                    <input
-                      type="range"
-                      min={trimStart}
-                      max={effectiveTrimEnd}
-                      step="0.01"
-                      value={playheadTime !== null ? playheadTime : trimStart}
-                      onChange={(e) => seekTo(parseFloat(e.target.value))}
-                      className="stamma-fader w-full"
-                      style={{ accentColor: '#FFB454' }}
-                      aria-label="Spola i vågformen"
-                    />
-                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{effectiveTrimEnd.toFixed(1)}s</span>
-                  </div>
-                </div>
-              )}
 
               <div className="flex items-center justify-between mb-2 gap-2">
                 <div className="relative">
