@@ -568,6 +568,7 @@ function WaveformTrimmer({
   onStop, loopEnabled, onToggleLoop, busy,
   noiseReductionMode, onToggleNoiseReductionMode, noiseSampleStart, noiseSampleEnd, onNoiseSampleChange,
   onApplyNoiseReduction, denoising, denoiseError, noiseReductionApplied,
+  metronomeEnabled, onToggleMetronome,
 }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
@@ -955,6 +956,8 @@ function WaveformTrimmer({
             onPlayPause={onPlayPause}
             disabled={playDisabled}
             busy={busy}
+            metronomeEnabled={metronomeEnabled}
+            onToggleMetronome={onToggleMetronome}
           />
           <div className="flex items-center gap-2 mt-2">
             <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
@@ -1310,6 +1313,11 @@ export default function App() {
   const ownTakeCountInCancelledRef = useRef(false);
   const reverbBusRef = useRef(null);
   const metronomeSchedulerRef = useRef(null);
+  // Mirrors the `metronomeOverride` argument a startMix() call was given,
+  // so a loop restart (which only has a ref, not the original call's
+  // arguments, to work from) can keep clicking at a "Lyssna"-detected tempo
+  // instead of falling back to the separate metronomeEnabled setting.
+  const metronomeOverrideRef = useRef(null);
 
   // Read inside the playback-end setTimeout, which was scheduled back when
   // it fired — using state directly there would capture whatever loopEnabled
@@ -1317,6 +1325,23 @@ export default function App() {
   useEffect(() => {
     loopEnabledRef.current = loopEnabled;
   }, [loopEnabled]);
+
+  // Same staleness problem as loopEnabledRef, for the same reason: a loop
+  // restart calls the startMix() closure that existed when the *previous*
+  // iteration scheduled its setTimeout, so reading metronomeEnabled/
+  // metronomeBpm directly there would silently use whatever they were when
+  // that iteration started — a metronome toggle or BPM change made mid-
+  // playback wouldn't take effect until the next manual play, which is
+  // exactly the "sometimes it clicks, sometimes it doesn't, even though
+  // it's on" symptom this was causing.
+  const metronomeEnabledRef = useRef(false);
+  const metronomeBpmRef = useRef(100);
+  useEffect(() => {
+    metronomeEnabledRef.current = metronomeEnabled;
+  }, [metronomeEnabled]);
+  useEffect(() => {
+    metronomeBpmRef.current = metronomeBpm;
+  }, [metronomeBpm]);
 
   // The browser remembers a granted/denied microphone permission on its own
   // (that's an origin-level browser decision, not something a site can
@@ -2004,6 +2029,7 @@ export default function App() {
     setMelodyNotes(result.notes);
     applyDetectedTempo(result.notes);
     setPhase('ready');
+    setNoteViewExpanded(true);
   }
 
   // Uploaded files are decoded up front (so we have real sample data),
@@ -2048,6 +2074,7 @@ export default function App() {
     setMelodyNotes(result.notes);
     applyDetectedTempo(result.notes);
     setPhase('ready');
+    setNoteViewExpanded(true);
     return true;
   }
 
@@ -2157,21 +2184,43 @@ export default function App() {
   // to a take. Toggling it off just stops the scheduler.
   async function toggleMetronomeListen() {
     if (metronomeListening) {
-      stopMetronomeScheduler(metronomeSchedulerRef.current);
-      metronomeSchedulerRef.current = null;
       setMetronomeListening(false);
+      // Handles both flavors below uniformly: a startMix()-driven melody+
+      // click preview (stops the whole mix) and a standalone click-only
+      // loop (metronomeSchedulerRef is stopped either way).
+      stopPlayback();
       return;
     }
-    // Also supersedes a playback-synced click (started by startMix) still
-    // running from the mix — without stopping it first, its interval would
-    // leak and both would click at once.
-    if (metronomeSchedulerRef.current) {
-      stopMetronomeScheduler(metronomeSchedulerRef.current);
-      metronomeSchedulerRef.current = null;
+    // Re-detect the tempo from the melody every time "Lyssna" is pressed,
+    // not just once right after analysis — so it always offers the app's
+    // current best guess, even if a manual BPM edit or an earlier missed
+    // detection left a stale/wrong number showing.
+    let bpm = metronomeBpm;
+    if (melodyNotes.length) {
+      const detected = detectTempoBpm(melodyNotes);
+      if (detected) {
+        bpm = detected;
+        setMetronomeBpm(detected);
+        setTempoDetected(true);
+      }
     }
-    const ctx = await getPlaybackContext();
-    metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpm);
     setMetronomeListening(true);
+    if (melodyNotes.length && recordedBufferRef.current) {
+      // Play the melody alongside the click, sample-accurately synced to
+      // the same start (see the metronomeOverride param on startMix), so
+      // the tempo can be judged directly against the actual singing
+      // instead of just an isolated click.
+      startMix(channels, ['melody'], undefined, { bpm });
+    } else {
+      // No melody yet (idle screen, before any recording) — just the
+      // click on its own, as before.
+      if (metronomeSchedulerRef.current) {
+        stopMetronomeScheduler(metronomeSchedulerRef.current);
+        metronomeSchedulerRef.current = null;
+      }
+      const ctx = await getPlaybackContext();
+      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, bpm);
+    }
   }
 
   // Shared by the +/- steppers and the tap-to-type BPM field — takes an
@@ -2191,6 +2240,29 @@ export default function App() {
 
   function adjustMetronomeBpm(delta) {
     setMetronomeBpmTo(metronomeBpm + delta);
+  }
+
+  // The mixer/idle-screen toggle only flips a stored preference, but if a
+  // mix is already playing that change should be heard right away, not
+  // wait for the next Play — mirrors the live-restart setMetronomeBpmTo
+  // already does for a BPM edit made mid-preview. Skipped while a "Lyssna"
+  // preview owns the scheduler (metronomeListening) — that flow manages
+  // its own click via the metronomeOverride path in startMix.
+  function toggleMetronomeEnabled() {
+    setMetronomeEnabled((prev) => {
+      const next = !prev;
+      if (isPlaying && !metronomeListening) {
+        const ctx = playCtxRef.current;
+        if (metronomeSchedulerRef.current) {
+          stopMetronomeScheduler(metronomeSchedulerRef.current);
+          metronomeSchedulerRef.current = null;
+        }
+        if (next && ctx) {
+          metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpmRef.current, ctx.currentTime + 0.05);
+        }
+      }
+      return next;
+    });
   }
 
   // `keepPosition`: true for pause (freeze playheadTime so Play resumes
@@ -2511,8 +2583,14 @@ export default function App() {
   // resume from a paused/seeked position instead of always the window's
   // start — defaults to the window start, which is also what a loop
   // restart and a fresh channel preview want.
-  async function startMix(channelsState, keysOverride, startOffset) {
+  // `metronomeOverride` ({ bpm } | undefined) forces a synced click at that
+  // exact tempo regardless of the `metronomeEnabled` toggle — used by
+  // "Lyssna" to click alongside the melody at whatever tempo it just
+  // detected, without permanently flipping the separate recording/
+  // playback-click setting.
+  async function startMix(channelsState, keysOverride, startOffset, metronomeOverride) {
     stopPlayback();
+    metronomeOverrideRef.current = metronomeOverride || null;
     const myGeneration = playGenerationRef.current;
     const activeKeys = keysOverride || Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
     if (!activeKeys.length) return;
@@ -2546,13 +2624,17 @@ export default function App() {
     // same `now` the mix itself starts at, on the same context/clock, so
     // it's sample-accurately synced rather than just "roughly around the
     // same time". Any independent "Lyssna" preview scheduler is stopped
-    // and superseded here, since they share the one ref/context.
+    // and superseded here, since they share the one ref/context. Reads the
+    // ref, not the closed-over state, so a toggle/BPM change mid-playback
+    // is picked up correctly on a loop restart (see metronomeEnabledRef).
     if (metronomeSchedulerRef.current) {
       stopMetronomeScheduler(metronomeSchedulerRef.current);
       metronomeSchedulerRef.current = null;
     }
-    if (metronomeEnabled) {
-      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpm, now);
+    if (metronomeOverride) {
+      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeOverride.bpm, now);
+    } else if (metronomeEnabledRef.current) {
+      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpmRef.current, now);
       if (metronomeListening) setMetronomeListening(false);
     }
 
@@ -2566,9 +2648,14 @@ export default function App() {
       // this timeout was set up to (totalDur + 0.4)s ago, and a toggle
       // flipped since then would otherwise be missed.
       if (loopEnabledRef.current) {
-        startMix(channelsState, keysOverride);
+        // Carries a "Lyssna" click-tempo override through the restart too
+        // (see metronomeOverrideRef) — otherwise a looping Lyssna preview
+        // would click at the detected tempo for one pass and then silently
+        // fall back to the separate metronomeEnabled setting.
+        startMix(channelsState, keysOverride, undefined, metronomeOverrideRef.current || undefined);
       } else {
         stopPlayback();
+        if (metronomeOverrideRef.current) setMetronomeListening(false);
       }
     }, (totalDur + 0.4) * 1000);
 
@@ -2900,6 +2987,8 @@ export default function App() {
                     loopEnabled={loopEnabled}
                     onToggleLoop={() => setLoopEnabled((v) => !v)}
                     busy={anyHarmonyBusy || autotuneRendering}
+                    metronomeEnabled={metronomeEnabled}
+                    onToggleMetronome={toggleMetronomeEnabled}
                     noiseReductionMode={noiseReductionMode}
                     onToggleNoiseReductionMode={() => (noiseReductionMode ? setNoiseReductionMode(false) : enterNoiseReductionMode())}
                     noiseSampleStart={noiseSampleStart}
@@ -2948,6 +3037,8 @@ export default function App() {
                       onPlayPause={togglePlayPause}
                       disabled={!anyChannelEnabled}
                       busy={anyHarmonyBusy || autotuneRendering}
+                      metronomeEnabled={metronomeEnabled}
+                      onToggleMetronome={toggleMetronomeEnabled}
                     />
                   </div>
 
@@ -2982,6 +3073,8 @@ export default function App() {
                 onPlayPause={togglePlayPause}
                 disabled={!anyChannelEnabled}
                 busy={anyHarmonyBusy || autotuneRendering}
+                metronomeEnabled={metronomeEnabled}
+                onToggleMetronome={toggleMetronomeEnabled}
               />
             </div>
           )}
@@ -3332,16 +3425,16 @@ export default function App() {
             </div>
 
             <div>
-              <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center justify-between mb-2 gap-2">
                 <button
                   onClick={() => setMixerExpanded((v) => !v)}
-                  className="stamma-btn flex items-center gap-2"
+                  className="stamma-btn flex-1 flex items-center justify-between min-w-0"
                 >
                   <h2 className="font-display text-lg font-semibold">Mixer</h2>
                   <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: mixerExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
                 </button>
                 {isPlaying && (
-                  <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline" style={{ color: '#C7CBDA' }}>
+                  <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline shrink-0" style={{ color: '#C7CBDA' }}>
                     Stoppa
                   </button>
                 )}
@@ -3355,22 +3448,6 @@ export default function App() {
               <div className="flex items-center justify-between mb-2 gap-2">
                 <div className="relative">
                   <div className="flex items-center gap-1.5">
-                    <button
-                      onClick={() => setMetronomeEnabled((v) => !v)}
-                      className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
-                      style={{
-                        width: 26,
-                        height: 26,
-                        backgroundColor: metronomeEnabled ? 'rgba(85,214,192,0.15)' : 'transparent',
-                        color: metronomeEnabled ? '#55D6C0' : '#C7CBDA',
-                        border: metronomeEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.15)',
-                      }}
-                      aria-pressed={metronomeEnabled}
-                      aria-label="Metronom vid inspelning och uppspelning"
-                      title="Metronom vid inspelning och uppspelning"
-                    >
-                      <MetronomeIcon size={14} />
-                    </button>
                     <button
                       onClick={() => setMetronomeExpanded((v) => !v)}
                       className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
@@ -3524,6 +3601,8 @@ export default function App() {
                   onPlayPause={togglePlayPause}
                   disabled={!anyChannelEnabled}
                   busy={anyHarmonyBusy || autotuneRendering}
+                  metronomeEnabled={metronomeEnabled}
+                  onToggleMetronome={toggleMetronomeEnabled}
                 />
               </div>
                 </>
@@ -3614,7 +3693,7 @@ export default function App() {
 // Loop / Stop-and-rewind / Play-Pause, as one row — reused under the note
 // window, under the waveform, and under the last mixer channel, so all
 // three places control the exact same mix playback identically.
-function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlayPause, disabled, busy }) {
+function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlayPause, disabled, busy, metronomeEnabled, onToggleMetronome }) {
   return (
     <div className="flex items-center gap-2">
       <button
@@ -3634,6 +3713,24 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
       >
         <StopIcon size={16} />
       </button>
+      {onToggleMetronome && (
+        <button
+          onClick={onToggleMetronome}
+          className="stamma-btn shrink-0 rounded-xl flex items-center justify-center"
+          style={{
+            width: 44,
+            height: 44,
+            backgroundColor: metronomeEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+            color: metronomeEnabled ? '#55D6C0' : '#C7CBDA',
+            border: metronomeEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+          }}
+          aria-pressed={metronomeEnabled}
+          aria-label="Metronom vid inspelning och uppspelning"
+          title="Metronom vid inspelning och uppspelning"
+        >
+          <MetronomeIcon size={19} />
+        </button>
+      )}
       <button
         onClick={onPlayPause}
         disabled={disabled || busy}
