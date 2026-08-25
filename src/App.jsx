@@ -21,6 +21,7 @@ import {
   detectTempoBpm,
 } from './pitchAnalysis.js';
 import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } from './harmonyEngine.js';
+import { alignOwnTakeToMelody } from './takeAlignment.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 import { fft, ifft, hannWindow } from './dsp.js';
 import { saveSession, loadSession, clearSession } from './indexedDb.js';
@@ -1256,6 +1257,7 @@ export default function App() {
   const [expandedChannels, setExpandedChannels] = useState({});
   const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countingIn, countInBeat, countdown } | null
   const [ownTakeError, setOwnTakeError] = useState('');
+  const [ownTakeAligningByType, setOwnTakeAligningByType] = useState({}); // { ters, kvint, sext } -> bool, see alignOwnTake
   // A session found in IndexedDB at mount, offered via a dismissible
   // banner — never applied automatically. Cleared (both from state and the
   // DB) once the user restores or dismisses it.
@@ -1654,6 +1656,7 @@ export default function App() {
     }
     ownTakeBuffersRef.current = {};
     setOwnTakeError('');
+    setOwnTakeAligningByType({});
     stopPlayback();
     // The previous take is being discarded (new recording/upload, or an
     // explicit reset) — drop its autosave too, so a later crash doesn't
@@ -2835,6 +2838,7 @@ export default function App() {
           ...prev,
           [ownKey]: prev[ownKey] || { enabled: true, volume: 0.85, pan: 0, solo: false },
         }));
+        alignOwnTake(type, audioBuffer);
       } catch (err) {
         setOwnTakeError(`Kunde inte spela in din ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
       } finally {
@@ -2843,6 +2847,30 @@ export default function App() {
       }
     };
     mr.stop();
+  }
+
+  // Kicked off right after a take is decoded (see mr.onstop above) — MTrack-
+  // Align-style timing alignment against the melody's onsets, see
+  // takeAlignment.js. Fire-and-forget: the raw take is already enabled and
+  // playable while this runs in the background, `ownTakeAligningByType`
+  // only drives the "(bygger …)" label on that channel. The identity check
+  // before overwriting the ref guards against the take having been deleted
+  // or re-recorded (a different buffer now sitting there) before this
+  // resolves.
+  async function alignOwnTake(type, rawBuffer) {
+    setOwnTakeAligningByType((prev) => ({ ...prev, [type]: true }));
+    try {
+      const aligned = await alignOwnTakeToMelody(rawBuffer, melodyNotes, recordingDuration);
+      if (ownTakeBuffersRef.current[type] === rawBuffer) {
+        ownTakeBuffersRef.current[type] = aligned;
+      }
+    } catch (err) {
+      // Alignment is a best-effort enhancement on top of an already-usable
+      // take — leave the raw, unaligned recording in place rather than
+      // surfacing an error for it.
+    } finally {
+      setOwnTakeAligningByType((prev) => ({ ...prev, [type]: false }));
+    }
   }
 
   function deleteOwnTake(type) {
@@ -3581,6 +3609,7 @@ export default function App() {
                           solo={ownChannel.solo}
                           onToggleSolo={() => toggleChannelSolo(ownKey)}
                           meterRef={(el) => { meterRefs.current[ownKey] = el; }}
+                          busy={ownTakeAligningByType[type]}
                           previewing={isPlaying && previewingKey === ownKey}
                           onPreview={() => (isPlaying && previewingKey === ownKey ? stopPlayback() : previewChannel(ownKey))}
                           expanded={!!expandedChannels[ownKey]}
