@@ -3,13 +3,16 @@ import {
   NOTE_NAMES,
   HARMONY_TYPES,
   SOUND_TYPES,
+  MAJOR_INTERVALS,
   midiToFreq,
   scaleStepToMidi,
   midiToNoteName,
   freqToMidi,
   midiToScaleStep,
   requantizeNotesToKey,
+  semitoneForStep,
 } from './musicTheory.js';
+import SignalsmithStretch from 'signalsmith-stretch';
 import {
   autoCorrelate,
   detectKey,
@@ -1106,6 +1109,11 @@ function AboutPage() {
       body: 'Innan du spelar in kan du slå på ett klickspår som hörs medan du sjunger, med en egen takt (BPM) du ställer med +/− eller lyssnar dig fram till i förväg. Har du redan spelat in en gång försöker appen räkna ut takten själv utifrån tonerna — går det inte, går det alltid att sätta den manuellt. Är klickspåret på när du sedan spelar upp inspelningen hörs det också då, i exakt takt med uppspelningen.',
     },
     {
+      id: 'live-forhandslyssning',
+      title: 'Live-förhandslyssning',
+      body: 'Innan du spelar in kan du slå på en direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ett fast tersavstånd, kvintavstånd eller sextavstånd — ett smakprov på hur en stämma skulle låta, utan att behöva spela in och vänta på den vanliga (mer noggranna, tonartsanpassade) stämmemotorn. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard.',
+    },
+    {
       id: 'tonhojdskurva',
       title: 'Tonhöjdskurvan',
       body: 'Appen lyssnar igenom inspelningen och räknar ut vilken ton som sjungs vid varje ögonblick. Det ritas upp som en kurva du kan zooma i och öppna i helskärm — varje stapel är en enskild ton.',
@@ -1337,6 +1345,27 @@ export default function App() {
   // audio), newest first, for the "Sessioner" list.
   const [projects, setProjects] = useState([]);
   const [projectsExpanded, setProjectsExpanded] = useState(false);
+  // Live-monitor: a real-time mic -> pitch-shift -> speaker/headphone loop
+  // via SignalsmithStretch's live-input mode (same AudioWorklet library the
+  // offline harmony engine uses, just fed live audio instead of buffers).
+  // Idle-phase only, deliberately separate from the take-recording mic
+  // pipeline below (startRecording) rather than run alongside it — two
+  // concurrent getUserMedia/AudioContext graphs on one device is exactly
+  // the kind of thing mobile browsers choke on (see the concurrent-
+  // AudioContext caution in startRecording). Off by default: it needs
+  // headphones (mic->speaker while the mic stays open will otherwise
+  // howl) and holds an AudioContext + AudioWorklet open the whole time.
+  // Deliberately a *fixed* interval, not tonart-aware — see
+  // liveMonitorSemitonesFor — this is step one of a larger real-time
+  // preview feature; per-note diatonic tracking is future work.
+  const [liveMonitorOn, setLiveMonitorOn] = useState(false);
+  const [liveMonitorStarting, setLiveMonitorStarting] = useState(false);
+  const [liveMonitorError, setLiveMonitorError] = useState('');
+  const [liveMonitorType, setLiveMonitorType] = useState('ters'); // ters | kvint | sext
+  const [liveMonitorLatencyMs, setLiveMonitorLatencyMs] = useState(null);
+  const liveMonitorStreamRef = useRef(null);
+  const liveMonitorCtxRef = useRef(null);
+  const liveMonitorNodeRef = useRef(null);
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -1453,6 +1482,15 @@ export default function App() {
     }).catch(() => {});
     return () => { if (status) status.onchange = null; };
   }, []);
+
+  // Live-monitor is idle-phase-only (see its state declarations above) —
+  // stop it the instant phase moves on (recording starts, a file loads,
+  // ...), and unconditionally on unmount, so its mic stream/AudioContext
+  // never lingers open past the screen it belongs to.
+  useEffect(() => {
+    if (phase !== 'idle' && liveMonitorNodeRef.current) stopLiveMonitor();
+  }, [phase]);
+  useEffect(() => () => stopLiveMonitor(), []);
 
   useEffect(() => {
     return () => {
@@ -1933,6 +1971,102 @@ export default function App() {
       setDenoiseError('Kunde inte brusreducera inspelningen. Testa igen, eller välj en annan del som brusprov.');
     } finally {
       setDenoising(false);
+    }
+  }
+
+  // Fixed semitone shift for a live-monitor interval — the *major-scale*
+  // diatonic distance for that harmony type (e.g. ters -> a major third),
+  // regardless of an actual tonart: there's no analyzed melody yet to
+  // quantize against while the mic is live, so this is a reasonable
+  // constant approximation rather than the real per-note diatonic
+  // interval the offline harmony engine computes (see buildRatioCurve).
+  function liveMonitorSemitonesFor(type) {
+    const t = HARMONY_TYPES[type];
+    return semitoneForStep(t.steps, MAJOR_INTERVALS) * t.defaultDirection;
+  }
+
+  // Pushes the current liveMonitorType's interval to an already-running
+  // node. Scheduled slightly ahead of "now" (per the library's own
+  // latency() advice) so the change lands as a clean transition instead of
+  // a soft catch-up. node.latency() is itself async (a worklet round-trip,
+  // not a plain getter) — awaiting it here, rather than e.g. adding it
+  // directly to ctx.currentTime, is load-bearing: a Promise coerced into
+  // arithmetic silently stringifies instead of throwing, which turned
+  // `output` into "12.3[object Promise]" and made every scheduled change a
+  // silent no-op. Guards against the node having been torn down by
+  // stopLiveMonitor while this await was in flight, since schedule() on a
+  // disconnected node (or one whose context already started closing) can
+  // throw. Returns the resolved latency so callers needing it (the initial
+  // start, for the ms readout) don't have to re-await a second round-trip.
+  async function applyLiveMonitorInterval(node, ctx, type) {
+    const latency = await node.latency();
+    if (liveMonitorNodeRef.current !== node) return latency;
+    node.schedule({
+      output: ctx.currentTime + latency,
+      active: true,
+      semitones: liveMonitorSemitonesFor(type),
+      formantCompensation: true,
+      formantBaseHz: 0, // 0 = let the node pitch-track the live voice itself
+    });
+    return latency;
+  }
+
+  function stopLiveMonitor() {
+    setLiveMonitorOn(false);
+    setLiveMonitorLatencyMs(null);
+    if (liveMonitorNodeRef.current) {
+      liveMonitorNodeRef.current.disconnect();
+      liveMonitorNodeRef.current = null;
+    }
+    if (liveMonitorCtxRef.current && liveMonitorCtxRef.current.state !== 'closed') {
+      liveMonitorCtxRef.current.close().catch(() => {});
+    }
+    liveMonitorCtxRef.current = null;
+    if (liveMonitorStreamRef.current) {
+      liveMonitorStreamRef.current.getTracks().forEach((t) => t.stop());
+      liveMonitorStreamRef.current = null;
+    }
+  }
+
+  async function startLiveMonitor() {
+    if (liveMonitorOn || liveMonitorStarting) return;
+    setLiveMonitorError('');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setLiveMonitorError('Den här webbläsaren stödjer inte live-förhandslyssning.');
+      return;
+    }
+    if (micPermission === 'denied') {
+      setLiveMonitorError('Mikrofonåtkomst är blockerad för den här sidan.');
+      return;
+    }
+    setLiveMonitorStarting(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      liveMonitorStreamRef.current = stream;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC({ latencyHint: 'interactive' });
+      liveMonitorCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const node = await SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+      liveMonitorNodeRef.current = node;
+      source.connect(node);
+      node.connect(ctx.destination);
+      node.start();
+      const latency = await applyLiveMonitorInterval(node, ctx, liveMonitorType);
+      setLiveMonitorLatencyMs(Math.round(latency * 1000));
+      setLiveMonitorOn(true);
+    } catch (err) {
+      setLiveMonitorError('Kunde inte starta live-förhandslyssningen. Kontrollera mikrofonbehörigheten.');
+      stopLiveMonitor();
+    } finally {
+      setLiveMonitorStarting(false);
+    }
+  }
+
+  function setLiveMonitorTypeAndApply(type) {
+    setLiveMonitorType(type);
+    if (liveMonitorNodeRef.current && liveMonitorCtxRef.current) {
+      applyLiveMonitorInterval(liveMonitorNodeRef.current, liveMonitorCtxRef.current, type);
     }
   }
 
@@ -3653,6 +3787,42 @@ export default function App() {
                 )}
               </div>
             </div>
+            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+              <div className="flex items-center gap-2">
+                <HeadphonesIcon size={16} />
+                <span className="text-sm font-medium">Live-förhandslyssning</span>
+                <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+                  {liveMonitorStarting ? 'Startar …' : liveMonitorOn && liveMonitorLatencyMs != null ? `${liveMonitorLatencyMs} ms` : 'Kräver hörlurar'}
+                </span>
+                <ToggleSwitch
+                  checked={liveMonitorOn}
+                  onChange={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
+                  disabled={liveMonitorStarting}
+                  accentColor="#55D6C0"
+                />
+              </div>
+              {liveMonitorOn && (
+                <div className="mt-3 pt-3 flex gap-2" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                  {HARMONY_KEYS.map((type) => (
+                    <button
+                      key={type}
+                      onClick={() => setLiveMonitorTypeAndApply(type)}
+                      className="stamma-btn flex-1 rounded-lg py-2 font-body font-medium text-sm"
+                      style={{
+                        backgroundColor: liveMonitorType === type ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                        color: liveMonitorType === type ? '#55D6C0' : '#F1EDE4',
+                        border: liveMonitorType === type ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                      }}
+                    >
+                      {HARMONY_TYPES[type].label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {liveMonitorError && (
+                <p className="mt-2 text-xs" style={{ color: '#FF9B9B' }}>{liveMonitorError}</p>
+              )}
+            </div>
             <button
               onClick={startRecording}
               className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
@@ -4665,6 +4835,16 @@ function MetronomeIcon({ size = 14 }) {
       <path d="M7 21L11 4h2l4 17" />
       <path d="M9.5 13l5-3.5" />
       <circle cx="12" cy="7" r="1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function HeadphonesIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 13v-1a8 8 0 0 1 16 0v1" />
+      <rect x="2.5" y="13" width="5" height="7" rx="2" />
+      <rect x="16.5" y="13" width="5" height="7" rx="2" />
     </svg>
   );
 }
