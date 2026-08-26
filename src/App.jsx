@@ -1122,7 +1122,7 @@ function AboutPage() {
     {
       id: 'live-forhandslyssning',
       title: 'Live-förhandslyssning',
-      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- eller sextavstånd — ett smakprov på hur en stämma skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn, inklusive samma "Humanisera stämmor"-karaktär (vibrato, formant, tonhöjd) om den är påslagen; innan dess (på startskärmen) används istället ett fast intervall utan karaktär, eftersom ingen tonart är känd än. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard.',
+      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- och/eller sextavstånd — valfri kombination, alla samtidigt om du vill — ett smakprov på hur stämmorna skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn, inklusive samma "Humanisera stämmor"-karaktär (vibrato, formant, tonhöjd) om den är påslagen — så flera stämmor samtidigt faktiskt låter som flera olika röster, inte samma röst tredubblad; innan dess (på startskärmen) används istället ett fast intervall utan karaktär, eftersom ingen tonart är känd än. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard — fler samtidiga stämmor kostar mer processorkraft.',
     },
     {
       id: 'tonhojdskurva',
@@ -1381,25 +1381,36 @@ export default function App() {
   //    through.
   //  - fixed-interval fallback (liveMonitorSemitonesFor): no melody to
   //    quantize against yet, so a constant major-scale approximation.
+  //
+  // Any combination of ters/kvint/sext can run at once (liveMonitorTypes)
+  // — one SignalsmithStretch node per active voice, all fed from the same
+  // mic source and summed into one mix bus (liveMonitorMixRef), same
+  // "multiple voices, one mic" shape as the offline Mixer. Each extra
+  // simultaneous voice is a full extra AudioWorklet pitch-shift instance
+  // though, so this is real, additive CPU cost — worth keeping in mind as
+  // the reason this whole feature defaults off.
   const [liveMonitorOn, setLiveMonitorOn] = useState(false);
   const [liveMonitorStarting, setLiveMonitorStarting] = useState(false);
   const [liveMonitorError, setLiveMonitorError] = useState('');
-  const [liveMonitorType, setLiveMonitorType] = useState('ters'); // ters | kvint | sext
+  const [liveMonitorTypes, setLiveMonitorTypes] = useState(() => ({ ters: true, kvint: false, sext: false }));
   const [liveMonitorLatencyMs, setLiveMonitorLatencyMs] = useState(null);
   const liveMonitorKeyAware = !!keyInfo;
   const liveMonitorStreamRef = useRef(null);
   const liveMonitorCtxRef = useRef(null);
-  const liveMonitorNodeRef = useRef(null);
+  const liveMonitorSourceRef = useRef(null);
+  const liveMonitorMixRef = useRef(null);
+  const liveMonitorNodesRef = useRef({}); // { ters?: StretchNode, kvint?: ..., sext?: ... }
   const liveMonitorAnalyserRef = useRef(null);
   const liveMonitorRafRef = useRef(null);
   const liveMonitorLatencySecRef = useRef(0);
-  const liveMonitorTypeRef = useRef(liveMonitorType);
+  const liveMonitorTypesRef = useRef(liveMonitorTypes);
   // The scale step (see musicTheory.js) the pitch-tracking loop currently
   // believes you're singing, and how many consecutive ~35ms frames the
   // *candidate* next step has read stably — re-locking (and rescheduling
-  // a new ratio) only once that candidate has been stable for
-  // LIVE_MONITOR_LOCK_FRAMES frames, so one noisy autocorrelation reading
-  // right at a note boundary can't flap the ratio back and forth.
+  // new ratios for every active voice) only once that candidate has been
+  // stable for LIVE_MONITOR_LOCK_FRAMES frames, so one noisy
+  // autocorrelation reading right at a note boundary can't flap the ratio
+  // back and forth.
   const liveMonitorLockedStepRef = useRef(null);
   const liveMonitorCandidateRef = useRef(null); // { step, count } | null
   // A single formant anchor for the whole live session, computed once at
@@ -1541,7 +1552,7 @@ export default function App() {
   // lingers open past the screen it belongs to.
   useEffect(() => {
     const allowed = phase === 'idle' || phase === 'error' || phase === 'ready';
-    if (!allowed && liveMonitorNodeRef.current) stopLiveMonitor();
+    if (!allowed && liveMonitorCtxRef.current) stopLiveMonitor();
   }, [phase]);
   useEffect(() => () => stopLiveMonitor(), []);
 
@@ -2038,30 +2049,18 @@ export default function App() {
     return semitoneForStep(t.steps, MAJOR_INTERVALS) * t.defaultDirection;
   }
 
-  // Pushes the current liveMonitorType's interval to an already-running
-  // node. Scheduled slightly ahead of "now" (per the library's own
-  // latency() advice) so the change lands as a clean transition instead of
-  // a soft catch-up. node.latency() is itself async (a worklet round-trip,
-  // not a plain getter) — awaiting it here, rather than e.g. adding it
-  // directly to ctx.currentTime, is load-bearing: a Promise coerced into
-  // arithmetic silently stringifies instead of throwing, which turned
-  // `output` into "12.3[object Promise]" and made every scheduled change a
-  // silent no-op. Guards against the node having been torn down by
-  // stopLiveMonitor while this await was in flight, since schedule() on a
-  // disconnected node (or one whose context already started closing) can
-  // throw. Returns the resolved latency so callers needing it (the initial
-  // start, for the ms readout) don't have to re-await a second round-trip.
-  async function applyLiveMonitorInterval(node, ctx, type) {
-    const latency = await node.latency();
-    if (liveMonitorNodeRef.current !== node) return latency;
+  // Schedules the fixed-interval fallback for one voice, using an
+  // already-known latency (liveMonitorLatencySecRef) rather than
+  // re-awaiting node.latency() — see createLiveMonitorVoice for the one
+  // place per session that actually needs the async round-trip.
+  function scheduleLiveMonitorFixedInterval(node, ctx, type) {
     node.schedule({
-      output: ctx.currentTime + latency,
+      output: ctx.currentTime + liveMonitorLatencySecRef.current,
       active: true,
       semitones: liveMonitorSemitonesFor(type),
       formantCompensation: true,
       formantBaseHz: 0, // 0 = let the node pitch-track the live voice itself
     });
-    return latency;
   }
 
   // Same cents formula as harmonyEngine.js's humanizeKeyframes (detune +
@@ -2084,17 +2083,19 @@ export default function App() {
 
   // Schedules a diatonic ratio for `step` (the scale degree the
   // pitch-tracking loop currently believes you're singing) shifted to
-  // `type`'s interval — the live-monitor equivalent of one segment in
-  // harmonyEngine.js's buildRatioCurve, computed on the fly instead of
-  // from a whole pre-analyzed take. Both frequencies come from
-  // scaleStepToMidi (not the raw measured pitch), so the *base* ratio is a
-  // pure function of which note you're on and stays flat while you hold
-  // or vibrato it — applying that flat ratio to the raw live signal is
-  // what carries your own vibrato through instead of cancelling it (see
-  // the LIVE_MONITOR_* constants' comment). humanizeOnRef then layers this
-  // type's fixed detune/wobble/vibrato/formant character on top, same
-  // profile the offline engine gives that voice, so e.g. "ters" sounds
-  // like the same ters here as in the exported mix.
+  // `type`'s interval, on `type`'s own voice node — the live-monitor
+  // equivalent of one segment in harmonyEngine.js's buildRatioCurve,
+  // computed on the fly instead of from a whole pre-analyzed take. Both
+  // frequencies come from scaleStepToMidi (not the raw measured pitch),
+  // so the *base* ratio is a pure function of which note you're on and
+  // stays flat while you hold or vibrato it — applying that flat ratio to
+  // the raw live signal is what carries your own vibrato through instead
+  // of cancelling it (see the LIVE_MONITOR_* constants' comment).
+  // humanizeOnRef then layers this type's fixed detune/wobble/vibrato/
+  // formant character on top, same profile the offline engine gives that
+  // voice, so e.g. "ters" sounds like the same ters here as in the
+  // exported mix — and, singing all three at once, actually sounds like
+  // three different voices rather than one voice tripled.
   function scheduleLiveMonitorRatio(node, ctx, step, type) {
     const key = keyInfoRef.current;
     if (!key) return;
@@ -2118,21 +2119,26 @@ export default function App() {
   // the mic every LIVE_MONITOR_SAMPLE_HOP_SEC via the same autocorrelation
   // pitch tracker startRecording uses for the melody, and re-locks onto a
   // new scale step once it's read LIVE_MONITOR_LOCK_FRAMES times in a row
-  // (debouncing single noisy frames right at a note boundary). Silence/
-  // unvoiced frames are simply skipped for *locking* purposes — the last
-  // locked step holds, which is harmless for a live preview (unlike the
-  // offline engine, this doesn't need to fade to "no shift" for a real
-  // pause). While humanize is on, scheduleLiveMonitorRatio is instead
-  // re-run on *every* tick regardless of whether the note changed — its
-  // wobble/vibrato terms are time-varying and need continuous updates to
-  // be audible while a note is held, the same reason
-  // harmonyEngine.js's humanizeKeyframes inserts extra points through a
-  // long-held note rather than relying on just the note's two endpoints.
-  function startLiveMonitorPitchLoop(node, ctx, analyser) {
+  // (debouncing single noisy frames right at a note boundary). On a lock
+  // change (or every tick, while humanize is on — see below), reschedules
+  // *every currently active voice* from liveMonitorNodesRef, not just one.
+  // Silence/unvoiced frames are simply skipped for locking purposes — the
+  // last locked step holds, which is harmless for a live preview (unlike
+  // the offline engine, this doesn't need to fade to "no shift" for a
+  // real pause). While humanize is on, voices are rescheduled on *every*
+  // tick regardless of whether the note changed — the wobble/vibrato
+  // terms are time-varying and need continuous updates to be audible
+  // while a note is held, the same reason harmonyEngine.js's
+  // humanizeKeyframes inserts extra points through a long-held note
+  // rather than relying on just the note's two endpoints. Keyed off
+  // liveMonitorAnalyserRef (one shared analyser for the whole session,
+  // regardless of how many voices are active) rather than any one voice
+  // node, so it keeps running as voices are toggled on/off mid-session.
+  function startLiveMonitorPitchLoop(ctx, analyser) {
     const buf = new Float32Array(analyser.fftSize);
     let lastSampleTime = -Infinity;
     const tick = () => {
-      if (liveMonitorNodeRef.current !== node) return; // torn down mid-loop
+      if (liveMonitorAnalyserRef.current !== analyser) return; // torn down mid-loop
       const now = ctx.currentTime;
       if (now - lastSampleTime >= LIVE_MONITOR_SAMPLE_HOP_SEC) {
         lastSampleTime = now;
@@ -2154,7 +2160,10 @@ export default function App() {
             }
           }
           if (liveMonitorLockedStepRef.current != null && (justLocked || humanizeOnRef.current)) {
-            scheduleLiveMonitorRatio(node, ctx, liveMonitorLockedStepRef.current, liveMonitorTypeRef.current);
+            const lockedStep = liveMonitorLockedStepRef.current;
+            Object.entries(liveMonitorNodesRef.current).forEach(([voiceType, voiceNode]) => {
+              scheduleLiveMonitorRatio(voiceNode, ctx, lockedStep, voiceType);
+            });
           }
         }
       }
@@ -2176,10 +2185,13 @@ export default function App() {
       liveMonitorAnalyserRef.current.disconnect();
       liveMonitorAnalyserRef.current = null;
     }
-    if (liveMonitorNodeRef.current) {
-      liveMonitorNodeRef.current.disconnect();
-      liveMonitorNodeRef.current = null;
+    Object.values(liveMonitorNodesRef.current).forEach((node) => node.disconnect());
+    liveMonitorNodesRef.current = {};
+    if (liveMonitorMixRef.current) {
+      liveMonitorMixRef.current.disconnect();
+      liveMonitorMixRef.current = null;
     }
+    liveMonitorSourceRef.current = null;
     if (liveMonitorCtxRef.current && liveMonitorCtxRef.current.state !== 'closed') {
       liveMonitorCtxRef.current.close().catch(() => {});
     }
@@ -2188,6 +2200,46 @@ export default function App() {
       liveMonitorStreamRef.current.getTracks().forEach((t) => t.stop());
       liveMonitorStreamRef.current = null;
     }
+  }
+
+  // Creates and wires up one voice's node: source -> node -> the shared
+  // mix bus, started, registered in liveMonitorNodesRef under `type`. Does
+  // NOT schedule an interval itself — callers decide fixed-interval vs.
+  // diatonic depending on whether a tonart/locked note is available yet.
+  // SignalsmithStretch(...) is itself an async worklet round-trip, so a
+  // session can be torn down (stopLiveMonitor, e.g. because phase moved
+  // on mid-start) while this is still in flight — checked here, not just
+  // by callers afterward, since callers only learn the node exists once
+  // this returns: registering/connecting it regardless would leave a
+  // node wired into a mix bus and AudioContext that no longer exist. Also
+  // re-checks liveMonitorTypesRef for this specific `type`, not just the
+  // ctx: a quick toggle-on-then-off of the *same* voice while this await
+  // is in flight leaves ctx untouched (session still running) but the
+  // voice no longer wanted — without this check the node would still get
+  // wired in and started, leaving an inaudible-in-the-UI "ghost" voice
+  // actually playing since liveMonitorTypesRef flips synchronously
+  // (before the await) while this only learns about it after.
+  async function createLiveMonitorVoice(ctx, source, mix, type) {
+    const node = await SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+    if (liveMonitorCtxRef.current !== ctx || !liveMonitorTypesRef.current[type]) {
+      node.disconnect();
+      return node;
+    }
+    liveMonitorNodesRef.current = { ...liveMonitorNodesRef.current, [type]: node };
+    source.connect(node);
+    node.connect(mix);
+    node.start();
+    return node;
+  }
+
+  // Keeps the mix bus from clipping as more simultaneous voices are
+  // summed onto it — equal-power-ish headroom (1/sqrt(n)) per active
+  // voice, recomputed on the fly as voices are toggled (see
+  // toggleLiveMonitorVoice), with a short ramp so a mid-session change
+  // isn't an audible step.
+  function updateLiveMonitorMixGain(ctx, mix) {
+    const activeCount = HARMONY_KEYS.filter((t) => liveMonitorTypesRef.current[t] && liveMonitorNodesRef.current[t]).length;
+    mix.gain.setTargetAtTime(activeCount ? 1 / Math.sqrt(activeCount) : 0, ctx.currentTime, 0.02);
   }
 
   async function startLiveMonitor() {
@@ -2201,6 +2253,11 @@ export default function App() {
       setLiveMonitorError('Mikrofonåtkomst är blockerad för den här sidan.');
       return;
     }
+    const activeTypes = HARMONY_KEYS.filter((t) => liveMonitorTypesRef.current[t]);
+    if (activeTypes.length === 0) {
+      setLiveMonitorError('Välj minst en stämma (ters, kvint eller sext) att förhandslyssna.');
+      return;
+    }
     setLiveMonitorStarting(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -2209,27 +2266,45 @@ export default function App() {
       const ctx = new AC({ latencyHint: 'interactive' });
       liveMonitorCtxRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
-      const node = await SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-      liveMonitorNodeRef.current = node;
-      source.connect(node);
-      node.connect(ctx.destination);
-      node.start();
-      liveMonitorTypeRef.current = liveMonitorType;
-      const latency = await applyLiveMonitorInterval(node, ctx, liveMonitorType);
-      if (liveMonitorNodeRef.current !== node) return; // torn down while awaiting
-      liveMonitorLatencySecRef.current = latency;
-      // A pitch-tracking analyser tap, separate from the node's own audio
-      // path (source -> node -> destination is untouched) — this is a
-      // side branch purely for autoCorrelate to read from.
+      liveMonitorSourceRef.current = source;
+      const mix = ctx.createGain();
+      liveMonitorMixRef.current = mix;
+      mix.connect(ctx.destination);
+
+      // The first voice's latency() is a real async worklet round-trip —
+      // awaiting it here (rather than e.g. adding it directly to
+      // ctx.currentTime) is load-bearing: a Promise coerced into
+      // arithmetic silently stringifies instead of throwing, which turned
+      // `output` into "12.3[object Promise]" and made every scheduled
+      // change a silent no-op. Every other voice (here or added later via
+      // toggleLiveMonitorVoice) reuses this same cached value instead of
+      // re-awaiting — they share one AudioContext/worklet config, so the
+      // latency is the same for all of them.
+      const firstType = activeTypes[0];
+      const firstNode = await createLiveMonitorVoice(ctx, source, mix, firstType);
+      if (liveMonitorCtxRef.current !== ctx) return; // torn down while awaiting
+      liveMonitorLatencySecRef.current = await firstNode.latency();
+      if (liveMonitorCtxRef.current !== ctx) return; // torn down while awaiting
+      scheduleLiveMonitorFixedInterval(firstNode, ctx, firstType);
+      for (const type of activeTypes.slice(1)) {
+        const node = await createLiveMonitorVoice(ctx, source, mix, type);
+        if (liveMonitorCtxRef.current !== ctx) return; // torn down while awaiting
+        scheduleLiveMonitorFixedInterval(node, ctx, type);
+      }
+      updateLiveMonitorMixGain(ctx, mix);
+
+      // A pitch-tracking analyser tap, separate from any voice's own
+      // audio path (source -> node -> mix is untouched) — this is a side
+      // branch purely for autoCorrelate to read from.
       if (keyInfoRef.current) {
         liveMonitorFormantBaseHzRef.current = melodyNotes.length ? formantBaseHzFor(melodyNotes, keyInfoRef.current) : 0;
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 2048;
         source.connect(analyser);
         liveMonitorAnalyserRef.current = analyser;
-        startLiveMonitorPitchLoop(node, ctx, analyser);
+        startLiveMonitorPitchLoop(ctx, analyser);
       }
-      setLiveMonitorLatencyMs(Math.round(latency * 1000));
+      setLiveMonitorLatencyMs(Math.round(liveMonitorLatencySecRef.current * 1000));
       setLiveMonitorOn(true);
     } catch (err) {
       setLiveMonitorError('Kunde inte starta live-förhandslyssningen. Kontrollera mikrofonbehörigheten.');
@@ -2239,17 +2314,36 @@ export default function App() {
     }
   }
 
-  function setLiveMonitorTypeAndApply(type) {
-    setLiveMonitorType(type);
-    liveMonitorTypeRef.current = type;
-    if (!liveMonitorNodeRef.current || !liveMonitorCtxRef.current) return;
-    // Key-aware and already locked onto a note: re-derive this type's
-    // interval from that same note immediately, rather than waiting for
-    // the next note change to pick up the new type.
+  // Toggles one voice (ters/kvint/sext) on or off. Before the monitor is
+  // running, this just updates which voices the next startLiveMonitor()
+  // call will use. While it's already running, adds or removes that
+  // voice's node live, on the same shared mic source/mix bus, without
+  // touching the other active voices or restarting anything.
+  async function toggleLiveMonitorVoice(type) {
+    const next = !liveMonitorTypesRef.current[type];
+    liveMonitorTypesRef.current = { ...liveMonitorTypesRef.current, [type]: next };
+    setLiveMonitorTypes(liveMonitorTypesRef.current);
+    const ctx = liveMonitorCtxRef.current;
+    const mix = liveMonitorMixRef.current;
+    if (!liveMonitorOn || !ctx || !mix) return; // not running — selection just takes effect next start
+    if (!next) {
+      const node = liveMonitorNodesRef.current[type];
+      if (node) {
+        node.disconnect();
+        const rest = { ...liveMonitorNodesRef.current };
+        delete rest[type];
+        liveMonitorNodesRef.current = rest;
+      }
+      updateLiveMonitorMixGain(ctx, mix);
+      return;
+    }
+    const node = await createLiveMonitorVoice(ctx, liveMonitorSourceRef.current, mix, type);
+    if (liveMonitorNodesRef.current[type] !== node) return; // torn down while awaiting
+    updateLiveMonitorMixGain(ctx, mix);
     if (liveMonitorLockedStepRef.current != null && keyInfoRef.current) {
-      scheduleLiveMonitorRatio(liveMonitorNodeRef.current, liveMonitorCtxRef.current, liveMonitorLockedStepRef.current, type);
+      scheduleLiveMonitorRatio(node, ctx, liveMonitorLockedStepRef.current, type);
     } else {
-      applyLiveMonitorInterval(liveMonitorNodeRef.current, liveMonitorCtxRef.current, type);
+      scheduleLiveMonitorFixedInterval(node, ctx, type);
     }
   }
 
@@ -3974,13 +4068,13 @@ export default function App() {
               on={liveMonitorOn}
               starting={liveMonitorStarting}
               error={liveMonitorError}
-              type={liveMonitorType}
+              types={liveMonitorTypes}
               latencyMs={liveMonitorLatencyMs}
               keyAware={liveMonitorKeyAware}
               keyInfo={keyInfo}
               humanizeOn={humanizeOn}
               onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
-              onSelectType={setLiveMonitorTypeAndApply}
+              onToggleType={toggleLiveMonitorVoice}
             />
             <button
               onClick={startRecording}
@@ -4080,13 +4174,13 @@ export default function App() {
               on={liveMonitorOn}
               starting={liveMonitorStarting}
               error={liveMonitorError}
-              type={liveMonitorType}
+              types={liveMonitorTypes}
               latencyMs={liveMonitorLatencyMs}
               keyAware={liveMonitorKeyAware}
               keyInfo={keyInfo}
               humanizeOn={humanizeOn}
               onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
-              onSelectType={setLiveMonitorTypeAndApply}
+              onToggleType={toggleLiveMonitorVoice}
             />
             <div>
               <button
@@ -5024,8 +5118,12 @@ function HeadphonesIcon({ size = 14 }) {
 // startLiveMonitor et al.) — same card in both phases, just with
 // `keyAware` reflecting whether a tonart is established yet (only true
 // once a take's been analyzed, i.e. never in the idle-phase render).
-function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyInfo, humanizeOn, onToggle, onSelectType }) {
+// `types` is a { ters, kvint, sext } bool map — any combination can be
+// active at once (see toggleLiveMonitorVoice), so the buttons below are
+// independent toggles, not an exclusive choice.
+function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyInfo, humanizeOn, onToggle, onToggleType }) {
   const keyLabel = keyAware && keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
+  const anyActive = HARMONY_KEYS.some((t) => types[t]);
   return (
     <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
       <div className="flex items-center gap-2">
@@ -5042,12 +5140,13 @@ function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyIn
             {HARMONY_KEYS.map((t) => (
               <button
                 key={t}
-                onClick={() => onSelectType(t)}
+                onClick={() => onToggleType(t)}
+                aria-pressed={!!types[t]}
                 className="stamma-btn flex-1 rounded-lg py-2 font-body font-medium text-sm"
                 style={{
-                  backgroundColor: type === t ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                  color: type === t ? '#55D6C0' : '#F1EDE4',
-                  border: type === t ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                  backgroundColor: types[t] ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                  color: types[t] ? '#55D6C0' : '#F1EDE4',
+                  border: types[t] ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
                 }}
               >
                 {HARMONY_TYPES[t].label}
@@ -5055,9 +5154,11 @@ function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyIn
             ))}
           </div>
           <p className="mt-2 font-mono-ui text-[11px]" style={{ color: '#C7CBDA' }}>
-            {keyLabel
-              ? `Tonartsanpassad (${keyLabel})${humanizeOn ? ', humaniserad röstkaraktär' : ''} — följer tonhöjden du sjunger.`
-              : 'Fast intervall (ingen tonart känd ännu).'}
+            {!anyActive
+              ? 'Ingen stämma vald — tyst tills du väljer en.'
+              : keyLabel
+                ? `Tonartsanpassad (${keyLabel})${humanizeOn ? ', humaniserad röstkaraktär' : ''} — följer tonhöjden du sjunger.`
+                : 'Fast intervall (ingen tonart känd ännu).'}
           </p>
         </div>
       )}
