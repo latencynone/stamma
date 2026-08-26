@@ -3087,6 +3087,68 @@ export default function App() {
                     />
                     <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{effectiveTrimEnd.toFixed(1)}s</span>
                   </div>
+
+                  <div className="mt-3 pt-3 relative" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                    <div className="flex items-center gap-1.5">
+                      <MetronomeIcon size={14} />
+                      <button
+                        onClick={() => setMetronomeExpanded((v) => !v)}
+                        className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
+                        style={{ color: '#C7CBDA' }}
+                      >
+                        {metronomeBpm} BPM
+                        <span style={{ display: 'inline-block', fontSize: 15, transform: metronomeExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                      </button>
+                    </div>
+                    {metronomeExpanded && (
+                      <div
+                        className="absolute z-10 mt-2 rounded-xl p-3"
+                        style={{ width: 220, backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
+                      >
+                        <div className="flex items-center justify-center gap-4">
+                          <button
+                            onClick={() => adjustMetronomeBpm(-1)}
+                            className="stamma-btn rounded-md flex items-center justify-center"
+                            style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                            aria-label="Sänk takt"
+                          >
+                            −
+                          </button>
+                          <BpmInput
+                            value={metronomeBpm}
+                            onCommit={setMetronomeBpmTo}
+                            className="font-mono-ui text-lg"
+                            style={{ minWidth: 56, color: '#F1EDE4' }}
+                          />
+                          <button
+                            onClick={() => adjustMetronomeBpm(1)}
+                            className="stamma-btn rounded-md flex items-center justify-center"
+                            style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                            aria-label="Höj takt"
+                          >
+                            +
+                          </button>
+                        </div>
+                        {tempoDetected && (
+                          <div className="mt-1.5 text-center font-mono-ui text-[10px]" style={{ color: '#55D6C0' }}>
+                            Upptäckt från inspelningen
+                          </div>
+                        )}
+                        <button
+                          onClick={toggleMetronomeListen}
+                          className="stamma-btn w-full mt-3 rounded-lg py-1.5 flex items-center justify-center gap-1.5 font-body font-medium text-xs"
+                          style={{
+                            backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                            color: metronomeListening ? '#55D6C0' : '#F1EDE4',
+                            border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                          }}
+                        >
+                          {metronomeListening ? <PauseIcon size={13} /> : <PlayIcon size={13} />}
+                          {metronomeListening ? 'Stoppa' : 'Lyssna'}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </>
@@ -3473,67 +3535,7 @@ export default function App() {
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
               </p>
 
-              <div className="flex items-center justify-between mb-2 gap-2">
-                <div className="relative">
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      onClick={() => setMetronomeExpanded((v) => !v)}
-                      className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
-                      style={{ color: '#C7CBDA' }}
-                    >
-                      {metronomeBpm} BPM
-                      <span style={{ display: 'inline-block', fontSize: 15, transform: metronomeExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
-                    </button>
-                  </div>
-                  {metronomeExpanded && (
-                    <div
-                      className="absolute z-10 mt-2 rounded-xl p-3"
-                      style={{ width: 220, backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
-                    >
-                      <div className="flex items-center justify-center gap-4">
-                        <button
-                          onClick={() => adjustMetronomeBpm(-1)}
-                          className="stamma-btn rounded-md flex items-center justify-center"
-                          style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
-                          aria-label="Sänk takt"
-                        >
-                          −
-                        </button>
-                        <BpmInput
-                          value={metronomeBpm}
-                          onCommit={setMetronomeBpmTo}
-                          className="font-mono-ui text-lg"
-                          style={{ minWidth: 56, color: '#F1EDE4' }}
-                        />
-                        <button
-                          onClick={() => adjustMetronomeBpm(1)}
-                          className="stamma-btn rounded-md flex items-center justify-center"
-                          style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
-                          aria-label="Höj takt"
-                        >
-                          +
-                        </button>
-                      </div>
-                      {tempoDetected && (
-                        <div className="mt-1.5 text-center font-mono-ui text-[10px]" style={{ color: '#55D6C0' }}>
-                          Upptäckt från inspelningen
-                        </div>
-                      )}
-                      <button
-                        onClick={toggleMetronomeListen}
-                        className="stamma-btn w-full mt-3 rounded-lg py-1.5 flex items-center justify-center gap-1.5 font-body font-medium text-xs"
-                        style={{
-                          backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                          color: metronomeListening ? '#55D6C0' : '#F1EDE4',
-                          border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                        }}
-                      >
-                        {metronomeListening ? <PauseIcon size={13} /> : <PlayIcon size={13} />}
-                        {metronomeListening ? 'Stoppa' : 'Lyssna'}
-                      </button>
-                    </div>
-                  )}
-                </div>
+              <div className="flex items-center justify-end mb-2 gap-2">
                 <button
                   onClick={toggleAllChannelsExpanded}
                   className="stamma-btn flex items-center gap-1 font-mono-ui text-xs shrink-0"
@@ -3630,8 +3632,6 @@ export default function App() {
                   onPlayPause={togglePlayPause}
                   disabled={!anyChannelEnabled}
                   busy={anyHarmonyBusy || autotuneRendering}
-                  metronomeEnabled={metronomeEnabled}
-                  onToggleMetronome={toggleMetronomeEnabled}
                 />
               </div>
                 </>
