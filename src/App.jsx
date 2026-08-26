@@ -1052,6 +1052,17 @@ function WaveformTrimmer({
 
 const DURATION = 10;
 
+// Live-monitor pitch-tracking loop (see liveMonitorPitchLoop): how often
+// it samples the mic for a pitch reading, and how many consecutive
+// readings of the *same* scale step it needs before actually re-locking
+// onto it — same autocorrelation-noise reasoning as the offline engine's
+// per-note ratio (see harmonyEngine.js), just applied live: a single
+// stray reading right at a note boundary shouldn't flap the shift ratio
+// back and forth.
+const LIVE_MONITOR_SAMPLE_HOP_SEC = 0.035;
+const LIVE_MONITOR_LOCK_FRAMES = 3;
+const LIVE_MONITOR_RMS_THRESHOLD = 0.0035; // matches ENERGY_RMS_THRESHOLD in harmonyEngine.js
+
 // Strength stops for autotune once it's switched on — the on/off state
 // itself is a separate toggle (autotuneOn), so this is just the "tre
 // nivåer" of partial correction strength, expressed as the same 0..1
@@ -1111,7 +1122,7 @@ function AboutPage() {
     {
       id: 'live-forhandslyssning',
       title: 'Live-förhandslyssning',
-      body: 'Innan du spelar in kan du slå på en direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ett fast tersavstånd, kvintavstånd eller sextavstånd — ett smakprov på hur en stämma skulle låta, utan att behöva spela in och vänta på den vanliga (mer noggranna, tonartsanpassade) stämmemotorn. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard.',
+      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- eller sextavstånd — ett smakprov på hur en stämma skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn; innan dess (på startskärmen) används istället ett fast intervall, eftersom ingen tonart är känd än. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard.',
     },
     {
       id: 'tonhojdskurva',
@@ -1348,24 +1359,51 @@ export default function App() {
   // Live-monitor: a real-time mic -> pitch-shift -> speaker/headphone loop
   // via SignalsmithStretch's live-input mode (same AudioWorklet library the
   // offline harmony engine uses, just fed live audio instead of buffers).
-  // Idle-phase only, deliberately separate from the take-recording mic
-  // pipeline below (startRecording) rather than run alongside it — two
+  // Idle/ready-phase only, deliberately separate from the take-recording
+  // mic pipeline below (startRecording) rather than run alongside it — two
   // concurrent getUserMedia/AudioContext graphs on one device is exactly
   // the kind of thing mobile browsers choke on (see the concurrent-
   // AudioContext caution in startRecording). Off by default: it needs
   // headphones (mic->speaker while the mic stays open will otherwise
   // howl) and holds an AudioContext + AudioWorklet open the whole time.
-  // Deliberately a *fixed* interval, not tonart-aware — see
-  // liveMonitorSemitonesFor — this is step one of a larger real-time
-  // preview feature; per-note diatonic tracking is future work.
+  //
+  // Two modes, chosen once at startLiveMonitor() time from whether a
+  // tonart is already known (never true in the idle-phase render, always
+  // true in the ready-phase one — see liveMonitorKeyAware):
+  //  - key-aware: a live pitch-tracking loop (liveMonitorPitchLoop) locks
+  //    onto whichever scale degree you're currently singing and derives
+  //    the harmony ratio the same way the offline engine does — a *flat*
+  //    ratio between two scale-quantized frequencies, applied to the raw
+  //    live signal. Flat-per-note (not chasing the raw pitch every frame)
+  //    is deliberate, for the same reason buildRatioCurveFromSegments'
+  //    doc comment gives: re-deriving the ratio from instantaneous pitch
+  //    every frame would cancel your own vibrato instead of carrying it
+  //    through.
+  //  - fixed-interval fallback (liveMonitorSemitonesFor): no melody to
+  //    quantize against yet, so a constant major-scale approximation.
   const [liveMonitorOn, setLiveMonitorOn] = useState(false);
   const [liveMonitorStarting, setLiveMonitorStarting] = useState(false);
   const [liveMonitorError, setLiveMonitorError] = useState('');
   const [liveMonitorType, setLiveMonitorType] = useState('ters'); // ters | kvint | sext
   const [liveMonitorLatencyMs, setLiveMonitorLatencyMs] = useState(null);
+  const liveMonitorKeyAware = !!keyInfo;
   const liveMonitorStreamRef = useRef(null);
   const liveMonitorCtxRef = useRef(null);
   const liveMonitorNodeRef = useRef(null);
+  const liveMonitorAnalyserRef = useRef(null);
+  const liveMonitorRafRef = useRef(null);
+  const liveMonitorLatencySecRef = useRef(0);
+  const liveMonitorTypeRef = useRef(liveMonitorType);
+  // The scale step (see musicTheory.js) the pitch-tracking loop currently
+  // believes you're singing, and how many consecutive ~35ms frames the
+  // *candidate* next step has read stably — re-locking (and rescheduling
+  // a new ratio) only once that candidate has been stable for
+  // LIVE_MONITOR_LOCK_FRAMES frames, so one noisy autocorrelation reading
+  // right at a note boundary can't flap the ratio back and forth.
+  const liveMonitorLockedStepRef = useRef(null);
+  const liveMonitorCandidateRef = useRef(null); // { step, count } | null
+  const keyInfoRef = useRef(keyInfo);
+  const channelsRef = useRef(channels);
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -1468,6 +1506,12 @@ export default function App() {
     metronomeBpmRef.current = metronomeBpm;
   }, [metronomeBpm]);
 
+  // Read by the live-monitor pitch-tracking loop (liveMonitorPitchLoop),
+  // which runs across many animation frames and would otherwise close
+  // over whatever keyInfo/channels were current when it started.
+  useEffect(() => { keyInfoRef.current = keyInfo; }, [keyInfo]);
+  useEffect(() => { channelsRef.current = channels; }, [channels]);
+
   // The browser remembers a granted/denied microphone permission on its own
   // (that's an origin-level browser decision, not something a site can
   // configure) — this just lets the UI react to that state instead of
@@ -1483,12 +1527,14 @@ export default function App() {
     return () => { if (status) status.onchange = null; };
   }, []);
 
-  // Live-monitor is idle-phase-only (see its state declarations above) —
-  // stop it the instant phase moves on (recording starts, a file loads,
-  // ...), and unconditionally on unmount, so its mic stream/AudioContext
-  // never lingers open past the screen it belongs to.
+  // Live-monitor only renders on the idle/error (no take yet) and ready
+  // (take analyzed) screens — stop it the instant phase moves to anything
+  // else (a take starts recording, a file's being analyzed, ...), and
+  // unconditionally on unmount, so its mic stream/AudioContext never
+  // lingers open past the screen it belongs to.
   useEffect(() => {
-    if (phase !== 'idle' && liveMonitorNodeRef.current) stopLiveMonitor();
+    const allowed = phase === 'idle' || phase === 'error' || phase === 'ready';
+    if (!allowed && liveMonitorNodeRef.current) stopLiveMonitor();
   }, [phase]);
   useEffect(() => () => stopLiveMonitor(), []);
 
@@ -2011,9 +2057,85 @@ export default function App() {
     return latency;
   }
 
+  // Schedules a flat diatonic ratio for `step` (the scale degree the
+  // pitch-tracking loop just locked onto) shifted to `type`'s interval —
+  // the live-monitor equivalent of one segment in harmonyEngine.js's
+  // buildRatioCurve, just computed on the fly instead of from a whole
+  // pre-analyzed take. Both frequencies come from scaleStepToMidi (not
+  // the raw measured pitch), so the ratio is a pure function of *which*
+  // note you're on and stays flat while you hold or vibrato on it —
+  // applying that flat ratio to the raw live signal is what carries your
+  // vibrato through instead of cancelling it (see the LIVE_MONITOR_*
+  // constants' comment).
+  function scheduleLiveMonitorRatio(node, ctx, step, type) {
+    const key = keyInfoRef.current;
+    if (!key) return;
+    const dir = channelsRef.current[type]?.direction ?? HARMONY_TYPES[type].defaultDirection;
+    const hStep = step + dir * HARMONY_TYPES[type].steps;
+    const melodyFreq = midiToFreq(scaleStepToMidi(step, key.tonic, key.mode));
+    const harmonyFreq = midiToFreq(scaleStepToMidi(hStep, key.tonic, key.mode));
+    node.schedule({
+      output: ctx.currentTime + liveMonitorLatencySecRef.current,
+      active: true,
+      semitones: 12 * Math.log2(harmonyFreq / melodyFreq),
+      formantCompensation: true,
+      formantBaseHz: 0,
+    });
+  }
+
+  // Runs for the lifetime of a key-aware live-monitor session: samples
+  // the mic every LIVE_MONITOR_SAMPLE_HOP_SEC via the same autocorrelation
+  // pitch tracker startRecording uses for the melody, and re-locks
+  // scheduleLiveMonitorRatio onto a new scale step once it's read
+  // LIVE_MONITOR_LOCK_FRAMES times in a row (debouncing single noisy
+  // frames right at a note boundary). Silence/unvoiced frames are simply
+  // skipped — the last locked ratio holds, which is harmless for a live
+  // preview (unlike the offline engine, this doesn't need to fade to "no
+  // shift" for a real pause).
+  function startLiveMonitorPitchLoop(node, ctx, analyser) {
+    const buf = new Float32Array(analyser.fftSize);
+    let lastSampleTime = -Infinity;
+    const tick = () => {
+      if (liveMonitorNodeRef.current !== node) return; // torn down mid-loop
+      const now = ctx.currentTime;
+      if (now - lastSampleTime >= LIVE_MONITOR_SAMPLE_HOP_SEC) {
+        lastSampleTime = now;
+        const key = keyInfoRef.current;
+        if (key) {
+          analyser.getFloatTimeDomainData(buf);
+          const { freq, rms } = autoCorrelate(buf, ctx.sampleRate);
+          if (freq > 55 && freq < 1200 && rms > LIVE_MONITOR_RMS_THRESHOLD) {
+            const step = midiToScaleStep(freqToMidi(freq), key.tonic, key.mode);
+            const candidate = liveMonitorCandidateRef.current;
+            liveMonitorCandidateRef.current = candidate && candidate.step === step
+              ? { step, count: candidate.count + 1 }
+              : { step, count: 1 };
+            if (liveMonitorCandidateRef.current.count >= LIVE_MONITOR_LOCK_FRAMES
+              && liveMonitorLockedStepRef.current !== step) {
+              liveMonitorLockedStepRef.current = step;
+              scheduleLiveMonitorRatio(node, ctx, step, liveMonitorTypeRef.current);
+            }
+          }
+        }
+      }
+      liveMonitorRafRef.current = requestAnimationFrame(tick);
+    };
+    liveMonitorRafRef.current = requestAnimationFrame(tick);
+  }
+
   function stopLiveMonitor() {
     setLiveMonitorOn(false);
     setLiveMonitorLatencyMs(null);
+    if (liveMonitorRafRef.current) {
+      cancelAnimationFrame(liveMonitorRafRef.current);
+      liveMonitorRafRef.current = null;
+    }
+    liveMonitorLockedStepRef.current = null;
+    liveMonitorCandidateRef.current = null;
+    if (liveMonitorAnalyserRef.current) {
+      liveMonitorAnalyserRef.current.disconnect();
+      liveMonitorAnalyserRef.current = null;
+    }
     if (liveMonitorNodeRef.current) {
       liveMonitorNodeRef.current.disconnect();
       liveMonitorNodeRef.current = null;
@@ -2052,7 +2174,20 @@ export default function App() {
       source.connect(node);
       node.connect(ctx.destination);
       node.start();
+      liveMonitorTypeRef.current = liveMonitorType;
       const latency = await applyLiveMonitorInterval(node, ctx, liveMonitorType);
+      if (liveMonitorNodeRef.current !== node) return; // torn down while awaiting
+      liveMonitorLatencySecRef.current = latency;
+      // A pitch-tracking analyser tap, separate from the node's own audio
+      // path (source -> node -> destination is untouched) — this is a
+      // side branch purely for autoCorrelate to read from.
+      if (keyInfoRef.current) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        source.connect(analyser);
+        liveMonitorAnalyserRef.current = analyser;
+        startLiveMonitorPitchLoop(node, ctx, analyser);
+      }
       setLiveMonitorLatencyMs(Math.round(latency * 1000));
       setLiveMonitorOn(true);
     } catch (err) {
@@ -2065,7 +2200,14 @@ export default function App() {
 
   function setLiveMonitorTypeAndApply(type) {
     setLiveMonitorType(type);
-    if (liveMonitorNodeRef.current && liveMonitorCtxRef.current) {
+    liveMonitorTypeRef.current = type;
+    if (!liveMonitorNodeRef.current || !liveMonitorCtxRef.current) return;
+    // Key-aware and already locked onto a note: re-derive this type's
+    // interval from that same note immediately, rather than waiting for
+    // the next note change to pick up the new type.
+    if (liveMonitorLockedStepRef.current != null && keyInfoRef.current) {
+      scheduleLiveMonitorRatio(liveMonitorNodeRef.current, liveMonitorCtxRef.current, liveMonitorLockedStepRef.current, type);
+    } else {
       applyLiveMonitorInterval(liveMonitorNodeRef.current, liveMonitorCtxRef.current, type);
     }
   }
@@ -3787,42 +3929,17 @@ export default function App() {
                 )}
               </div>
             </div>
-            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
-              <div className="flex items-center gap-2">
-                <HeadphonesIcon size={16} />
-                <span className="text-sm font-medium">Live-förhandslyssning</span>
-                <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
-                  {liveMonitorStarting ? 'Startar …' : liveMonitorOn && liveMonitorLatencyMs != null ? `${liveMonitorLatencyMs} ms` : 'Kräver hörlurar'}
-                </span>
-                <ToggleSwitch
-                  checked={liveMonitorOn}
-                  onChange={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
-                  disabled={liveMonitorStarting}
-                  accentColor="#55D6C0"
-                />
-              </div>
-              {liveMonitorOn && (
-                <div className="mt-3 pt-3 flex gap-2" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
-                  {HARMONY_KEYS.map((type) => (
-                    <button
-                      key={type}
-                      onClick={() => setLiveMonitorTypeAndApply(type)}
-                      className="stamma-btn flex-1 rounded-lg py-2 font-body font-medium text-sm"
-                      style={{
-                        backgroundColor: liveMonitorType === type ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                        color: liveMonitorType === type ? '#55D6C0' : '#F1EDE4',
-                        border: liveMonitorType === type ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
-                      }}
-                    >
-                      {HARMONY_TYPES[type].label}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {liveMonitorError && (
-                <p className="mt-2 text-xs" style={{ color: '#FF9B9B' }}>{liveMonitorError}</p>
-              )}
-            </div>
+            <LiveMonitorCard
+              on={liveMonitorOn}
+              starting={liveMonitorStarting}
+              error={liveMonitorError}
+              type={liveMonitorType}
+              latencyMs={liveMonitorLatencyMs}
+              keyAware={liveMonitorKeyAware}
+              keyInfo={keyInfo}
+              onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
+              onSelectType={setLiveMonitorTypeAndApply}
+            />
             <button
               onClick={startRecording}
               className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
@@ -3917,6 +4034,17 @@ export default function App() {
         {/* Ready: sound mode, mixer, export */}
         {phase === 'ready' && (
           <div className="space-y-5">
+            <LiveMonitorCard
+              on={liveMonitorOn}
+              starting={liveMonitorStarting}
+              error={liveMonitorError}
+              type={liveMonitorType}
+              latencyMs={liveMonitorLatencyMs}
+              keyAware={liveMonitorKeyAware}
+              keyInfo={keyInfo}
+              onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
+              onSelectType={setLiveMonitorTypeAndApply}
+            />
             <div>
               <button
                 onClick={() => setLjudExpanded((v) => !v)}
@@ -4846,6 +4974,50 @@ function HeadphonesIcon({ size = 14 }) {
       <rect x="2.5" y="13" width="5" height="7" rx="2" />
       <rect x="16.5" y="13" width="5" height="7" rx="2" />
     </svg>
+  );
+}
+
+// Idle/ready-phase card for the live pitch-shift monitor (see
+// startLiveMonitor et al.) — same card in both phases, just with
+// `keyAware` reflecting whether a tonart is established yet (only true
+// once a take's been analyzed, i.e. never in the idle-phase render).
+function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyInfo, onToggle, onSelectType }) {
+  const keyLabel = keyAware && keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
+  return (
+    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+      <div className="flex items-center gap-2">
+        <HeadphonesIcon size={16} />
+        <span className="text-sm font-medium">Live-förhandslyssning</span>
+        <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+          {starting ? 'Startar …' : on && latencyMs != null ? `${latencyMs} ms` : 'Kräver hörlurar'}
+        </span>
+        <ToggleSwitch checked={on} onChange={onToggle} disabled={starting} accentColor="#55D6C0" />
+      </div>
+      {on && (
+        <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+          <div className="flex gap-2">
+            {HARMONY_KEYS.map((t) => (
+              <button
+                key={t}
+                onClick={() => onSelectType(t)}
+                className="stamma-btn flex-1 rounded-lg py-2 font-body font-medium text-sm"
+                style={{
+                  backgroundColor: type === t ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
+                  color: type === t ? '#55D6C0' : '#F1EDE4',
+                  border: type === t ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                }}
+              >
+                {HARMONY_TYPES[t].label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 font-mono-ui text-[11px]" style={{ color: '#C7CBDA' }}>
+            {keyLabel ? `Tonartsanpassad (${keyLabel}) — följer tonhöjden du sjunger.` : 'Fast intervall (ingen tonart känd ännu).'}
+          </p>
+        </div>
+      )}
+      {error && <p className="mt-2 text-xs" style={{ color: '#FF9B9B' }}>{error}</p>}
+    </div>
   );
 }
 
