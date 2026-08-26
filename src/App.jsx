@@ -1305,6 +1305,7 @@ export default function App() {
   const autotuneRenderPromiseRef = useRef(null);
   const fileInputRef = useRef(null);
   const loopEnabledRef = useRef(false);
+  const isPlayingRef = useRef(false);
   const ownTakeBuffersRef = useRef({}); // { ters, kvint, sext } -> AudioBuffer | null
   const ownTakeStreamRef = useRef(null);
   const ownTakeRecorderRef = useRef(null);
@@ -1327,6 +1328,9 @@ export default function App() {
   useEffect(() => {
     loopEnabledRef.current = loopEnabled;
   }, [loopEnabled]);
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
 
   // Same staleness problem as loopEnabledRef, for the same reason: a loop
   // restart calls the startMix() closure that existed when the *previous*
@@ -2196,6 +2200,25 @@ export default function App() {
     if (!ctx || ctx.state === 'closed') {
       const AC = window.AudioContext || window.webkitAudioContext;
       ctx = new AC();
+      // A context the browser suspends on its own mid-playback (a tab
+      // backgrounded long enough to be reclaimed, an OS audio-focus change,
+      // a laptop lid closing) otherwise leaves the transport UI stuck
+      // showing "Pausa" over silence with nothing to notice or recover —
+      // suspend()/resume() is a true pause/continue of Web Audio's own
+      // clock (already-scheduled nodes keep their exact place, so resuming
+      // needs no position recalculation), so recovery is just calling
+      // resume(); only fall back to a clean stopped state if that itself
+      // fails. `metronomeSchedulerRef` covers the other three things this
+      // context alone ever drives audibly — a "Hitta takten"/"Lyssna"
+      // preview, the click during an actual recording, and a mix-synced
+      // click (see startMix) — since all three keep it non-null exactly
+      // while a click should be sounding. A context that's supposed to be
+      // idle suspending on its own is normal, not a problem to react to.
+      ctx.onstatechange = () => {
+        if (ctx.state === 'suspended' && (isPlayingRef.current || metronomeSchedulerRef.current)) {
+          ctx.resume().catch(() => stopPlayback());
+        }
+      };
       playCtxRef.current = ctx;
     }
     if (ctx.state === 'suspended') {
