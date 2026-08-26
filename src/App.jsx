@@ -1290,6 +1290,11 @@ export default function App() {
   const meterRefs = useRef({});
   const meterScratchRef = useRef(null);
   const recordedBufferRef = useRef(null);
+  // { buffer, blob } — the last WAV encode done for autosave, so a save
+  // triggered by something that isn't the audio itself (a mixer volume
+  // nudge, a reverb toggle) doesn't re-encode the same several-hundred-KB
+  // buffer from scratch every time. See the autosave effect below.
+  const autosaveWavCacheRef = useRef(null);
   // The untouched decode, kept alongside recordedBufferRef (the "current
   // working" buffer everything else reads from) so normalize/noise
   // reduction — both one-shot, destructive operations — have something to
@@ -1409,10 +1414,24 @@ export default function App() {
     if (phase !== 'ready' || !recordedBufferRef.current || restorableSession) return undefined;
     const buffer = recordedBufferRef.current;
     const timer = setTimeout(() => {
+      // A save can be triggered by any of this effect's many dependencies
+      // (a mixer volume drag, a reverb toggle) — most of which leave the
+      // actual recorded audio untouched, so re-encoding it to WAV every
+      // time would be pure waste. Only re-encode when the buffer itself
+      // (identity, not deep-equal — every real edit path replaces it
+      // wholesale, see applyProcessedRecording/revertToOriginalRecording)
+      // has actually changed since the last save.
+      let blob;
+      if (autosaveWavCacheRef.current?.buffer === buffer) {
+        blob = autosaveWavCacheRef.current.blob;
+      } else {
+        blob = audioBufferToWavBlob(buffer);
+        autosaveWavCacheRef.current = { buffer, blob };
+      }
       saveSession({
         version: 1,
         savedAt: Date.now(),
-        audio: audioBufferToWavBlob(buffer),
+        audio: blob,
         soundType,
         autotuneOn,
         autotuneLevelIndex,
