@@ -2030,7 +2030,18 @@ export default function App() {
     }
     setKeyInfo(result.key);
     setMelodyNotes(result.notes);
-    applyDetectedTempo(result.notes);
+    // The count-in and (if the toggle was on) the click running through the
+    // whole take already anchored this recording to metronomeBpm — an
+    // auto-detect guess right afterward can easily land a beat or two off
+    // from that (natural timing variance) and would otherwise silently
+    // overwrite the exact tempo just actually sung to. Only guess when no
+    // tempo was already committed to, same as the file-upload path (which
+    // has no such commitment to preserve).
+    if (metronomeEnabledRef.current) {
+      setTempoDetected(false);
+    } else {
+      applyDetectedTempo(result.notes);
+    }
     setPhase('ready');
     setNoteViewExpanded(true);
   }
