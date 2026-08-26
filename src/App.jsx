@@ -1128,7 +1128,7 @@ function AboutPage() {
     {
       id: 'egen-stamma',
       title: 'Spela in egen stämma',
-      body: 'Rec-knappen på en stämmas kanal spelar in dig själv sjungandes just den stämman, med melodin i hörlurarna/högtalaren som stöd samtidigt. Din inspelade stämma dyker upp som en egen kanal ("Egen ters" osv.) och spelas upp precis som du sjöng den, utan pitchskiftning — du kan radera den och spela in igen när du vill.',
+      body: 'Rec-knappen på en stämmas kanal spelar in dig själv sjungandes just den stämman, med melodin i hörlurarna/högtalaren som stöd samtidigt. Din inspelade stämma dyker upp som en egen kanal ("Egen ters" osv.) och spelas upp precis som du sjöng den, utan pitchskiftning — du kan radera den och spela in igen när du vill. Fäll ut kanalen så visas samma vågform-verktyg som för huvudinspelningen, med egen beskärning och tona in/ut — bra för att putsa bort en falskstart eller ett andningsljud i början utan att spela in om hela tagningen.',
     },
     {
       id: 'autotune',
@@ -1320,6 +1320,7 @@ export default function App() {
   const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countingIn, countInBeat, countdown } | null
   const [ownTakeError, setOwnTakeError] = useState('');
   const [ownTakeAligningByType, setOwnTakeAligningByType] = useState({}); // { ters, kvint, sext } -> bool, see alignOwnTake
+  const [ownTakeWaveformPeaksByType, setOwnTakeWaveformPeaksByType] = useState({}); // { ters, kvint, sext } -> Float32Array, for that channel's own WaveformTrimmer
   // A session found in IndexedDB at mount, offered via a dismissible
   // banner — never applied automatically. Cleared (both from state and the
   // DB) once the user restores or dismisses it.
@@ -2606,7 +2607,15 @@ export default function App() {
       const reverbBus = createReverbBus(offlineCtx, reverbOn, REVERB_LEVELS[reverbLevelIndex]);
       const now = 0.05;
       usable.forEach(({ key, content }) => {
-        startMixChannelWithContent(offlineCtx, key, now, channels[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, rangeStart, reverbBus.input, false);
+        // Mirrors startMix's per-channel trim/fade override (an own-take's
+        // WaveformTrimmer) — the export should match what actually plays.
+        const chState = channels[key];
+        const chRangeStart = chState.trimStart != null ? Math.max(rangeStart, Math.min(chState.trimStart, rangeEnd)) : rangeStart;
+        const chRangeEnd = chState.trimEnd != null ? Math.max(chRangeStart + 0.05, Math.min(chState.trimEnd, rangeEnd)) : rangeEnd;
+        const chFadeIn = chState.fadeIn != null ? chState.fadeIn : fadeIn;
+        const chFadeOut = chState.fadeOut != null ? chState.fadeOut : fadeOut;
+        const chNow = now + (chRangeStart - rangeStart);
+        startMixChannelWithContent(offlineCtx, key, chNow, chState, content, chRangeStart, chRangeEnd, chFadeIn, chFadeOut, chRangeStart, reverbBus.input, false);
       });
 
       const rendered = await offlineCtx.startRendering();
@@ -2793,7 +2802,22 @@ export default function App() {
     const started = [];
     usable.forEach(({ key, content }) => {
       try {
-        started.push(startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom, reverbBus.input));
+        const chState = channelsState[key];
+        // An own-take channel's WaveformTrimmer (see MixerChannel's
+        // `waveform` slot) can narrow its own window inside the shared
+        // one — trimStart/trimEnd/fadeIn/fadeOut null means "use the
+        // shared window", same as every other channel.
+        const chRangeStart = chState.trimStart != null ? Math.max(rangeStart, Math.min(chState.trimStart, rangeEnd)) : rangeStart;
+        const chRangeEnd = chState.trimEnd != null ? Math.max(chRangeStart + 0.05, Math.min(chState.trimEnd, rangeEnd)) : rangeEnd;
+        const chFadeIn = chState.fadeIn != null ? chState.fadeIn : fadeIn;
+        const chFadeOut = chState.fadeOut != null ? chState.fadeOut : fadeOut;
+        // A channel's own trim can start later than the shared playhead
+        // (playFrom) — e.g. seeking to the very start while this take is
+        // trimmed to skip a false start — so it needs its own delayed
+        // start instead of beginning at `now` like every other channel.
+        const chPlayFrom = Math.max(playFrom, chRangeStart);
+        const chNow = now + Math.max(0, chPlayFrom - playFrom);
+        started.push(startMixChannelWithContent(ctx, key, chNow, chState, content, chRangeStart, chRangeEnd, chFadeIn, chFadeOut, chPlayFrom, reverbBus.input));
       } catch (err) {
         console.error(`Kunde inte spela upp kanalen "${key}":`, err);
       }
@@ -3039,8 +3063,13 @@ export default function App() {
         const ownKey = `${type}Own`;
         setChannels((prev) => ({
           ...prev,
-          [ownKey]: prev[ownKey] || { enabled: true, volume: 0.85, pan: 0, solo: false },
+          // trimStart/trimEnd/fadeIn/fadeOut start unset (null) — "use the
+          // shared mix window", same as every other channel already does —
+          // and only diverge once this channel's own WaveformTrimmer is
+          // actually dragged (see startMix's per-channel override).
+          [ownKey]: prev[ownKey] || { enabled: true, volume: 0.85, pan: 0, solo: false, trimStart: null, trimEnd: null, fadeIn: null, fadeOut: null },
         }));
+        setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(audioBuffer) }));
         alignOwnTake(type, audioBuffer);
       } catch (err) {
         setOwnTakeError(`Kunde inte spela in din ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
@@ -3066,6 +3095,9 @@ export default function App() {
       const aligned = await alignOwnTakeToMelody(rawBuffer, melodyNotes, recordingDuration);
       if (ownTakeBuffersRef.current[type] === rawBuffer) {
         ownTakeBuffersRef.current[type] = aligned;
+        if (aligned !== rawBuffer) {
+          setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(aligned) }));
+        }
       }
     } catch (err) {
       // Alignment is a best-effort enhancement on top of an already-usable
@@ -3085,7 +3117,36 @@ export default function App() {
       delete next[ownKey];
       return next;
     });
+    setOwnTakeWaveformPeaksByType((prev) => {
+      if (!(type in prev)) return prev;
+      const next = { ...prev };
+      delete next[type];
+      return next;
+    });
     if (isPlaying) stopPlayback();
+  }
+
+  // Own-take trim/fade only ever narrow the *shared* mix window (see
+  // startMix) — null means "use the shared window", same as every channel
+  // already effectively does before its own WaveformTrimmer is touched.
+  function setOwnTakeTrim(type, trimStart, trimEnd) {
+    const ownKey = `${type}Own`;
+    setChannels((prev) => {
+      if (!prev[ownKey]) return prev;
+      const next = { ...prev, [ownKey]: { ...prev[ownKey], trimStart, trimEnd } };
+      if (isPlaying) restartMix(next);
+      return next;
+    });
+  }
+
+  function setOwnTakeFade(type, fadeIn, fadeOut) {
+    const ownKey = `${type}Own`;
+    setChannels((prev) => {
+      if (!prev[ownKey]) return prev;
+      const next = { ...prev, [ownKey]: { ...prev[ownKey], fadeIn, fadeOut } };
+      if (isPlaying) restartMix(next);
+      return next;
+    });
   }
 
   const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
@@ -3835,6 +3896,29 @@ export default function App() {
                           expanded={!!expandedChannels[ownKey]}
                           onToggleExpanded={() => toggleChannelExpanded(ownKey)}
                           onDelete={() => deleteOwnTake(type)}
+                          waveform={ownTakeWaveformPeaksByType[type] && (
+                            <div className="mt-3 rounded-xl p-3" style={{ backgroundColor: '#10131A', border: '1px solid rgba(241,237,228,0.08)' }}>
+                              <WaveformTrimmer
+                                peaks={ownTakeWaveformPeaksByType[type]}
+                                duration={recordingDuration}
+                                trimStart={ownChannel.trimStart ?? trimStart}
+                                trimEnd={ownChannel.trimEnd ?? effectiveTrimEnd}
+                                onTrimChange={(s, e) => setOwnTakeTrim(type, s, e)}
+                                fadeIn={ownChannel.fadeIn ?? fadeIn}
+                                fadeOut={ownChannel.fadeOut ?? fadeOut}
+                                onFadeChange={(fi, fo) => setOwnTakeFade(type, fi, fo)}
+                                playheadTime={playheadTime}
+                                isPlaying={isPlaying}
+                                onPlayPause={togglePlayPause}
+                                onSeek={seekTo}
+                                playDisabled={!anyChannelEnabled}
+                                onStop={() => stopPlayback()}
+                                loopEnabled={loopEnabled}
+                                onToggleLoop={() => setLoopEnabled((v) => !v)}
+                                busy={ownTakeAligningByType[type]}
+                              />
+                            </div>
+                          )}
                         />
                       ),
                   ].filter(Boolean);
@@ -4143,6 +4227,7 @@ function MixerChannel({
   direction, onSetDirection, solo, onToggleSolo, pan, onPanChange, previewing, onPreview,
   expanded, onToggleExpanded,
   onRecord, onStopRecordEarly, recording, recordCountingIn, recordCountInBeat, recordCountdown, recordDisabled, onDelete,
+  waveform,
 }) {
   const panLabel = Math.abs(pan) < 0.04 ? 'C' : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
@@ -4308,6 +4393,7 @@ function MixerChannel({
             <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>R</span>
             <span className="font-mono-ui text-[10px] shrink-0 w-6 text-right" style={{ color: '#C7CBDA' }}>{panLabel}</span>
           </div>
+          {waveform}
         </>
       )}
     </div>
