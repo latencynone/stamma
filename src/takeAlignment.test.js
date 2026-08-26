@@ -3,7 +3,7 @@ import {
   detectOnsetSegments, estimateCoarseOffset, matchOnsetsToMelody,
   buildAlignmentKeyframes, alignOwnTakeToMelody,
 } from './takeAlignment.js';
-import { synthesizeVoice, toAudioBuffer } from './testUtils.js';
+import { synthesizeVoice, toAudioBuffer, rmsOf } from './testUtils.js';
 
 const SR = 44100;
 
@@ -110,6 +110,25 @@ describe('buildAlignmentKeyframes', () => {
     const segmentKeyframe = keyframes.find((k) => k.output === 1.0 && k.input === 1.0);
     expect(segmentKeyframe.rate).toBeCloseTo(1.5, 5); // (4.0-1.0)/(3.0-1.0)
   });
+
+  it('clamps an implausibly extreme rate instead of handing it to the stretch engine', () => {
+    // A near-instant own-take gap (0.05s) spanning a much longer melody
+    // gap (2s) — the kind of thing a stray bleed-through/mismatched onset
+    // produces, not real singing — would otherwise demand a ~0.025x rate
+    // (40x slower), which is exactly the kind of extreme stretch that
+    // audibly "drags"/stammers.
+    const anchors = [{ ownTime: 1.0, melodyTime: 1.0 }, { ownTime: 1.05, melodyTime: 3.0 }];
+    const keyframes = buildAlignmentKeyframes(anchors);
+    const segmentKeyframe = keyframes.find((k) => k.output === 1.0 && k.input === 1.0);
+    expect(segmentKeyframe.rate).toBeGreaterThanOrEqual(0.4);
+
+    // And the opposite extreme — a huge own-take gap over a near-instant
+    // melody gap — is capped rather than sped up into a blur.
+    const anchors2 = [{ ownTime: 1.0, melodyTime: 1.0 }, { ownTime: 6.0, melodyTime: 1.05 }];
+    const keyframes2 = buildAlignmentKeyframes(anchors2);
+    const segmentKeyframe2 = keyframes2.find((k) => k.output === 1.0 && k.input === 1.0);
+    expect(segmentKeyframe2.rate).toBeLessThanOrEqual(2.5);
+  });
 });
 
 describe('alignOwnTakeToMelody', () => {
@@ -152,5 +171,46 @@ describe('alignOwnTakeToMelody', () => {
       const nearest = Math.min(...alignedSegments.map((s) => Math.abs(s.start - n.start)));
       expect(nearest).toBeLessThan(0.08);
     });
+  });
+
+  // Reproduces a real reported bug: a take recorded on a wall-clock timer
+  // (see recordOwnTake in App.jsx) is only ever approximately as long as
+  // the melody, and the tail after the last matched anchor plays at rate 1
+  // with no further reset (see buildAlignmentKeyframes) — so it keeps
+  // asking for more of the take for as long as output still has left to
+  // render. A take that stops singing (and the take recording itself ends)
+  // well before the melody's own end needs more input there than the take
+  // buffer actually has. Before the padding fix this read past the end of
+  // what stretch.addBuffers() was given, which is exactly what surfaced as
+  // stammering and a volume drop in the last second or two of an aligned
+  // take — this checks the tail comes out cleanly silent instead.
+  it('stays clean (no glitching) when the take ends well before the melody does', async () => {
+    const melodyNotes = makeNoteList([220, 247, 262, 294, 330]);
+    const outputDuration = melodyNotes[melodyNotes.length - 1].end + 2.5; // melody has 2.5s of tail after its last note
+
+    // Own take only covers the first two melody notes, and the take
+    // recording itself stops (buffer ends) shortly after the second one —
+    // there is no real audio at all for most of the melody's remaining
+    // duration.
+    const ownNotes = [
+      { start: melodyNotes[0].start, end: melodyNotes[0].end, freq: melodyNotes[0].freq * 1.5 },
+      { start: melodyNotes[1].start, end: melodyNotes[1].end, freq: melodyNotes[1].freq * 1.5 },
+    ];
+    const ownTotalDur = ownNotes[ownNotes.length - 1].end + 0.3; // buffer ends here, far short of outputDuration
+    const raw = synthesizeVoice(ownNotes, ownTotalDur, SR, { gapNoiseAmp: 0 });
+    const setupCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, raw.length, SR);
+    const ownBuffer = toAudioBuffer(setupCtx, raw, SR);
+
+    const aligned = await alignOwnTakeToMelody(ownBuffer, melodyNotes, outputDuration);
+    expect(aligned.length).toBe(Math.round(outputDuration * SR));
+
+    const out = aligned.getChannelData(0);
+    expect(Array.from(out).some((v) => Number.isNaN(v))).toBe(false);
+
+    // The last second of output falls well past both the last matched
+    // anchor and the end of the take's own audio — should be silent, not
+    // some leftover/glitched signal.
+    const tailRms = rmsOf(out, out.length - SR, out.length);
+    expect(tailRms).toBeLessThan(0.01);
   });
 });

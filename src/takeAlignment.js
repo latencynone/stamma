@@ -158,6 +158,21 @@ export function matchOnsetsToMelody(ownStarts, melodyStarts) {
   return anchors;
 }
 
+// Bounds on the per-segment stretch rate a pair of anchors is allowed to
+// imply — real singing drifts by tens of percent, not multiples. A rate
+// outside this range means the anchor pair is more likely a bad match (an
+// onset the pitch-agnostic detector picked up from the melody bleeding
+// into the mic — see recordOwnTake's echoCancellation note — matched to a
+// nearby-but-wrong melody note, say) than genuine tempo drift, and
+// SignalsmithStretch audibly struggles at extreme ratios anyway (reported
+// as a "dragging"/stammering artifact). Clamping still lands input exactly
+// on `next.input` at `next.output` (every keyframe resets both explicitly,
+// see renderTimeWarp) — a clamped segment just gets there with a small
+// jump instead of a smooth but badly-stretched ramp, which is the less
+// audible failure mode of the two.
+const MIN_STRETCH_RATE = 0.4;
+const MAX_STRETCH_RATE = 2.5;
+
 // Turns confident anchors into SignalsmithStretch schedule keyframes on the
 // shared mix timeline (the `output` axis = the melody/recording's own
 // timeline, same as every other channel). Before the first anchor and after
@@ -165,8 +180,8 @@ export function matchOnsetsToMelody(ownStarts, melodyStarts) {
 // shifted, never stretched, since there's no second confident point there
 // to define a stretch ratio against. Between two anchors, the local rate is
 // exactly whatever's needed to make that stretch of the take span the gap
-// between them. Returns null (meaning "leave the take untouched") if there
-// are no anchors at all.
+// between them, clamped to a plausible range (see above). Returns null
+// (meaning "leave the take untouched") if there are no anchors at all.
 export function buildAlignmentKeyframes(anchors) {
   if (!anchors.length) return null;
   const first = anchors[0];
@@ -174,7 +189,7 @@ export function buildAlignmentKeyframes(anchors) {
   anchors.forEach((a, idx) => {
     const next = anchors[idx + 1];
     const rate = next
-      ? (next.ownTime - a.ownTime) / Math.max(1e-6, next.melodyTime - a.melodyTime)
+      ? Math.min(MAX_STRETCH_RATE, Math.max(MIN_STRETCH_RATE, (next.ownTime - a.ownTime) / Math.max(1e-6, next.melodyTime - a.melodyTime)))
       : 1;
     keyframes.push({ output: a.melodyTime, input: a.ownTime, rate });
   });
@@ -204,8 +219,35 @@ async function renderTimeWarp(ownBuffer, keyframes, outputDuration) {
   stretch.connect(offlineCtx.destination);
   await stretch.configure({ blockMs: 60 });
 
+  // Past the last keyframe there's no further reset (see
+  // buildAlignmentKeyframes: the tail plays at rate 1, unstretched, all
+  // the way to `outputDuration`) — so the input position it ends up
+  // requesting keeps climbing for as long as output still has left to
+  // render. `ownBuffer` is only ever as long as what was actually sung
+  // (recorded on a wall-clock timer, not sample-locked to
+  // `outputDuration`), so a last anchor that isn't right at the very end
+  // of the take needs more input than physically exists — Signalsmith
+  // Stretch reading past what addBuffers() gave it is exactly what
+  // produced the reported stammering/volume-drop in the last second or
+  // two of an aligned take. Padding with real trailing silence (rather
+  // than leaving that "one step off the end of the array" case
+  // undefined) makes that tail cleanly silent, which is the correct
+  // result anyway once the take has run out of actual singing.
+  const last = keyframes[keyframes.length - 1];
+  const tailReachSec = last.input + Math.max(0, outputDuration - last.output) * (last.rate || 1);
+  const paddedLen = Math.max(ownBuffer.length, Math.ceil(tailReachSec * sr) + Math.ceil(sr * 0.25));
+
   const channelData = [];
-  for (let c = 0; c < channels; c++) channelData.push(ownBuffer.getChannelData(c).slice());
+  for (let c = 0; c < channels; c++) {
+    const src = ownBuffer.getChannelData(c);
+    if (paddedLen <= src.length) {
+      channelData.push(src.slice());
+    } else {
+      const padded = new Float32Array(paddedLen);
+      padded.set(src);
+      channelData.push(padded);
+    }
+  }
   await stretch.addBuffers(channelData);
 
   const scheduleAt = (k) => stretch.schedule({

@@ -1710,6 +1710,32 @@ export default function App() {
     if (isPlaying) stopPlayback();
   }
 
+  // Peak-normalizes `source` to `targetPeak` (just under full scale by
+  // default) and returns a new buffer — shared by the main recording's
+  // manual "Normalisera" button and the automatic own-take normalization
+  // below. Returns null for a silent (or already-empty) source rather than
+  // dividing by ~0 into a wall of noise.
+  function peakNormalizeBuffer(ctx, source, targetPeak = 0.97, silenceThreshold = 0.0005) {
+    let peak = 0;
+    for (let ch = 0; ch < source.numberOfChannels; ch++) {
+      const data = source.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) {
+        const abs = Math.abs(data[i]);
+        if (abs > peak) peak = abs;
+      }
+    }
+    if (peak <= silenceThreshold) return null;
+    const gain = targetPeak / peak;
+    const outBuffer = ctx.createBuffer(source.numberOfChannels, source.length, source.sampleRate);
+    for (let ch = 0; ch < source.numberOfChannels; ch++) {
+      const data = source.getChannelData(ch);
+      const out = new Float32Array(data.length);
+      for (let i = 0; i < data.length; i++) out[i] = data[i] * gain;
+      outBuffer.copyToChannel(out, ch);
+    }
+    return outBuffer;
+  }
+
   // Peak-normalizes the current recording to just under full scale.
   // One-shot and destructive (see revertToOriginalRecording for the way
   // back), matching how "normalize" behaves in a regular audio editor.
@@ -1719,26 +1745,11 @@ export default function App() {
     setNormalizing(true);
     setNormalizeError('');
     try {
-      let peak = 0;
-      for (let ch = 0; ch < source.numberOfChannels; ch++) {
-        const data = source.getChannelData(ch);
-        for (let i = 0; i < data.length; i++) {
-          const abs = Math.abs(data[i]);
-          if (abs > peak) peak = abs;
-        }
-      }
-      if (peak <= 0.0005) {
+      const ctx = await getPlaybackContext();
+      const outBuffer = peakNormalizeBuffer(ctx, source);
+      if (!outBuffer) {
         setNormalizeError('Inspelningen verkar vara helt tyst — går inte att normalisera.');
         return;
-      }
-      const gain = 0.97 / peak;
-      const ctx = await getPlaybackContext();
-      const outBuffer = ctx.createBuffer(source.numberOfChannels, source.length, source.sampleRate);
-      for (let ch = 0; ch < source.numberOfChannels; ch++) {
-        const data = source.getChannelData(ch);
-        const out = new Float32Array(data.length);
-        for (let i = 0; i < data.length; i++) out[i] = data[i] * gain;
-        outBuffer.copyToChannel(out, ch);
       }
       applyProcessedRecording(outBuffer);
     } catch (err) {
@@ -2842,7 +2853,16 @@ export default function App() {
         const arrayBuf = await blob.arrayBuffer();
         const AC = window.AudioContext || window.webkitAudioContext;
         decodeCtx = new AC();
-        const audioBuffer = await decodeCtx.decodeAudioData(arrayBuf);
+        const decoded = await decodeCtx.decodeAudioData(arrayBuf);
+        // Own-take capture asks for autoGainControl: false (see the comment
+        // on recordOwnTake) so the browser's AGC doesn't fight the melody
+        // bleeding in through the mic — but without it, the raw take is
+        // captured at whatever level the room/mic happens to produce, often
+        // much quieter than the main recording (which keeps AGC on). Peak-
+        // normalize it here so a take isn't left sitting at a barely-
+        // audible level by default; falls back to the raw decode for a
+        // take that's genuinely silent (nothing to normalize against).
+        const audioBuffer = peakNormalizeBuffer(decodeCtx, decoded) || decoded;
         ownTakeBuffersRef.current[type] = audioBuffer;
         const ownKey = `${type}Own`;
         setChannels((prev) => ({
