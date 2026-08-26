@@ -190,7 +190,7 @@ export function buildRatioCurveFromSegments(segments, totalDuration, energyEnvel
 // doesn't share yours. One fixed profile per interval keeps a given type's
 // character consistent across renders instead of it just adding random
 // per-render noise.
-const HARMONY_HUMANIZE_PROFILES = {
+export const HARMONY_HUMANIZE_PROFILES = {
   ters: {
     detuneCents: -3, wobbleCents: 4, wobbleHz: 0.22, phase: 0.4,
     vibratoCents: 9, vibratoHz: 5.4, vibratoPhase: 1.2,
@@ -364,7 +364,7 @@ async function renderWithRatioCurve(recordedBuffer, keyframes, formantBaseHz, fo
   return offlineCtx.startRendering();
 }
 
-function formantBaseHzFor(melodyNotes, keyInfo) {
+export function formantBaseHzFor(melodyNotes, keyInfo) {
   const melodyFreqs = melodyNotes.map((n) => midiToFreq(scaleStepToMidi(n.step, keyInfo.tonic, keyInfo.mode)));
   return melodyFreqs.length ? median(melodyFreqs) : 200;
 }

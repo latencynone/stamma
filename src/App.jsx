@@ -24,7 +24,7 @@ import {
   extractFramesFromBuffer,
   detectTempoBpm,
 } from './pitchAnalysis.js';
-import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } from './harmonyEngine.js';
+import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope, formantBaseHzFor, HARMONY_HUMANIZE_PROFILES } from './harmonyEngine.js';
 import { alignOwnTakeToMelody } from './takeAlignment.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 import { fft, ifft, hannWindow } from './dsp.js';
@@ -1122,7 +1122,7 @@ function AboutPage() {
     {
       id: 'live-forhandslyssning',
       title: 'Live-förhandslyssning',
-      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- eller sextavstånd — ett smakprov på hur en stämma skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn; innan dess (på startskärmen) används istället ett fast intervall, eftersom ingen tonart är känd än. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard.',
+      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- eller sextavstånd — ett smakprov på hur en stämma skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn, inklusive samma "Humanisera stämmor"-karaktär (vibrato, formant, tonhöjd) om den är påslagen; innan dess (på startskärmen) används istället ett fast intervall utan karaktär, eftersom ingen tonart är känd än. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard.',
     },
     {
       id: 'tonhojdskurva',
@@ -1402,8 +1402,14 @@ export default function App() {
   // right at a note boundary can't flap the ratio back and forth.
   const liveMonitorLockedStepRef = useRef(null);
   const liveMonitorCandidateRef = useRef(null); // { step, count } | null
+  // A single formant anchor for the whole live session, computed once at
+  // start from the already-analyzed take (same formula as the offline
+  // engine's formantBaseHzFor — the median melody frequency) rather than
+  // re-derived every tick, since it shouldn't drift mid-session.
+  const liveMonitorFormantBaseHzRef = useRef(0);
   const keyInfoRef = useRef(keyInfo);
   const channelsRef = useRef(channels);
+  const humanizeOnRef = useRef(humanizeOn);
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -1511,6 +1517,7 @@ export default function App() {
   // over whatever keyInfo/channels were current when it started.
   useEffect(() => { keyInfoRef.current = keyInfo; }, [keyInfo]);
   useEffect(() => { channelsRef.current = channels; }, [channels]);
+  useEffect(() => { humanizeOnRef.current = humanizeOn; }, [humanizeOn]);
 
   // The browser remembers a granted/denied microphone permission on its own
   // (that's an origin-level browser decision, not something a site can
@@ -2057,16 +2064,37 @@ export default function App() {
     return latency;
   }
 
-  // Schedules a flat diatonic ratio for `step` (the scale degree the
-  // pitch-tracking loop just locked onto) shifted to `type`'s interval —
-  // the live-monitor equivalent of one segment in harmonyEngine.js's
-  // buildRatioCurve, just computed on the fly instead of from a whole
-  // pre-analyzed take. Both frequencies come from scaleStepToMidi (not
-  // the raw measured pitch), so the ratio is a pure function of *which*
-  // note you're on and stays flat while you hold or vibrato on it —
-  // applying that flat ratio to the raw live signal is what carries your
-  // vibrato through instead of cancelling it (see the LIVE_MONITOR_*
-  // constants' comment).
+  // Same cents formula as harmonyEngine.js's humanizeKeyframes (detune +
+  // slow wobble + faster vibrato, all in cents so they compose regardless
+  // of interval size), just evaluated at a single instant instead of
+  // pre-baked into keyframes — see startLiveMonitorPitchLoop for why this
+  // has to be called continuously rather than once per note-lock. `t` is
+  // the live AudioContext clock, not recording-relative time; that only
+  // shifts the wobble/vibrato's phase, which doesn't matter since nothing
+  // needs to line up with an offline render here.
+  function liveMonitorHumanizeFactor(type, t) {
+    const profile = HARMONY_HUMANIZE_PROFILES[type];
+    if (!profile) return 1;
+    const { detuneCents = 0, wobbleCents = 0, wobbleHz = 0.25, phase = 0, vibratoCents = 0, vibratoHz = 5.5, vibratoPhase = 0 } = profile;
+    const cents = detuneCents
+      + wobbleCents * Math.sin(2 * Math.PI * wobbleHz * t + phase)
+      + vibratoCents * Math.sin(2 * Math.PI * vibratoHz * t + vibratoPhase);
+    return Math.pow(2, cents / 1200);
+  }
+
+  // Schedules a diatonic ratio for `step` (the scale degree the
+  // pitch-tracking loop currently believes you're singing) shifted to
+  // `type`'s interval — the live-monitor equivalent of one segment in
+  // harmonyEngine.js's buildRatioCurve, computed on the fly instead of
+  // from a whole pre-analyzed take. Both frequencies come from
+  // scaleStepToMidi (not the raw measured pitch), so the *base* ratio is a
+  // pure function of which note you're on and stays flat while you hold
+  // or vibrato it — applying that flat ratio to the raw live signal is
+  // what carries your own vibrato through instead of cancelling it (see
+  // the LIVE_MONITOR_* constants' comment). humanizeOnRef then layers this
+  // type's fixed detune/wobble/vibrato/formant character on top, same
+  // profile the offline engine gives that voice, so e.g. "ters" sounds
+  // like the same ters here as in the exported mix.
   function scheduleLiveMonitorRatio(node, ctx, step, type) {
     const key = keyInfoRef.current;
     if (!key) return;
@@ -2074,24 +2102,32 @@ export default function App() {
     const hStep = step + dir * HARMONY_TYPES[type].steps;
     const melodyFreq = midiToFreq(scaleStepToMidi(step, key.tonic, key.mode));
     const harmonyFreq = midiToFreq(scaleStepToMidi(hStep, key.tonic, key.mode));
+    const humanize = humanizeOnRef.current;
+    const ratio = (harmonyFreq / melodyFreq) * (humanize ? liveMonitorHumanizeFactor(type, ctx.currentTime) : 1);
     node.schedule({
       output: ctx.currentTime + liveMonitorLatencySecRef.current,
       active: true,
-      semitones: 12 * Math.log2(harmonyFreq / melodyFreq),
+      semitones: 12 * Math.log2(ratio),
       formantCompensation: true,
-      formantBaseHz: 0,
+      formantSemitones: humanize ? (HARMONY_HUMANIZE_PROFILES[type]?.formantSemitones || 0) : 0,
+      formantBaseHz: liveMonitorFormantBaseHzRef.current,
     });
   }
 
   // Runs for the lifetime of a key-aware live-monitor session: samples
   // the mic every LIVE_MONITOR_SAMPLE_HOP_SEC via the same autocorrelation
-  // pitch tracker startRecording uses for the melody, and re-locks
-  // scheduleLiveMonitorRatio onto a new scale step once it's read
-  // LIVE_MONITOR_LOCK_FRAMES times in a row (debouncing single noisy
-  // frames right at a note boundary). Silence/unvoiced frames are simply
-  // skipped — the last locked ratio holds, which is harmless for a live
-  // preview (unlike the offline engine, this doesn't need to fade to "no
-  // shift" for a real pause).
+  // pitch tracker startRecording uses for the melody, and re-locks onto a
+  // new scale step once it's read LIVE_MONITOR_LOCK_FRAMES times in a row
+  // (debouncing single noisy frames right at a note boundary). Silence/
+  // unvoiced frames are simply skipped for *locking* purposes — the last
+  // locked step holds, which is harmless for a live preview (unlike the
+  // offline engine, this doesn't need to fade to "no shift" for a real
+  // pause). While humanize is on, scheduleLiveMonitorRatio is instead
+  // re-run on *every* tick regardless of whether the note changed — its
+  // wobble/vibrato terms are time-varying and need continuous updates to
+  // be audible while a note is held, the same reason
+  // harmonyEngine.js's humanizeKeyframes inserts extra points through a
+  // long-held note rather than relying on just the note's two endpoints.
   function startLiveMonitorPitchLoop(node, ctx, analyser) {
     const buf = new Float32Array(analyser.fftSize);
     let lastSampleTime = -Infinity;
@@ -2102,6 +2138,7 @@ export default function App() {
         lastSampleTime = now;
         const key = keyInfoRef.current;
         if (key) {
+          let justLocked = false;
           analyser.getFloatTimeDomainData(buf);
           const { freq, rms } = autoCorrelate(buf, ctx.sampleRate);
           if (freq > 55 && freq < 1200 && rms > LIVE_MONITOR_RMS_THRESHOLD) {
@@ -2113,8 +2150,11 @@ export default function App() {
             if (liveMonitorCandidateRef.current.count >= LIVE_MONITOR_LOCK_FRAMES
               && liveMonitorLockedStepRef.current !== step) {
               liveMonitorLockedStepRef.current = step;
-              scheduleLiveMonitorRatio(node, ctx, step, liveMonitorTypeRef.current);
+              justLocked = true;
             }
+          }
+          if (liveMonitorLockedStepRef.current != null && (justLocked || humanizeOnRef.current)) {
+            scheduleLiveMonitorRatio(node, ctx, liveMonitorLockedStepRef.current, liveMonitorTypeRef.current);
           }
         }
       }
@@ -2182,6 +2222,7 @@ export default function App() {
       // path (source -> node -> destination is untouched) — this is a
       // side branch purely for autoCorrelate to read from.
       if (keyInfoRef.current) {
+        liveMonitorFormantBaseHzRef.current = melodyNotes.length ? formantBaseHzFor(melodyNotes, keyInfoRef.current) : 0;
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 2048;
         source.connect(analyser);
@@ -3937,6 +3978,7 @@ export default function App() {
               latencyMs={liveMonitorLatencyMs}
               keyAware={liveMonitorKeyAware}
               keyInfo={keyInfo}
+              humanizeOn={humanizeOn}
               onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
               onSelectType={setLiveMonitorTypeAndApply}
             />
@@ -4042,6 +4084,7 @@ export default function App() {
               latencyMs={liveMonitorLatencyMs}
               keyAware={liveMonitorKeyAware}
               keyInfo={keyInfo}
+              humanizeOn={humanizeOn}
               onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
               onSelectType={setLiveMonitorTypeAndApply}
             />
@@ -4981,7 +5024,7 @@ function HeadphonesIcon({ size = 14 }) {
 // startLiveMonitor et al.) — same card in both phases, just with
 // `keyAware` reflecting whether a tonart is established yet (only true
 // once a take's been analyzed, i.e. never in the idle-phase render).
-function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyInfo, onToggle, onSelectType }) {
+function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyInfo, humanizeOn, onToggle, onSelectType }) {
   const keyLabel = keyAware && keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
   return (
     <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
@@ -5012,7 +5055,9 @@ function LiveMonitorCard({ on, starting, error, type, latencyMs, keyAware, keyIn
             ))}
           </div>
           <p className="mt-2 font-mono-ui text-[11px]" style={{ color: '#C7CBDA' }}>
-            {keyLabel ? `Tonartsanpassad (${keyLabel}) — följer tonhöjden du sjunger.` : 'Fast intervall (ingen tonart känd ännu).'}
+            {keyLabel
+              ? `Tonartsanpassad (${keyLabel})${humanizeOn ? ', humaniserad röstkaraktär' : ''} — följer tonhöjden du sjunger.`
+              : 'Fast intervall (ingen tonart känd ännu).'}
           </p>
         </div>
       )}
