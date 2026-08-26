@@ -25,7 +25,7 @@ import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope } fr
 import { alignOwnTakeToMelody } from './takeAlignment.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 import { fft, ifft, hannWindow } from './dsp.js';
-import { saveSession, loadSession, clearSession } from './indexedDb.js';
+import { saveProject, listProjects, loadProject, deleteProject, renameProject } from './indexedDb.js';
 
 const HARMONY_KEYS = Object.keys(HARMONY_TYPES);
 
@@ -1171,6 +1171,11 @@ function AboutPage() {
       body: 'Varje spår — melodi, ters, kvint, sext, och eventuella egna inspelade stämmor — går att slå på eller av var för sig, och alla påslagna spelas samtidigt när du trycker play. Varje spår har en liten play-knapp för att förhandslyssna bara det spåret, en S-knapp för att solo:a (tysta alla andra tillfälligt), och volym/panorering som fälls ut genom att trycka på procentsatsen.',
     },
     {
+      id: 'sessioner',
+      title: 'Sessioner',
+      body: 'Appen sparar automatiskt det du håller på med i webbläsaren, namngivet efter tonart och tidpunkt. Fäll ut "Sessioner" för att se alla sparade tagningar, byta namn på dem, öppna en annan, eller radera. Börjar du en ny inspelning eller laddar upp en ny fil sparas det som en egen, ny session — den gamla ligger kvar orörd i listan.',
+    },
+    {
       id: 'exportera',
       title: 'Exportera',
       body: 'Ladda ner sången och varje stämma som separata WAV-filer, till exempel för att jobba vidare i ett annat program.',
@@ -1321,11 +1326,17 @@ export default function App() {
   const [ownTakeError, setOwnTakeError] = useState('');
   const [ownTakeAligningByType, setOwnTakeAligningByType] = useState({}); // { ters, kvint, sext } -> bool, see alignOwnTake
   const [ownTakeWaveformPeaksByType, setOwnTakeWaveformPeaksByType] = useState({}); // { ters, kvint, sext } -> Float32Array, for that channel's own WaveformTrimmer
-  // A session found in IndexedDB at mount, offered via a dismissible
-  // banner — never applied automatically. Cleared (both from state and the
-  // DB) once the user restores or dismisses it.
+  // The most recently saved project's *metadata* (no audio — see
+  // listProjects), offered via a dismissible banner at mount. Never
+  // applied automatically; dismissing just hides the banner; the project
+  // itself is real, named, saved work, not a throwaway crash-recovery
+  // artifact, so dismissing never deletes it — see "Sessioner" below.
   const [restorableSession, setRestorableSession] = useState(null);
   const [restoringSession, setRestoringSession] = useState(false);
+  // Every saved project's metadata (id, name, savedAt, settings — no
+  // audio), newest first, for the "Sessioner" list.
+  const [projects, setProjects] = useState([]);
+  const [projectsExpanded, setProjectsExpanded] = useState(false);
   const autotuneEnabled = autotuneOn;
   const effectiveTrimEnd = trimEnd === null ? recordingDuration : trimEnd;
 
@@ -1362,6 +1373,13 @@ export default function App() {
   // nudge, a reverb toggle) doesn't re-encode the same several-hundred-KB
   // buffer from scratch every time. See the autosave effect below.
   const autosaveWavCacheRef = useRef(null);
+  // Which saved project autosave is currently updating — null means "no
+  // project yet, the next autosave creates one". Set on restore/switch,
+  // cleared whenever the working recording is replaced wholesale (a new
+  // recording/upload, or the explicit reset button) so that doesn't
+  // silently overwrite a previous, differently-named project.
+  const activeProjectIdRef = useRef(null);
+  const activeProjectNameRef = useRef(null);
   // The untouched decode, kept alongside recordedBufferRef (the "current
   // working" buffer everything else reads from) so normalize/noise
   // reduction — both one-shot, destructive operations — have something to
@@ -1459,13 +1477,18 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
-  // Checks IndexedDB once at mount for a session left behind by a crash or
-  // an accidental refresh. Only ever surfaces it via the restore banner —
-  // never applies it silently.
+  // Loads the saved-projects list once at mount — also offers the newest
+  // one via the dismissible restore banner, same "never applied silently"
+  // rule as before.
+  function refreshProjects() {
+    listProjects().then(setProjects).catch(() => {});
+  }
   useEffect(() => {
     let cancelled = false;
-    loadSession().then((session) => {
-      if (!cancelled && session) setRestorableSession(session);
+    listProjects().then((list) => {
+      if (cancelled) return;
+      setProjects(list);
+      if (list.length) setRestorableSession(list[0]);
     }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
@@ -1476,7 +1499,10 @@ export default function App() {
   // that replaces recordedBufferRef.current (new recording/upload,
   // normalize, noise reduction, revert). Skipped while a previous session
   // is still waiting to be restored/dismissed, so it can't be clobbered
-  // before the user decides on it.
+  // before the user decides on it. Updates whichever project is currently
+  // "active" (activeProjectIdRef) — a fresh recording/upload clears that
+  // ref (see resetSourceState), so the first autosave after one creates a
+  // brand new project instead of overwriting whatever was open before.
   useEffect(() => {
     if (phase !== 'ready' || !recordedBufferRef.current || restorableSession) return undefined;
     const buffer = recordedBufferRef.current;
@@ -1495,7 +1521,16 @@ export default function App() {
         blob = audioBufferToWavBlob(buffer);
         autosaveWavCacheRef.current = { buffer, blob };
       }
-      saveSession({
+      if (!activeProjectNameRef.current) {
+        const now = new Date();
+        const datePart = now.toLocaleDateString('sv-SE', { day: '2-digit', month: '2-digit' });
+        const timePart = now.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+        const keyPart = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'} · ` : '';
+        activeProjectNameRef.current = `${keyPart}${datePart} ${timePart}`;
+      }
+      saveProject({
+        id: activeProjectIdRef.current,
+        name: activeProjectNameRef.current,
         version: 1,
         savedAt: Date.now(),
         audio: blob,
@@ -1511,13 +1546,16 @@ export default function App() {
         trimEnd,
         loopEnabled,
         channels,
+      }).then((id) => {
+        activeProjectIdRef.current = id;
+        refreshProjects();
       }).catch(() => {});
     }, 800);
     return () => clearTimeout(timer);
   }, [
     phase, waveformPeaks, restorableSession, soundType, autotuneOn, autotuneLevelIndex,
     reverbOn, reverbLevelIndex, humanizeOn, fadeIn, fadeOut, trimStart, trimEnd,
-    loopEnabled, channels,
+    loopEnabled, channels, keyInfo,
   ]);
 
   function harmonyNotesFor(type) {
@@ -1748,11 +1786,14 @@ export default function App() {
     ownTakeBuffersRef.current = {};
     setOwnTakeError('');
     setOwnTakeAligningByType({});
+    setOwnTakeWaveformPeaksByType({});
     stopPlayback();
-    // The previous take is being discarded (new recording/upload, or an
-    // explicit reset) — drop its autosave too, so a later crash doesn't
-    // offer to restore audio that's no longer this session's.
-    clearSession().catch(() => {});
+    // The previous take is being *replaced* (new recording/upload, or an
+    // explicit reset), not deleted — it's still real, named, saved work,
+    // sitting in "Sessioner" for later. Just detach autosave from it so
+    // the next save creates a fresh project instead of overwriting it.
+    activeProjectIdRef.current = null;
+    activeProjectNameRef.current = null;
   }
 
   // Downsamples a recording into per-column peak amplitudes for the
@@ -2247,47 +2288,96 @@ export default function App() {
     }
   }
 
-  // Decodes a restorable session's saved audio and re-applies its
-  // settings on top of the freshly analyzed recording. Always consumes
-  // (clears) the offer, whether it succeeds or not, so the banner can't
-  // get stuck.
-  async function restoreSession() {
-    if (!restorableSession || restoringSession) return;
-    setRestoringSession(true);
+  // Decodes a project's saved audio and re-applies its settings on top of
+  // the freshly analyzed recording — shared by the mount-time restore
+  // banner and "Öppna" in the Sessioner list. Marks `project` as the one
+  // autosave should keep updating from here on.
+  async function loadProjectIntoWorkspace(project) {
     let decodeCtx = null;
     try {
-      const arrayBuf = await restorableSession.audio.arrayBuffer();
+      const arrayBuf = await project.audio.arrayBuffer();
       const AC = window.AudioContext || window.webkitAudioContext;
       decodeCtx = new AC();
       const buffer = await decodeCtx.decodeAudioData(arrayBuf);
       const ok = finalizeLoadedBuffer(buffer);
       if (ok) {
-        setSoundType(restorableSession.soundType ?? 'recording');
-        setAutotuneOn(!!restorableSession.autotuneOn);
-        setAutotuneLevelIndex(restorableSession.autotuneLevelIndex ?? 0);
-        setReverbOn(!!restorableSession.reverbOn);
-        setReverbLevelIndex(restorableSession.reverbLevelIndex ?? 0);
-        setHumanizeOn(restorableSession.humanizeOn ?? true);
-        setFadeIn(restorableSession.fadeIn ?? 0);
-        setFadeOut(restorableSession.fadeOut ?? 0);
-        setTrimStart(restorableSession.trimStart ?? 0);
-        setTrimEnd(restorableSession.trimEnd ?? null);
-        setLoopEnabled(!!restorableSession.loopEnabled);
-        setChannels(restorableSession.channels || defaultChannels());
+        setSoundType(project.soundType ?? 'recording');
+        setAutotuneOn(!!project.autotuneOn);
+        setAutotuneLevelIndex(project.autotuneLevelIndex ?? 0);
+        setReverbOn(!!project.reverbOn);
+        setReverbLevelIndex(project.reverbLevelIndex ?? 0);
+        setHumanizeOn(project.humanizeOn ?? true);
+        setFadeIn(project.fadeIn ?? 0);
+        setFadeOut(project.fadeOut ?? 0);
+        setTrimStart(project.trimStart ?? 0);
+        setTrimEnd(project.trimEnd ?? null);
+        setLoopEnabled(!!project.loopEnabled);
+        setChannels(project.channels || defaultChannels());
+        activeProjectIdRef.current = project.id;
+        activeProjectNameRef.current = project.name;
       }
+      return ok;
+    } catch (e) {
+      setPhase('error');
+      setErrorMsg('Kunde inte läsa in sessionen.');
+      return false;
+    } finally {
+      if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
+    }
+  }
+
+  // Always consumes (clears) the restore-banner offer, whether it
+  // succeeds or not, so the banner can't get stuck.
+  async function restoreSession() {
+    if (!restorableSession || restoringSession) return;
+    setRestoringSession(true);
+    try {
+      const full = await loadProject(restorableSession.id);
+      if (full) await loadProjectIntoWorkspace(full);
     } catch (e) {
       setPhase('error');
       setErrorMsg('Kunde inte återställa förra sessionen.');
     } finally {
-      if (decodeCtx && decodeCtx.state !== 'closed') decodeCtx.close().catch(() => {});
       setRestorableSession(null);
       setRestoringSession(false);
     }
   }
 
   function dismissRestorableSession() {
+    // Only hides the mount-time banner for this page load — the project
+    // is real, named, saved work, not a throwaway crash-recovery
+    // artifact, so dismissing never deletes it (see "Sessioner").
     setRestorableSession(null);
-    clearSession().catch(() => {});
+  }
+
+  // "Öppna" in the Sessioner list — replaces the current workspace with a
+  // different saved project, same as starting a fresh recording/upload
+  // does (resetSourceState), just loading saved content afterward instead
+  // of waiting for a new one.
+  async function switchToProject(id) {
+    if (id === activeProjectIdRef.current) {
+      setProjectsExpanded(false);
+      return;
+    }
+    const full = await loadProject(id).catch(() => null);
+    if (full) {
+      resetSourceState();
+      await loadProjectIntoWorkspace(full);
+    }
+    setProjectsExpanded(false);
+  }
+
+  function handleRenameProject(id, name) {
+    if (id === activeProjectIdRef.current) activeProjectNameRef.current = name;
+    renameProject(id, name).then(refreshProjects).catch(() => {});
+  }
+
+  function handleDeleteProject(id) {
+    if (id === activeProjectIdRef.current) {
+      activeProjectIdRef.current = null;
+      activeProjectNameRef.current = null;
+    }
+    deleteProject(id).then(refreshProjects).catch(() => {});
   }
 
   function resetAll() {
@@ -3182,6 +3272,7 @@ export default function App() {
       <div className="w-full max-w-md px-5 py-8 font-body">
         {restorableSession && phase === 'idle' && (
           <RestoreBanner
+            name={restorableSession.name}
             savedAt={restorableSession.savedAt}
             restoring={restoringSession}
             onRestore={restoreSession}
@@ -3222,6 +3313,33 @@ export default function App() {
             </p>
           )}
         </header>
+
+        {/* Sessioner — saved projects, see indexedDb.js */}
+        {projects.length > 0 && phase !== 'recording' && phase !== 'countin' && (
+          <div className="rounded-xl p-3 mb-5" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+            <button
+              onClick={() => setProjectsExpanded((v) => !v)}
+              className="stamma-btn w-full flex items-center justify-between"
+            >
+              <span className="text-sm font-medium">Sessioner ({projects.length})</span>
+              <span style={{ display: 'inline-block', fontSize: 15, color: '#C7CBDA', transform: projectsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+            </button>
+            {projectsExpanded && (
+              <div className="mt-3 space-y-2">
+                {projects.map((p) => (
+                  <ProjectRow
+                    key={p.id}
+                    project={p}
+                    active={p.id === activeProjectIdRef.current}
+                    onOpen={() => switchToProject(p.id)}
+                    onRename={(name) => handleRenameProject(p.id, name)}
+                    onDelete={() => handleDeleteProject(p.id)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Signature visualization */}
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
@@ -4099,7 +4217,7 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
 // Offers to bring back a session an earlier crash/refresh left behind in
 // IndexedDB. Purely a prompt — restoring or dismissing is always an
 // explicit click, never automatic.
-function RestoreBanner({ savedAt, onRestore, onDismiss, restoring }) {
+function RestoreBanner({ name, savedAt, onRestore, onDismiss, restoring }) {
   const label = new Date(savedAt).toLocaleString('sv-SE', {
     day: '2-digit',
     month: '2-digit',
@@ -4111,7 +4229,7 @@ function RestoreBanner({ savedAt, onRestore, onDismiss, restoring }) {
       className="rounded-xl p-4 mb-5 text-sm"
       style={{ backgroundColor: 'rgba(85,214,192,0.08)', border: '1px solid rgba(85,214,192,0.3)', color: '#F1EDE4' }}
     >
-      <p className="leading-relaxed font-medium">Återställ förra sessionen?</p>
+      <p className="leading-relaxed font-medium">Återställ "{name}"?</p>
       <p className="mt-0.5 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Sparad {label}</p>
       <div className="mt-3 flex gap-3">
         <button
@@ -4131,6 +4249,80 @@ function RestoreBanner({ savedAt, onRestore, onDismiss, restoring }) {
           Avfärda
         </button>
       </div>
+    </div>
+  );
+}
+
+// One row in the "Sessioner" list — click the name to rename it in place
+// (tap-to-type, same pattern as BpmInput), "Öppna" loads it into the
+// workspace, the trash button deletes it (native confirm(), a destructive
+// action with no undo).
+function ProjectRow({ project, active, onOpen, onRename, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(project.name);
+  const dateLabel = new Date(project.savedAt).toLocaleString('sv-SE', {
+    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+
+  function commit() {
+    setEditing(false);
+    const trimmed = draft.trim();
+    if (trimmed && trimmed !== project.name) onRename(trimmed);
+    else setDraft(project.name);
+  }
+
+  return (
+    <div
+      className="rounded-lg p-2.5 flex items-center gap-2"
+      style={{
+        backgroundColor: active ? 'rgba(85,214,192,0.08)' : 'rgba(241,237,228,0.03)',
+        border: active ? '1px solid rgba(85,214,192,0.35)' : '1px solid rgba(241,237,228,0.08)',
+      }}
+    >
+      <div className="flex-1 min-w-0">
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onFocus={(e) => e.target.select()}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.currentTarget.blur();
+              else if (e.key === 'Escape') { setDraft(project.name); setEditing(false); }
+            }}
+            className="w-full bg-transparent text-sm font-medium"
+            style={{ color: '#F1EDE4', border: 'none', borderBottom: '1px solid rgba(85,214,192,0.5)', outline: 'none' }}
+          />
+        ) : (
+          <button
+            onClick={() => setEditing(true)}
+            className="stamma-btn block w-full text-left text-sm font-medium truncate"
+            style={{ color: '#F1EDE4' }}
+            title="Byt namn"
+          >
+            {project.name}
+            {active && <span style={{ color: '#55D6C0' }}> · aktiv</span>}
+          </button>
+        )}
+        <div className="font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>{dateLabel}</div>
+      </div>
+      <button
+        onClick={onOpen}
+        className="stamma-btn shrink-0 rounded-md px-2.5 py-1.5 font-mono-ui text-xs font-medium"
+        style={{ color: '#55D6C0', border: '1px solid rgba(85,214,192,0.4)' }}
+      >
+        Öppna
+      </button>
+      <button
+        onClick={() => { if (window.confirm(`Radera "${project.name}"? Går inte att ångra.`)) onDelete(); }}
+        className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
+        style={{ width: 30, height: 30, color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.15)' }}
+        aria-label={`Radera ${project.name}`}
+        title={`Radera ${project.name}`}
+      >
+        <TrashIcon size={13} />
+      </button>
     </div>
   );
 }
