@@ -2643,11 +2643,23 @@ export default function App() {
     const activeKeys = keysOverride || Object.keys(channelsState).filter((k) => isChannelAudible(channelsState, k));
     if (!activeKeys.length) return;
 
-    const ctx = await getPlaybackContext();
-    const resolved = await Promise.all(
-      activeKeys.map(async (key) => ({ key, content: await resolveChannelContent(key) }))
-    );
-    const usable = resolved.filter((r) => r.content);
+    let ctx;
+    let usable;
+    try {
+      ctx = await getPlaybackContext();
+      const resolved = await Promise.all(
+        activeKeys.map(async (key) => ({ key, content: await resolveChannelContent(key) }))
+      );
+      usable = resolved.filter((r) => r.content);
+    } catch (err) {
+      // A harmony/autotune render or the context itself failing here would
+      // otherwise leave nothing scheduled but isPlaying never set — the
+      // Play button would look inert rather than actually broken. Nothing
+      // was started yet at this point, so there's nothing to clean up
+      // beyond the stopPlayback() already run above.
+      console.error('Kunde inte starta uppspelning:', err);
+      return;
+    }
     if (!usable.length) return;
     // A newer startMix() call (another play/pause/preview press while this
     // one was still awaiting content, e.g. a first-time harmony render)
@@ -2665,7 +2677,24 @@ export default function App() {
     reverbBusRef.current = reverbBus;
 
     const now = ctx.currentTime + 0.05;
-    const started = usable.map(({ key, content }) => startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom, reverbBus.input));
+    // A per-channel try/catch rather than usable.map(...) all-or-nothing —
+    // one channel failing to schedule (a malformed buffer, a stale node
+    // from a race) shouldn't take the whole mix down with it, and every
+    // node that *did* start before a failure is still tracked so
+    // stopPlayback() can actually reach it instead of it playing on
+    // forever, orphaned, with the transport UI already showing "stopped".
+    const started = [];
+    usable.forEach(({ key, content }) => {
+      try {
+        started.push(startMixChannelWithContent(ctx, key, now, channelsState[key], content, rangeStart, rangeEnd, fadeIn, fadeOut, playFrom, reverbBus.input));
+      } catch (err) {
+        console.error(`Kunde inte spela upp kanalen "${key}":`, err);
+      }
+    });
+    if (!started.length) {
+      stopPlayback();
+      return;
+    }
 
     // The click-track toggle (used for a recording's count-in/click) also
     // doubles as a "click along with playback" aid — started at the exact
@@ -2793,10 +2822,23 @@ export default function App() {
     // that's about to play as a monitor.
     ownTakeCountInCancelledRef.current = false;
     setRecordingOwnTake({ type, countingIn: true, countInBeat: 0, countdown: recordingDuration });
-    const clickCtx = await getPlaybackContext();
-    await playCountIn(clickCtx, metronomeBpm, (i) => {
-      setRecordingOwnTake((s) => (s && s.type === type && s.countingIn ? { ...s, countInBeat: i } : s));
-    });
+    try {
+      const clickCtx = await getPlaybackContext();
+      await playCountIn(clickCtx, metronomeBpm, (i) => {
+        setRecordingOwnTake((s) => (s && s.type === type && s.countingIn ? { ...s, countInBeat: i } : s));
+      });
+    } catch (err) {
+      // The mic stream was already opened above — without this, a failure
+      // here (the playback context refusing to (re)start, say) would leave
+      // it open with nothing to ever close it, and the record button stuck
+      // showing "counting in…" forever with no recording actually able to
+      // start.
+      stream.getTracks().forEach((t) => t.stop());
+      ownTakeStreamRef.current = null;
+      setOwnTakeError(`Kunde inte spela in din ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
+      setRecordingOwnTake(null);
+      return;
+    }
     if (ownTakeCountInCancelledRef.current) return;
 
     startMix(channels, ['melody']);
