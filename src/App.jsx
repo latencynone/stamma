@@ -3155,7 +3155,7 @@ export default function App() {
                           }}
                         >
                           {metronomeListening ? <PauseIcon size={13} /> : <PlayIcon size={13} />}
-                          {metronomeListening ? 'Stoppa' : 'Lyssna'}
+                          {metronomeListening ? 'Stoppa' : 'Hitta takten'}
                         </button>
                       </div>
                     )}
