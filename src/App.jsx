@@ -8,6 +8,7 @@ import {
   midiToNoteName,
   freqToMidi,
   midiToScaleStep,
+  requantizeNotesToKey,
 } from './musicTheory.js';
 import {
   autoCorrelate,
@@ -328,12 +329,13 @@ function createFormantSum(ctx, source) {
 
 // `harmonyLayers`: array of { key, notes, color, glow } — one per currently
 // active (mixer-enabled) harmony type, drawn simultaneously in its own color.
-function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, playheadTime }) {
+function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, playheadTime, onKeyChange, onResetKey, keyIsManual }) {
   const canvasRef = useRef(null);
   const scrollWrapRef = useRef(null);
   const outerRef = useRef(null);
   const [zoom, setZoom] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [keyPickerOpen, setKeyPickerOpen] = useState(false);
 
   // The fullscreen view is driven by our own state (a CSS overlay), not the
   // browser's Fullscreen API — that API is unavailable in a lot of contexts
@@ -525,7 +527,67 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
           +
         </button>
         {keyLabel && (
-          <span style={{ color: '#FFB454', whiteSpace: 'nowrap' }}>Tonart: {keyLabel}</span>
+          <div className="relative">
+            <button
+              onClick={() => setKeyPickerOpen((v) => !v)}
+              className="stamma-btn px-2.5 py-1 rounded-md flex items-center gap-1"
+              style={{ color: '#FFB454', border: '1px solid rgba(255,180,84,0.3)', whiteSpace: 'nowrap' }}
+            >
+              Tonart: {keyLabel}
+              <span style={{ fontSize: 13, display: 'inline-block', transform: keyPickerOpen ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+            </button>
+            {keyPickerOpen && (
+              <div
+                className="absolute z-20 mt-2 rounded-xl p-3"
+                style={{ width: 240, backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
+              >
+                <div className="font-mono-ui text-[10px] mb-2" style={{ color: '#C7CBDA' }}>
+                  Rätta tonarten manuellt
+                </div>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {NOTE_NAMES.map((name, pc) => (
+                    <button
+                      key={pc}
+                      onClick={() => onKeyChange(pc, keyInfo.mode)}
+                      className="stamma-btn rounded-md py-1.5 text-xs font-medium"
+                      style={{
+                        backgroundColor: keyInfo.tonic === pc ? 'rgba(255,180,84,0.15)' : 'transparent',
+                        color: keyInfo.tonic === pc ? '#FFB454' : '#F1EDE4',
+                        border: keyInfo.tonic === pc ? '1px solid rgba(255,180,84,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                      }}
+                    >
+                      {name}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex gap-1.5 mt-1.5">
+                  {[['major', 'Dur'], ['minor', 'Moll']].map(([m, label]) => (
+                    <button
+                      key={m}
+                      onClick={() => onKeyChange(keyInfo.tonic, m)}
+                      className="stamma-btn flex-1 rounded-md py-1.5 text-xs font-medium"
+                      style={{
+                        backgroundColor: keyInfo.mode === m ? 'rgba(255,180,84,0.15)' : 'transparent',
+                        color: keyInfo.mode === m ? '#FFB454' : '#F1EDE4',
+                        border: keyInfo.mode === m ? '1px solid rgba(255,180,84,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {keyIsManual && (
+                  <button
+                    onClick={() => { onResetKey(); setKeyPickerOpen(false); }}
+                    className="stamma-btn w-full mt-2.5 rounded-lg py-1.5 font-mono-ui text-[10px]"
+                    style={{ color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.12)' }}
+                  >
+                    ↺ Återställ till upptäckt tonart
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         )}
         <button
           onClick={toggleFullscreen}
@@ -1051,7 +1113,7 @@ function AboutPage() {
     {
       id: 'tonart',
       title: 'Tonart',
-      body: 'Utifrån vilka toner som förekommer mest gissar appen vilken tonart (dur eller moll) melodin ligger i. Det är den tonarten stämmorna sedan byggs utifrån, så en fel uppfattad tonart är den vanligaste orsaken till att en stämma låter konstig.',
+      body: 'Utifrån vilka toner som förekommer mest gissar appen vilken tonart (dur eller moll) melodin ligger i. Det är den tonarten stämmorna sedan byggs utifrån, så en fel uppfattad tonart är den vanligaste orsaken till att en stämma låter konstig. Går det fel går det att rätta: tryck på "Tonart: …" ovanför tonhöjdskurvan för att välja grundton och dur/moll för hand — stämmorna räknas om direkt.',
     },
     {
       id: 'ljud',
@@ -1290,6 +1352,10 @@ export default function App() {
   const meterRefs = useRef({});
   const meterScratchRef = useRef(null);
   const recordedBufferRef = useRef(null);
+  // The key auto-detection actually found, kept even after a manual
+  // override (see overrideKey) so "Återställ" can always get back to it
+  // without re-running analysis.
+  const detectedKeyRef = useRef(null);
   // { buffer, blob } — the last WAV encode done for autosave, so a save
   // triggered by something that isn't the audio itself (a mixer volume
   // nudge, a reverb toggle) doesn't re-encode the same several-hundred-KB
@@ -1630,6 +1696,7 @@ export default function App() {
   // upload, and the explicit reset button.
   function resetSourceState() {
     setKeyInfo(null);
+    detectedKeyRef.current = null;
     setMelodyNotes([]);
     setChannels(defaultChannels());
     setSoundType('recording');
@@ -2062,6 +2129,7 @@ export default function App() {
       setErrorMsg(ANALYSIS_ERROR_MESSAGES[result.error]);
       return;
     }
+    detectedKeyRef.current = result.key;
     setKeyInfo(result.key);
     setMelodyNotes(result.notes);
     // The count-in and (if the toggle was on) the click running through the
@@ -2118,12 +2186,32 @@ export default function App() {
       );
       return false;
     }
+    detectedKeyRef.current = result.key;
     setKeyInfo(result.key);
     setMelodyNotes(result.notes);
     applyDetectedTempo(result.notes);
     setPhase('ready');
     setNoteViewExpanded(true);
     return true;
+  }
+
+  // Manual tonart correction — the app's own most common cause of an odd-
+  // sounding harmony is a misheard key (see the "Tonart"-section on the
+  // About page), so this lets the singer fix it directly instead of
+  // re-recording. Re-quantizes every note against the new key (see
+  // requantizeNotesToKey — uses each note's actual measured pitch, not a
+  // second pass over the raw audio) and invalidates every buffer built
+  // from the old key, exactly like the other edits that replace
+  // melodyNotes/keyInfo wholesale.
+  function overrideKey(tonic, mode) {
+    if (!keyInfo || !melodyNotes.length) return;
+    if (tonic === keyInfo.tonic && mode === keyInfo.mode) return;
+    const nextKey = { tonic, mode };
+    setMelodyNotes((notes) => requantizeNotesToKey(notes, keyInfo, nextKey));
+    setKeyInfo(nextKey);
+    harmonyBuffersRef.current = {};
+    autotunedBuffersRef.current = {};
+    if (isPlaying) stopPlayback();
   }
 
   async function handleFileUpload(file) {
@@ -3001,6 +3089,11 @@ export default function App() {
   }
 
   const keyLabel = keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
+  const keyIsManual = !!(keyInfo && detectedKeyRef.current
+    && (keyInfo.tonic !== detectedKeyRef.current.tonic || keyInfo.mode !== detectedKeyRef.current.mode));
+  function resetKeyToDetected() {
+    if (detectedKeyRef.current) overrideKey(detectedKeyRef.current.tonic, detectedKeyRef.current.mode);
+  }
   const anyChannelEnabled = Object.values(channels).some((c) => c.enabled);
   const anyHarmonyBusy = Object.values(harmonyRenderingByType).some(Boolean);
 
@@ -3081,7 +3174,17 @@ export default function App() {
           {noteViewExpanded && (
             <>
               <div className="mt-2">
-                <PitchCanvas melodyNotes={melodyNotes} harmonyLayers={harmonyLayers} keyInfo={keyInfo} keyLabel={keyLabel} duration={recordingDuration} playheadTime={playheadTime} />
+                <PitchCanvas
+                  melodyNotes={melodyNotes}
+                  harmonyLayers={harmonyLayers}
+                  keyInfo={keyInfo}
+                  keyLabel={keyLabel}
+                  duration={recordingDuration}
+                  playheadTime={playheadTime}
+                  onKeyChange={overrideKey}
+                  onResetKey={resetKeyToDetected}
+                  keyIsManual={keyIsManual}
+                />
               </div>
               {melodyNotes.length > 0 && (
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>

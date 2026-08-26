@@ -92,3 +92,19 @@ export function midiToNoteName(midi) {
   const octave = Math.floor(rounded / 12) - 1;
   return `${NOTE_NAMES[pc]}${octave}`;
 }
+
+// Re-quantizes every note's `step` against a different key, for a manual
+// tonart override after auto-detection guessed wrong (the app's own most
+// common cause of an odd-sounding harmony — the notes themselves already
+// carry everything needed to redo this without re-running pitch tracking).
+// Prefers each note's actual sung pitch (`measuredFreq`, attached by
+// attachMeasuredFreq) so the new step reflects what was really sung rather
+// than a second, compounding quantization; falls back to re-deriving an
+// absolute pitch from the note's existing step in the *old* key for a note
+// that has no measured frequency (too little voiced signal in its range).
+export function requantizeNotesToKey(notes, oldKey, newKey) {
+  return notes.map((n) => {
+    const midi = n.measuredFreq ? freqToMidi(n.measuredFreq) : scaleStepToMidi(n.step, oldKey.tonic, oldKey.mode);
+    return { ...n, step: midiToScaleStep(midi, newKey.tonic, newKey.mode) };
+  });
+}
