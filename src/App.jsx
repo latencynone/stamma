@@ -1122,7 +1122,7 @@ function AboutPage() {
     {
       id: 'live-forhandslyssning',
       title: 'Live-förhandslyssning',
-      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- och/eller sextavstånd — valfri kombination, alla samtidigt om du vill — ett smakprov på hur stämmorna skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn, inklusive samma "Humanisera stämmor"-karaktär (vibrato, formant, tonhöjd) om den är påslagen — så flera stämmor samtidigt faktiskt låter som flera olika röster, inte samma röst tredubblad; innan dess (på startskärmen) används istället ett fast intervall utan karaktär, eftersom ingen tonart är känd än. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard — fler samtidiga stämmor kostar mer processorkraft.',
+      body: 'En direkt, låg-latens mikrofonlyssning som pitchskiftar din röst i realtid till ters-, kvint- och/eller sextavstånd — valfri kombination, alla samtidigt om du vill — ett smakprov på hur stämmorna skulle låta, utan att behöva spela in och vänta på den vanliga stämmemotorn. Har du redan spelat in en gång följer den tonarten och tonhöjden du faktiskt sjunger, precis som den riktiga stämmemotorn, inklusive samma "Humanisera stämmor"-karaktär (vibrato, formant, tonhöjd) om den är påslagen — så flera stämmor samtidigt faktiskt låter som flera olika röster, inte samma röst tredubblad; innan dess (på startskärmen) används istället ett fast intervall utan karaktär, eftersom ingen tonart är känd än. Spelar du in en egen ters/kvint/sext (rec-knappen på stämmans kanal) medan den är på följer den automatiskt med och spelar bara upp just den stämman under tagningen, så du hör exakt vad du siktar på — dina egna valda stämmor kommer tillbaka när du är klar. Kräver hörlurar, annars hörs rundgång eftersom mikrofonen är öppen samtidigt som ljudet spelas upp. Av som standard — fler samtidiga stämmor kostar mer processorkraft.',
     },
     {
       id: 'tonhojdskurva',
@@ -1147,7 +1147,7 @@ function AboutPage() {
     {
       id: 'egen-stamma',
       title: 'Spela in egen stämma',
-      body: 'Rec-knappen på en stämmas kanal spelar in dig själv sjungandes just den stämman, med melodin i hörlurarna/högtalaren som stöd samtidigt. Din inspelade stämma dyker upp som en egen kanal ("Egen ters" osv.) och spelas upp precis som du sjöng den, utan pitchskiftning — du kan radera den och spela in igen när du vill. Fäll ut kanalen så visas samma vågform-verktyg som för huvudinspelningen, med egen beskärning och tona in/ut — bra för att putsa bort en falskstart eller ett andningsljud i början utan att spela in om hela tagningen.',
+      body: 'Rec-knappen på en stämmas kanal spelar in dig själv sjungandes just den stämman, med melodin i hörlurarna/högtalaren som stöd samtidigt. Din inspelade stämma dyker upp som en egen kanal ("Egen ters" osv.) och spelas upp precis som du sjöng den, utan pitchskiftning — du kan radera den och spela in igen när du vill. Fäll ut kanalen så visas samma vågform-verktyg som för huvudinspelningen, med egen beskärning och tona in/ut — bra för att putsa bort en falskstart eller ett andningsljud i början utan att spela in om hela tagningen. Har du live-förhandslyssningen påslagen när du trycker rec smalnar den automatiskt av till just den stämma du spelar in, tonarts- och personlighetsanpassad, så du hör målstämman sjungas med dig medan du tar den — och går tillbaka till dina egna valda stämmor när tagningen är klar. (Kräver hörlurar, annars läcker den in i inspelningen.)',
     },
     {
       id: 'autotune',
@@ -1394,6 +1394,24 @@ export default function App() {
   const [liveMonitorError, setLiveMonitorError] = useState('');
   const [liveMonitorTypes, setLiveMonitorTypes] = useState(() => ({ ters: true, kvint: false, sext: false }));
   const [liveMonitorLatencyMs, setLiveMonitorLatencyMs] = useState(null);
+  // While an own-take recording is running (see recordOwnTake) and the
+  // live monitor happens to be on, it temporarily narrows to *just* the
+  // voice being recorded so you hear that one stämma — tonart- and
+  // "Humanisera"-anpassad, off the same pitch tracker as the offline
+  // engine — sung back over your shoulder while you record it. This holds
+  // the type being followed (or null); liveMonitorRestoreTypesRef holds
+  // the user's own selection to put back afterwards.
+  const [liveMonitorFollowingOwnTake, setLiveMonitorFollowingOwnTake] = useState(null);
+  const liveMonitorFollowingOwnTakeRef = useRef(null);
+  const liveMonitorRestoreTypesRef = useRef(null);
+  // Serializes the async stop→start restarts so the "narrow to one voice
+  // on the shared capture" at record-start and the "restore the user's
+  // own session" at record-end can't interleave (a fast start→cancel
+  // during the count-in).
+  const liveMonitorOpRef = useRef(Promise.resolve());
+  // Re-entrancy guard for startLiveMonitor that a queued restart can rely
+  // on synchronously (the liveMonitorStarting state lags a render behind).
+  const liveMonitorBusyRef = useRef(false);
   const liveMonitorKeyAware = !!keyInfo;
   const liveMonitorStreamRef = useRef(null);
   const liveMonitorCtxRef = useRef(null);
@@ -2242,25 +2260,37 @@ export default function App() {
     mix.gain.setTargetAtTime(activeCount ? 1 / Math.sqrt(activeCount) : 0, ctx.currentTime, 0.02);
   }
 
-  async function startLiveMonitor() {
-    if (liveMonitorOn || liveMonitorStarting) return;
+  // `externalStream` (a clone of the own-take recording's mic stream — see
+  // followOwnTakeWithLiveMonitor) lets the monitor run without opening a
+  // second getUserMedia capture of its own: iOS Safari tends to interrupt
+  // an existing capture the moment a new one with different constraints
+  // starts, which would silently kill whichever of "recording" and
+  // "monitoring" started first. Sharing one capture (via .clone(), which
+  // doesn't open a new device stream) sidesteps that entirely. We still
+  // own the clone and stop it in stopLiveMonitor like any other stream.
+  async function startLiveMonitor(externalStream = null) {
+    if (liveMonitorBusyRef.current || liveMonitorCtxRef.current) return;
+    liveMonitorBusyRef.current = true;
     setLiveMonitorError('');
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (!externalStream && (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)) {
       setLiveMonitorError('Den här webbläsaren stödjer inte live-förhandslyssning.');
+      liveMonitorBusyRef.current = false;
       return;
     }
-    if (micPermission === 'denied') {
+    if (!externalStream && micPermission === 'denied') {
       setLiveMonitorError('Mikrofonåtkomst är blockerad för den här sidan.');
+      liveMonitorBusyRef.current = false;
       return;
     }
     const activeTypes = HARMONY_KEYS.filter((t) => liveMonitorTypesRef.current[t]);
     if (activeTypes.length === 0) {
       setLiveMonitorError('Välj minst en stämma (ters, kvint eller sext) att förhandslyssna.');
+      liveMonitorBusyRef.current = false;
       return;
     }
     setLiveMonitorStarting(true);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = externalStream || await navigator.mediaDevices.getUserMedia({ audio: true });
       liveMonitorStreamRef.current = stream;
       const AC = window.AudioContext || window.webkitAudioContext;
       const ctx = new AC({ latencyHint: 'interactive' });
@@ -2311,6 +2341,7 @@ export default function App() {
       stopLiveMonitor();
     } finally {
       setLiveMonitorStarting(false);
+      liveMonitorBusyRef.current = false;
     }
   }
 
@@ -2346,6 +2377,79 @@ export default function App() {
       scheduleLiveMonitorFixedInterval(node, ctx, type);
     }
   }
+
+  // Points liveMonitorTypesRef (and the state mirror the card renders at)
+  // at an exact { ters, kvint, sext } map. Used by the own-take follow to
+  // narrow to one voice and to put the user's selection back — a plain
+  // assignment because the follow always restarts the monitor right after
+  // (a fresh startLiveMonitor reads the ref), rather than diffing voices
+  // onto a live session.
+  function setLiveMonitorTypeSet(next) {
+    liveMonitorTypesRef.current = { ...next };
+    setLiveMonitorTypes(liveMonitorTypesRef.current);
+  }
+
+  // Serializes stop→start restarts of the monitor so a record-start
+  // narrow and a record-end restore can't run concurrently.
+  function queueLiveMonitorOp(fn) {
+    liveMonitorOpRef.current = liveMonitorOpRef.current.catch(() => {}).then(fn);
+    return liveMonitorOpRef.current;
+  }
+
+  // Called at own-take record start (see recordOwnTake): if the live
+  // monitor is on, remember the user's own voice selection, narrow to
+  // just `type`, and restart the monitor onto a *clone of the recording's
+  // own mic stream* (see startLiveMonitor's externalStream note) so only
+  // one capture is open. No-op when the monitor is off — this is opt-in
+  // via that toggle (it needs headphones, same as the monitor itself), it
+  // doesn't force the monitor on.
+  function followOwnTakeWithLiveMonitor(type, sourceStream) {
+    if (!liveMonitorOn || liveMonitorFollowingOwnTakeRef.current) return;
+    // Needs its own stoppable copy of the capture (see startLiveMonitor's
+    // externalStream note) — bail rather than risk stopLiveMonitor later
+    // killing the recording's stream if clone() somehow isn't there.
+    if (!sourceStream || typeof sourceStream.clone !== 'function') return;
+    const clone = sourceStream.clone();
+    liveMonitorRestoreTypesRef.current = { ...liveMonitorTypesRef.current };
+    liveMonitorFollowingOwnTakeRef.current = type;
+    setLiveMonitorFollowingOwnTake(type);
+    setLiveMonitorTypeSet({ ters: type === 'ters', kvint: type === 'kvint', sext: type === 'sext' });
+    queueLiveMonitorOp(async () => {
+      stopLiveMonitor();
+      await startLiveMonitor(clone);
+    });
+  }
+
+  // Called on every own-take recording exit (via the recordingOwnTake
+  // effect below, so count-in cancel / early stop / natural end / a
+  // resetSourceState abort all land here) — put the user's own voice
+  // selection back and, if the monitor is still running, restart it onto
+  // its own fresh capture. If the user turned the monitor off meanwhile
+  // the restart is skipped; the restored selection just applies next time
+  // they start it.
+  function restoreLiveMonitorAfterOwnTake() {
+    if (!liveMonitorFollowingOwnTakeRef.current) return;
+    const restore = liveMonitorRestoreTypesRef.current;
+    liveMonitorFollowingOwnTakeRef.current = null;
+    liveMonitorRestoreTypesRef.current = null;
+    setLiveMonitorFollowingOwnTake(null);
+    if (restore) setLiveMonitorTypeSet(restore);
+    queueLiveMonitorOp(async () => {
+      const wasRunning = !!liveMonitorCtxRef.current;
+      stopLiveMonitor();
+      if (wasRunning) await startLiveMonitor();
+    });
+  }
+
+  // Every own-take recording exit funnels through recordingOwnTake going
+  // back to null (natural end, early stop, count-in cancel, or a
+  // resetSourceState abort) — the one place to undo followOwnTakeWith-
+  // LiveMonitor from. restoreLiveMonitorAfterOwnTake is a no-op unless a
+  // follow is actually active, so the null on mount is harmless.
+  useEffect(() => {
+    if (!recordingOwnTake) restoreLiveMonitorAfterOwnTake();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordingOwnTake]);
 
   async function startRecording() {
     setErrorMsg('');
@@ -3454,6 +3558,12 @@ export default function App() {
     // that's about to play as a monitor.
     ownTakeCountInCancelledRef.current = false;
     setRecordingOwnTake({ type, countingIn: true, countInBeat: 0, countdown: recordingDuration });
+    // If the live monitor is on, narrow it to just this voice for the
+    // recording so you hear the tonart-/character-anpassad stämma sung
+    // back while you record it (restored on any exit via the
+    // recordingOwnTake effect). Runs from the count-in on, so the harmony
+    // is already there on the first beat you sing.
+    followOwnTakeWithLiveMonitor(type, stream);
     try {
       const clickCtx = await getPlaybackContext();
       await playCountIn(clickCtx, metronomeBpm, (i) => {
@@ -4179,6 +4289,7 @@ export default function App() {
               keyAware={liveMonitorKeyAware}
               keyInfo={keyInfo}
               humanizeOn={humanizeOn}
+              followingOwnTake={liveMonitorFollowingOwnTake}
               onToggle={() => (liveMonitorOn ? stopLiveMonitor() : startLiveMonitor())}
               onToggleType={toggleLiveMonitorVoice}
             />
@@ -5121,32 +5232,36 @@ function HeadphonesIcon({ size = 14 }) {
 // `types` is a { ters, kvint, sext } bool map — any combination can be
 // active at once (see toggleLiveMonitorVoice), so the buttons below are
 // independent toggles, not an exclusive choice.
-function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyInfo, humanizeOn, onToggle, onToggleType }) {
+function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyInfo, humanizeOn, followingOwnTake, onToggle, onToggleType }) {
   const keyLabel = keyAware && keyInfo ? `${NOTE_NAMES[keyInfo.tonic]}-${keyInfo.mode === 'major' ? 'dur' : 'moll'}` : null;
   const anyActive = HARMONY_KEYS.some((t) => types[t]);
+  const following = !!followingOwnTake;
   return (
     <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
       <div className="flex items-center gap-2">
         <HeadphonesIcon size={16} />
         <span className="text-sm font-medium">Live-förhandslyssning</span>
         <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
-          {starting ? 'Startar …' : on && latencyMs != null ? `${latencyMs} ms` : 'Kräver hörlurar'}
+          {starting ? 'Startar …' : following ? 'Följer inspelningen' : on && latencyMs != null ? `${latencyMs} ms` : 'Kräver hörlurar'}
         </span>
-        <ToggleSwitch checked={on} onChange={onToggle} disabled={starting} accentColor="#55D6C0" />
+        <ToggleSwitch checked={on || following} onChange={onToggle} disabled={starting || following} accentColor="#55D6C0" />
       </div>
-      {on && (
+      {(on || following) && (
         <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
           <div className="flex gap-2">
             {HARMONY_KEYS.map((t) => (
               <button
                 key={t}
-                onClick={() => onToggleType(t)}
+                onClick={() => { if (!following) onToggleType(t); }}
+                disabled={following}
                 aria-pressed={!!types[t]}
                 className="stamma-btn flex-1 rounded-lg py-2 font-body font-medium text-sm"
                 style={{
                   backgroundColor: types[t] ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
                   color: types[t] ? '#55D6C0' : '#F1EDE4',
                   border: types[t] ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                  opacity: following && !types[t] ? 0.4 : 1,
+                  cursor: following ? 'default' : 'pointer',
                 }}
               >
                 {HARMONY_TYPES[t].label}
@@ -5154,11 +5269,13 @@ function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyI
             ))}
           </div>
           <p className="mt-2 font-mono-ui text-[11px]" style={{ color: '#C7CBDA' }}>
-            {!anyActive
-              ? 'Ingen stämma vald — tyst tills du väljer en.'
-              : keyLabel
-                ? `Tonartsanpassad (${keyLabel})${humanizeOn ? ', humaniserad röstkaraktär' : ''} — följer tonhöjden du sjunger.`
-                : 'Fast intervall (ingen tonart känd ännu).'}
+            {following
+              ? `Följer din inspelning av egen ${HARMONY_TYPES[followingOwnTake].label.toLowerCase()} — övriga stämmor pausade tills tagningen är klar.`
+              : !anyActive
+                ? 'Ingen stämma vald — tyst tills du väljer en.'
+                : keyLabel
+                  ? `Tonartsanpassad (${keyLabel})${humanizeOn ? ', humaniserad röstkaraktär' : ''} — följer tonhöjden du sjunger.`
+                  : 'Fast intervall (ingen tonart känd ännu).'}
           </p>
         </div>
       )}
