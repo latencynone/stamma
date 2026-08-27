@@ -1436,6 +1436,19 @@ export default function App() {
   // engine's formantBaseHzFor — the median melody frequency) rather than
   // re-derived every tick, since it shouldn't drift mid-session.
   const liveMonitorFormantBaseHzRef = useRef(0);
+  // Per-voice-type "generation" counter, bumped by createLiveMonitorVoice
+  // itself at the *start* of every call (before its await). A rapid
+  // off->on->off->on double-toggle of the same voice can leave an earlier
+  // call's SignalsmithStretch(...) round-trip still in flight when a later
+  // one for the same type has already started; without this, the earlier
+  // call's stale resolution would see the type is (once again) wanted and
+  // register/connect itself too — silently overwriting the newer node's
+  // entry in liveMonitorNodesRef while staying connected and playing, an
+  // orphaned "ghost" voice stopLiveMonitor() can no longer find to clean
+  // up since it's not in the ref map anymore. Comparing the generation
+  // captured at call-start against the current one after the await lets a
+  // superseded call disconnect itself instead.
+  const liveMonitorVoiceGenRef = useRef({});
   const keyInfoRef = useRef(keyInfo);
   const channelsRef = useRef(channels);
   const humanizeOnRef = useRef(humanizeOn);
@@ -2238,8 +2251,10 @@ export default function App() {
   // actually playing since liveMonitorTypesRef flips synchronously
   // (before the await) while this only learns about it after.
   async function createLiveMonitorVoice(ctx, source, mix, type) {
+    const myGen = (liveMonitorVoiceGenRef.current[type] || 0) + 1;
+    liveMonitorVoiceGenRef.current = { ...liveMonitorVoiceGenRef.current, [type]: myGen };
     const node = await SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-    if (liveMonitorCtxRef.current !== ctx || !liveMonitorTypesRef.current[type]) {
+    if (liveMonitorCtxRef.current !== ctx || !liveMonitorTypesRef.current[type] || liveMonitorVoiceGenRef.current[type] !== myGen) {
       node.disconnect();
       return node;
     }
