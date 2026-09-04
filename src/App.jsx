@@ -3877,7 +3877,10 @@ export default function App() {
           </div>
         )}
 
-        {/* Signature visualization */}
+        {/* Signature visualization — nothing to show until an analysis has
+            actually produced melody notes/a waveform, so this stays hidden
+            through idle and error rather than rendering an empty shell. */}
+        {phase === 'ready' && (
         <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
           <button
             onClick={() => setNoteViewExpanded((v) => !v)}
@@ -4102,6 +4105,7 @@ export default function App() {
             </div>
           )}
         </div>
+        )}
 
         {/* Error banner */}
         {errorMsg && (
