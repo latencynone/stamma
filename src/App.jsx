@@ -241,13 +241,13 @@ function detectNoiseRegion(channelData, sampleRate, duration) {
 // One metronome tick — a short sine blip, accented (higher pitch, a touch
 // louder) on the first beat of every 4 so the pulse reads as a bar, not
 // just an undifferentiated click.
-function playMetronomeClick(ctx, whenTime, accent) {
+function playMetronomeClick(ctx, whenTime, accent, gainMultiplier = 1) {
   const osc = ctx.createOscillator();
   osc.type = 'sine';
   osc.frequency.value = accent ? 1500 : 1000;
   const gain = ctx.createGain();
   gain.gain.setValueAtTime(0.0001, whenTime);
-  gain.gain.exponentialRampToValueAtTime(accent ? 0.4 : 0.28, whenTime + 0.004);
+  gain.gain.exponentialRampToValueAtTime((accent ? 0.4 : 0.28) * gainMultiplier, whenTime + 0.004);
   gain.gain.exponentialRampToValueAtTime(0.0001, whenTime + 0.06);
   osc.connect(gain).connect(ctx.destination);
   osc.start(whenTime);
@@ -262,13 +262,13 @@ function playMetronomeClick(ctx, whenTime, accent) {
 // same timestamp another scheduled event starts at (e.g. mix playback)
 // makes the two sample-accurately simultaneous instead of each just
 // starting "soon".
-function startMetronomeScheduler(ctx, bpm, startTime) {
+function startMetronomeScheduler(ctx, bpm, startTime, gainMultiplier = 1) {
   const beatDur = 60 / Math.max(20, bpm);
   const lookahead = 0.1;
   const state = { nextClickTime: startTime ?? ctx.currentTime + 0.1, beatCount: 0 };
   state.intervalId = setInterval(() => {
     while (state.nextClickTime < ctx.currentTime + lookahead) {
-      playMetronomeClick(ctx, state.nextClickTime, state.beatCount % 4 === 0);
+      playMetronomeClick(ctx, state.nextClickTime, state.beatCount % 4 === 0, gainMultiplier);
       state.nextClickTime += beatDur;
       state.beatCount++;
     }
@@ -287,11 +287,20 @@ function stopMetronomeScheduler(state) {
 // sounded — i.e. exactly when recording should begin. `onBeat(i)` is
 // setTimeout-paced (not sample-accurate) since it only drives a UI digit.
 const COUNT_IN_BEATS = 4;
-function playCountIn(ctx, bpm, onBeat) {
+// iOS Safari (worst as a home-screen-installed web app) has been reported
+// to audibly duck the page's own audio output once a getUserMedia capture
+// with echoCancellation disabled is active alongside it — exactly the
+// constraint recordOwnTake requests (see its own comment on why). Can't be
+// detected or fixed from script (the OS does it below the Web Audio API),
+// so this just plays the monitor melody and count-in/click louder than
+// normal specifically during that recording, as a blind compensation —
+// needs recalibrating by ear on a real device if it over- or under-shoots.
+const OWN_TAKE_MONITOR_BOOST = 1.6;
+function playCountIn(ctx, bpm, onBeat, gainMultiplier = 1) {
   const beatDur = 60 / Math.max(20, bpm);
   const start = ctx.currentTime + 0.05;
   for (let i = 0; i < COUNT_IN_BEATS; i++) {
-    playMetronomeClick(ctx, start + i * beatDur, i === 0);
+    playMetronomeClick(ctx, start + i * beatDur, i === 0, gainMultiplier);
   }
   return new Promise((resolve) => {
     for (let i = 0; i < COUNT_IN_BEATS; i++) {
@@ -3393,7 +3402,7 @@ export default function App() {
   // "Lyssna" to click alongside the melody at whatever tempo it just
   // detected, without permanently flipping the separate recording/
   // playback-click setting.
-  async function startMix(channelsState, keysOverride, startOffset, metronomeOverride) {
+  async function startMix(channelsState, keysOverride, startOffset, metronomeOverride, metronomeGainMultiplier = 1) {
     stopPlayback();
     metronomeOverrideRef.current = metronomeOverride || null;
     const myGeneration = playGenerationRef.current;
@@ -3481,9 +3490,9 @@ export default function App() {
       metronomeSchedulerRef.current = null;
     }
     if (metronomeOverride) {
-      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeOverride.bpm, now);
+      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeOverride.bpm, now, metronomeGainMultiplier);
     } else if (metronomeEnabledRef.current) {
-      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpmRef.current, now);
+      metronomeSchedulerRef.current = startMetronomeScheduler(ctx, metronomeBpmRef.current, now, metronomeGainMultiplier);
       if (metronomeListening) setMetronomeListening(false);
     }
 
@@ -3501,7 +3510,7 @@ export default function App() {
         // (see metronomeOverrideRef) — otherwise a looping Lyssna preview
         // would click at the detected tempo for one pass and then silently
         // fall back to the separate metronomeEnabled setting.
-        startMix(channelsState, keysOverride, undefined, metronomeOverrideRef.current || undefined);
+        startMix(channelsState, keysOverride, undefined, metronomeOverrideRef.current || undefined, metronomeGainMultiplier);
       } else {
         stopPlayback();
         if (metronomeOverrideRef.current) setMetronomeListening(false);
@@ -3604,7 +3613,7 @@ export default function App() {
       const clickCtx = await getPlaybackContext();
       await playCountIn(clickCtx, metronomeBpm, (i) => {
         setRecordingOwnTake((s) => (s && s.type === type && s.countingIn ? { ...s, countInBeat: i } : s));
-      });
+      }, OWN_TAKE_MONITOR_BOOST);
     } catch (err) {
       // The mic stream was already opened above — without this, a failure
       // here (the playback context refusing to (re)start, say) would leave
@@ -3619,7 +3628,15 @@ export default function App() {
     }
     if (ownTakeCountInCancelledRef.current) return;
 
-    startMix(channels, ['melody']);
+    // Boosted melody volume + click gain (see OWN_TAKE_MONITOR_BOOST) —
+    // compensating for iOS's own output ducking during this recording,
+    // not a real preference, so it's a one-off copy of `channels` rather
+    // than a change to the melody channel's actual stored volume.
+    const boostedChannels = {
+      ...channels,
+      melody: { ...channels.melody, volume: channels.melody.volume * OWN_TAKE_MONITOR_BOOST },
+    };
+    startMix(boostedChannels, ['melody'], undefined, undefined, OWN_TAKE_MONITOR_BOOST);
 
     ownTakeChunksRef.current = [];
     ownTakeFinishedRef.current = false;
