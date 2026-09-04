@@ -2599,6 +2599,7 @@ export default function App() {
 
     setPhase('analyzing');
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    discardPlaybackContext();
 
     const mr = mediaRecorderRef.current;
     if (mr && mr.state !== 'inactive') {
@@ -2953,6 +2954,26 @@ export default function App() {
       await ctx.resume();
     }
     return ctx;
+  }
+
+  // Called right as a getUserMedia recording (main or own-take) stops its
+  // stream — see the two call sites. iOS Safari (worst as a home-screen-
+  // installed web app, reported symptom: totally silent "Spela mix", no
+  // error, right after recording an own take without headphones) can leave
+  // an already-open AudioContext's underlying audio session silently
+  // broken once a getUserMedia capture that ran alongside it ends, even
+  // though the context itself keeps reporting state 'running' — so
+  // getPlaybackContext()'s own suspended-check never notices anything is
+  // wrong. Discarding the cached context here forces the next
+  // getPlaybackContext() call to build a fresh one, which reliably gets a
+  // clean session. Cheap and harmless on browsers where this isn't an
+  // issue — playback wasn't running during a recording anyway (startMix's
+  // own stopPlayback() sees to that), so there's nothing to interrupt.
+  function discardPlaybackContext() {
+    if (playCtxRef.current && playCtxRef.current.state !== 'closed') {
+      playCtxRef.current.close().catch(() => {});
+    }
+    playCtxRef.current = null;
   }
 
   // "Lyssna" — preview the click track on its own, independent of any
@@ -3662,6 +3683,7 @@ export default function App() {
     stopPlayback(); // stop the monitor
     const stream = ownTakeStreamRef.current;
     if (stream) stream.getTracks().forEach((t) => t.stop());
+    discardPlaybackContext();
 
     const mr = ownTakeRecorderRef.current;
     if (!mr || mr.state === 'inactive') {
