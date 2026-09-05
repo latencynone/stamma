@@ -25,7 +25,7 @@ import {
   detectTempoBpm,
 } from './pitchAnalysis.js';
 import { renderHarmonyOffline, renderAutotunedMelody, computeEnergyEnvelope, formantBaseHzFor, HARMONY_HUMANIZE_PROFILES } from './harmonyEngine.js';
-import { alignOwnTakeToMelody } from './takeAlignment.js';
+import { detectAlignmentAnchors, renderAlignmentFromAnchors } from './takeAlignment.js';
 import { audioBufferToWavBlob, downloadBlob } from './wav.js';
 import { fft, ifft, hannWindow } from './dsp.js';
 import { saveProject, listProjects, loadProject, deleteProject, renameProject } from './indexedDb.js';
@@ -672,11 +672,19 @@ function WaveformTrimmer({
   noiseReductionMode, onToggleNoiseReductionMode, noiseSampleStart, noiseSampleEnd, onNoiseSampleChange,
   onApplyNoiseReduction, denoising, denoiseError, noiseReductionApplied,
   metronomeEnabled, onToggleMetronome, theme,
+  alignAnchors, onAlignAnchorDrag,
 }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const drawRef = useRef(() => {});
+  // "Tajta till" anchor being dragged (see applyOwnTakeAlignment /
+  // dragOwnTakeAlignAnchor in App) — tracked locally so the marker follows
+  // the pointer smoothly without re-rendering the (expensive, async) time-
+  // warped audio on every pointermove; the actual re-render only fires
+  // once, from onAlignAnchorDrag, on pointer-up.
+  const [dragAnchor, setDragAnchor] = useState(null); // { index, time } | null
+  const dragAnchorLiveRef = useRef(null); // mirrors dragAnchor.time — see beginAnchorDrag's `up`
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -872,6 +880,63 @@ function WaveformTrimmer({
       };
       window.addEventListener('pointermove', move);
       window.addEventListener('pointerup', up);
+    };
+  }
+
+  // Manual per-anchor override (Tracktion Warp Time / Logic Flex Time
+  // style) — drag a detected anchor's own-take time directly on the
+  // waveform. Clamped between its neighbors (own-take onsets can't cross
+  // each other and stay a valid monotonic match) rather than the trim
+  // window, since an anchor is a point in the *raw* take's timeline.
+  const ANCHOR_MIN_GAP_SEC = 0.05;
+  function anchorBounds(index) {
+    const anchors = alignAnchors || [];
+    const prevTime = index > 0 ? anchors[index - 1].ownTime + ANCHOR_MIN_GAP_SEC : 0;
+    const nextTime = index < anchors.length - 1 ? anchors[index + 1].ownTime - ANCHOR_MIN_GAP_SEC : duration;
+    return [Math.min(prevTime, nextTime), Math.max(prevTime, nextTime)];
+  }
+
+  function beginAnchorDrag(index) {
+    return (e) => {
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+      const [lo, hi] = anchorBounds(index);
+      const move = (ev) => {
+        const rect = wrapRef.current.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+        const t = Math.min(hi, Math.max(lo, frac * duration));
+        dragAnchorLiveRef.current = t;
+        setDragAnchor({ index, time: t });
+      };
+      const up = () => {
+        handle.releasePointerCapture(e.pointerId);
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        // Read the live value from the ref, not from a setDragAnchor
+        // updater — calling onAlignAnchorDrag (which updates state on the
+        // *parent*, App) from inside a setState updater for *this*
+        // component triggers React's "Cannot update a component while
+        // rendering a different component" warning, since updaters can run
+        // during render. Plain sequential calls avoid that entirely.
+        const finalTime = dragAnchorLiveRef.current;
+        dragAnchorLiveRef.current = null;
+        setDragAnchor(null);
+        if (finalTime !== null && onAlignAnchorDrag) onAlignAnchorDrag(index, finalTime);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    };
+  }
+
+  function anchorKeyDown(index) {
+    return (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const step = e.shiftKey ? STEP_SEC_LARGE : STEP_SEC;
+      const [lo, hi] = anchorBounds(index);
+      const cur = alignAnchors[index].ownTime;
+      const next = Math.min(hi, Math.max(lo, cur + (e.key === 'ArrowRight' ? step : -step)));
+      if (onAlignAnchorDrag) onAlignAnchorDrag(index, next);
     };
   }
 
@@ -1127,7 +1192,37 @@ function WaveformTrimmer({
             </div>
           </>
         )}
+        {alignAnchors && alignAnchors.map((anchor, i) => {
+          const t = dragAnchor && dragAnchor.index === i ? dragAnchor.time : anchor.ownTime;
+          const pct = duration > 0 ? Math.min(100, Math.max(0, (t / duration) * 100)) : 0;
+          return (
+            <div
+              key={i}
+              onPointerDown={beginAnchorDrag(i)}
+              onKeyDown={anchorKeyDown(i)}
+              style={{ position: 'absolute', top: 0, bottom: 0, left: `calc(${pct}% - 7px)`, width: 14, cursor: 'ew-resize', touchAction: 'none' }}
+              className="stamma-btn"
+              role="slider"
+              tabIndex={0}
+              title="Ankarpunkt — dra för att justera tajmingen manuellt"
+              aria-label={`Ankarpunkt ${i + 1} av ${alignAnchors.length}`}
+              aria-valuemin={0}
+              aria-valuemax={Math.round(duration * 10) / 10}
+              aria-valuenow={Math.round(t * 10) / 10}
+              aria-valuetext={`${t.toFixed(2)} sekunder`}
+            >
+              <div style={{ position: 'absolute', left: 6, top: 0, bottom: 0, width: 2, backgroundColor: 'var(--gold)', opacity: 0.85 }} />
+              <div style={{ position: 'absolute', left: 0, top: 2, width: 14, height: 14, borderRadius: '50%', backgroundColor: 'var(--gold)', border: '2px solid var(--bg)' }} />
+            </div>
+          );
+        })}
       </div>
+      {alignAnchors && alignAnchors.length > 0 && (
+        <div className="mt-1.5 flex items-center gap-1.5 font-mono-ui text-[10px]" style={{ color: 'var(--gold)' }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: 'var(--gold)', display: 'inline-block' }} />
+          <span>Dra en punkt för att justera tajmingen manuellt där</span>
+        </div>
+      )}
       <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: 'var(--text-muted)' }}>
         <span style={{ color: 'var(--teal)' }}>{trimStart.toFixed(1)}s</span>
         <span>{(trimEnd - trimStart).toFixed(1)}s vald</span>
@@ -1554,8 +1649,14 @@ export default function App() {
   const [expandedChannels, setExpandedChannels] = useState({});
   const [recordingOwnTake, setRecordingOwnTake] = useState(null); // { type, countingIn, countInBeat, countdown } | null
   const [ownTakeError, setOwnTakeError] = useState('');
-  const [ownTakeAligningByType, setOwnTakeAligningByType] = useState({}); // { ters, kvint, sext } -> bool, see alignOwnTake
+  const [ownTakeAligningByType, setOwnTakeAligningByType] = useState({}); // { ters, kvint, sext } -> bool, see applyOwnTakeAlignment
   const [ownTakeWaveformPeaksByType, setOwnTakeWaveformPeaksByType] = useState({}); // { ters, kvint, sext } -> Float32Array, for that channel's own WaveformTrimmer
+  // "Tajta till" is opt-in (see applyOwnTakeAlignment) — these track, per
+  // type, the detected anchors of the currently-applied alignment (null =
+  // showing the raw, unaligned take) and the "Styrka" dial's 0..1 value
+  // (kept even after a revert, so re-aligning remembers the last setting).
+  const [ownTakeAlignAnchorsByType, setOwnTakeAlignAnchorsByType] = useState({});
+  const [ownTakeAlignStrengthByType, setOwnTakeAlignStrengthByType] = useState({});
   // The most recently saved project's *metadata* (no audio — see
   // listProjects), offered via a dismissible banner at mount. Never
   // applied automatically; dismissing just hides the banner; the project
@@ -1722,7 +1823,8 @@ export default function App() {
   const fileInputRef = useRef(null);
   const loopEnabledRef = useRef(false);
   const isPlayingRef = useRef(false);
-  const ownTakeBuffersRef = useRef({}); // { ters, kvint, sext } -> AudioBuffer | null
+  const ownTakeBuffersRef = useRef({}); // { ters, kvint, sext } -> AudioBuffer | null — raw or aligned, whichever is currently playing
+  const ownTakeRawBuffersRef = useRef({}); // { ters, kvint, sext } -> AudioBuffer | null — the untouched recording, so re-aligning/reverting never compounds on a previous alignment
   const ownTakeStreamRef = useRef(null);
   const ownTakeRecorderRef = useRef(null);
   const ownTakeChunksRef = useRef([]);
@@ -2128,9 +2230,12 @@ export default function App() {
       setRecordingOwnTake(null);
     }
     ownTakeBuffersRef.current = {};
+    ownTakeRawBuffersRef.current = {};
     setOwnTakeError('');
     setOwnTakeAligningByType({});
     setOwnTakeWaveformPeaksByType({});
+    setOwnTakeAlignAnchorsByType({});
+    setOwnTakeAlignStrengthByType({});
     stopPlayback();
     // The previous take is being *replaced* (new recording/upload, or an
     // explicit reset), not deleted — it's still real, named, saved work,
@@ -3926,7 +4031,14 @@ export default function App() {
         // audible level by default; falls back to the raw decode for a
         // take that's genuinely silent (nothing to normalize against).
         const audioBuffer = peakNormalizeBuffer(decodeCtx, decoded) || decoded;
+        ownTakeRawBuffersRef.current[type] = audioBuffer;
         ownTakeBuffersRef.current[type] = audioBuffer;
+        setOwnTakeAlignAnchorsByType((prev) => {
+          if (!(type in prev)) return prev;
+          const next = { ...prev };
+          delete next[type];
+          return next;
+        });
         const ownKey = `${type}Own`;
         setChannels((prev) => ({
           ...prev,
@@ -3937,7 +4049,6 @@ export default function App() {
           [ownKey]: prev[ownKey] || { enabled: true, volume: 0.85, pan: 0, solo: false, trimStart: null, trimEnd: null, fadeIn: null, fadeOut: null },
         }));
         setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(audioBuffer) }));
-        alignOwnTake(type, audioBuffer);
       } catch (err) {
         setOwnTakeError(`Kunde inte spela in din ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
       } finally {
@@ -3948,28 +4059,73 @@ export default function App() {
     mr.stop();
   }
 
-  // Kicked off right after a take is decoded (see mr.onstop above) — MTrack-
-  // Align-style timing alignment against the melody's onsets, see
-  // takeAlignment.js. Fire-and-forget: the raw take is already enabled and
-  // playable while this runs in the background, `ownTakeAligningByType`
-  // only drives the "(bygger …)" label on that channel. The identity check
-  // before overwriting the ref guards against the take having been deleted
-  // or re-recorded (a different buffer now sitting there) before this
-  // resolves.
-  async function alignOwnTake(type, rawBuffer) {
+  // "Tajta till" — opt-in MTrackAlign-style timing alignment of an own take
+  // against the melody's onsets (see takeAlignment.js). Always re-detects
+  // and re-renders from the untouched raw take (ownTakeRawBuffersRef), so
+  // pressing the button again after adjusting "Styrka" never compounds on
+  // a previous alignment. The identity check before overwriting the ref
+  // guards against the take having been deleted or re-recorded (a
+  // different buffer now sitting there) while this was running.
+  async function applyOwnTakeAlignment(type) {
+    const rawBuffer = ownTakeRawBuffersRef.current[type];
+    if (!rawBuffer || !melodyNotes.length) return;
+    const strength = ownTakeAlignStrengthByType[type] ?? 0.5;
     setOwnTakeAligningByType((prev) => ({ ...prev, [type]: true }));
     try {
-      const aligned = await alignOwnTakeToMelody(rawBuffer, melodyNotes, recordingDuration);
-      if (ownTakeBuffersRef.current[type] === rawBuffer) {
+      const anchors = detectAlignmentAnchors(rawBuffer, melodyNotes, strength);
+      const aligned = await renderAlignmentFromAnchors(rawBuffer, anchors, recordingDuration, strength);
+      if (ownTakeRawBuffersRef.current[type] === rawBuffer) {
         ownTakeBuffersRef.current[type] = aligned;
-        if (aligned !== rawBuffer) {
-          setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(aligned) }));
-        }
+        setOwnTakeAlignAnchorsByType((prev) => ({ ...prev, [type]: anchors }));
+        setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(aligned) }));
       }
     } catch (err) {
-      // Alignment is a best-effort enhancement on top of an already-usable
-      // take — leave the raw, unaligned recording in place rather than
-      // surfacing an error for it.
+      setOwnTakeError(`Kunde inte tajta till ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
+    } finally {
+      setOwnTakeAligningByType((prev) => ({ ...prev, [type]: false }));
+    }
+  }
+
+  // Back to the untouched recording — drops the applied alignment without
+  // discarding the raw take (still sitting in ownTakeRawBuffersRef).
+  function revertOwnTakeAlignment(type) {
+    const rawBuffer = ownTakeRawBuffersRef.current[type];
+    if (!rawBuffer) return;
+    ownTakeBuffersRef.current[type] = rawBuffer;
+    setOwnTakeAlignAnchorsByType((prev) => {
+      if (!(type in prev)) return prev;
+      const next = { ...prev };
+      delete next[type];
+      return next;
+    });
+    setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(rawBuffer) }));
+  }
+
+  function setOwnTakeAlignStrength(type, value) {
+    setOwnTakeAlignStrengthByType((prev) => ({ ...prev, [type]: value }));
+  }
+
+  // Tracktion Warp Time / Logic Flex Time-style manual override: drag one
+  // detected anchor's own-take time directly on the waveform, then
+  // re-render from the (unchanged) raw take through the edited anchor list
+  // — no re-detection, so the manual edit isn't immediately rediscovered
+  // and overwritten by the automatic match it started from.
+  async function dragOwnTakeAlignAnchor(type, index, newOwnTime) {
+    const rawBuffer = ownTakeRawBuffersRef.current[type];
+    const anchors = ownTakeAlignAnchorsByType[type];
+    if (!rawBuffer || !anchors || !anchors[index]) return;
+    const edited = anchors.map((a, i) => (i === index ? { ...a, ownTime: newOwnTime } : a));
+    setOwnTakeAlignAnchorsByType((prev) => ({ ...prev, [type]: edited }));
+    const strength = ownTakeAlignStrengthByType[type] ?? 0.5;
+    setOwnTakeAligningByType((prev) => ({ ...prev, [type]: true }));
+    try {
+      const aligned = await renderAlignmentFromAnchors(rawBuffer, edited, recordingDuration, strength);
+      if (ownTakeRawBuffersRef.current[type] === rawBuffer) {
+        ownTakeBuffersRef.current[type] = aligned;
+        setOwnTakeWaveformPeaksByType((prev) => ({ ...prev, [type]: computeWaveformPeaks(aligned) }));
+      }
+    } catch (err) {
+      setOwnTakeError(`Kunde inte tajta till ${HARMONY_TYPES[type].label.toLowerCase()}. Testa igen.`);
     } finally {
       setOwnTakeAligningByType((prev) => ({ ...prev, [type]: false }));
     }
@@ -3977,6 +4133,7 @@ export default function App() {
 
   function deleteOwnTake(type) {
     ownTakeBuffersRef.current[type] = null;
+    ownTakeRawBuffersRef.current[type] = null;
     const ownKey = `${type}Own`;
     setChannels((prev) => {
       if (!(ownKey in prev)) return prev;
@@ -3985,6 +4142,12 @@ export default function App() {
       return next;
     });
     setOwnTakeWaveformPeaksByType((prev) => {
+      if (!(type in prev)) return prev;
+      const next = { ...prev };
+      delete next[type];
+      return next;
+    });
+    setOwnTakeAlignAnchorsByType((prev) => {
       if (!(type in prev)) return prev;
       const next = { ...prev };
       delete next[type];
@@ -4843,6 +5006,62 @@ export default function App() {
                           onDelete={() => deleteOwnTake(type)}
                           waveform={ownTakeWaveformPeaksByType[type] && (
                             <div className="mt-3 rounded-xl p-3" style={{ backgroundColor: 'var(--bg)', border: '1px solid rgba(var(--ink-rgb),0.08)' }}>
+                              <div className="rounded-xl p-3 mb-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <div className="text-sm font-medium">Tajta till melodin</div>
+                                    <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                                      {ownTakeAligningByType[type]
+                                        ? 'Bygger …'
+                                        : ownTakeAlignAnchorsByType[type]
+                                          ? `Tajtad — ${ownTakeAlignAnchorsByType[type].length} ankarpunkter mot melodin`
+                                          : 'Justerar tajmingen efter melodi-kanalens takt (MTrackAlign-stil)'}
+                                    </div>
+                                  </div>
+                                  <button
+                                    onClick={() => applyOwnTakeAlignment(type)}
+                                    disabled={ownTakeAligningByType[type] || !melodyNotes.length}
+                                    className="stamma-btn px-3 py-1.5 rounded-md text-xs font-medium shrink-0"
+                                    style={{
+                                      backgroundColor: (ownTakeAligningByType[type] || !melodyNotes.length) ? 'rgba(var(--ink-rgb),0.06)' : 'var(--teal)',
+                                      color: (ownTakeAligningByType[type] || !melodyNotes.length) ? 'rgba(var(--ink-rgb),0.3)' : 'var(--bg)',
+                                      cursor: (ownTakeAligningByType[type] || !melodyNotes.length) ? 'not-allowed' : 'pointer',
+                                    }}
+                                  >
+                                    {ownTakeAligningByType[type] ? 'Bearbetar …' : ownTakeAlignAnchorsByType[type] ? 'Tajta till igen' : 'Tajta till'}
+                                  </button>
+                                </div>
+                                <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
+                                  <div className="flex items-center justify-between font-mono-ui text-[10px] mb-1.5" style={{ color: 'var(--text-muted)' }}>
+                                    <span>Styrka</span>
+                                    <span>{Math.round((ownTakeAlignStrengthByType[type] ?? 0.5) * 100)}%</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={1}
+                                    step={0.01}
+                                    value={ownTakeAlignStrengthByType[type] ?? 0.5}
+                                    onChange={(e) => setOwnTakeAlignStrength(type, parseFloat(e.target.value))}
+                                    className="stamma-fader w-full"
+                                    style={{ accentColor: HARMONY_COLORS[type].line }}
+                                    aria-label="Tajta till – styrka"
+                                  />
+                                  <div className="flex justify-between font-mono-ui text-[9px] mt-1" style={{ color: 'var(--text-muted)' }}>
+                                    <span>Lätt</span>
+                                    <span>Hård</span>
+                                  </div>
+                                  {ownTakeAlignAnchorsByType[type] && !ownTakeAligningByType[type] && (
+                                    <button
+                                      onClick={() => revertOwnTakeAlignment(type)}
+                                      className="stamma-btn w-full mt-3 rounded-md py-1.5 text-xs font-medium"
+                                      style={{ border: '1px solid rgba(var(--ink-rgb),0.15)', color: 'var(--text-muted)' }}
+                                    >
+                                      Återställ till original
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
                               <WaveformTrimmer
                                 peaks={ownTakeWaveformPeaksByType[type]}
                                 duration={recordingDuration}
@@ -4862,6 +5081,8 @@ export default function App() {
                                 onToggleLoop={() => setLoopEnabled((v) => !v)}
                                 busy={ownTakeAligningByType[type]}
                                 theme={theme}
+                                alignAnchors={ownTakeAlignAnchorsByType[type] || null}
+                                onAlignAnchorDrag={(index, t) => dragOwnTakeAlignAnchor(type, index, t)}
                               />
                             </div>
                           )}

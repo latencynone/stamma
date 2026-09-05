@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   detectOnsetSegments, estimateCoarseOffset, matchOnsetsToMelody,
   buildAlignmentKeyframes, alignOwnTakeToMelody,
+  detectAlignmentAnchors, renderAlignmentFromAnchors,
 } from './takeAlignment.js';
 import { synthesizeVoice, toAudioBuffer, rmsOf } from './testUtils.js';
 
@@ -94,6 +95,19 @@ describe('matchOnsetsToMelody', () => {
     const ownStarts = [10.0, 14.0, 18.0]; // unrelated, far outside the coarse search range
     expect(matchOnsetsToMelody(ownStarts, melodyStarts)).toEqual([]);
   });
+
+  it('the matchWindowSec parameter (the "Styrka" dial\'s main lever) gates a borderline outlier', () => {
+    // Four onsets with zero delay (so the coarse offset lands on exactly
+    // 0, dominated by these) plus one outlier 0.4s late.
+    const melodyStarts = [0.3, 0.9, 1.6, 2.4, 3.1];
+    const ownStarts = [0.3, 0.9, 2.0, 2.4, 3.1]; // index 2 (melody 1.6) is 0.4s late
+    const tight = matchOnsetsToMelody(ownStarts, melodyStarts, 0.1);
+    const loose = matchOnsetsToMelody(ownStarts, melodyStarts, 0.5);
+    expect(tight.length).toBe(4);
+    expect(tight.some((a) => Math.abs(a.melodyTime - 1.6) < 0.01)).toBe(false);
+    expect(loose.length).toBe(5);
+    expect(loose.some((a) => Math.abs(a.melodyTime - 1.6) < 0.01)).toBe(true);
+  });
 });
 
 describe('buildAlignmentKeyframes', () => {
@@ -137,7 +151,8 @@ describe('alignOwnTakeToMelody', () => {
     const setupCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, data.length, SR);
     const ownBuffer = toAudioBuffer(setupCtx, data, SR);
     const result = await alignOwnTakeToMelody(ownBuffer, [], 3.0);
-    expect(result).toBe(ownBuffer);
+    expect(result.buffer).toBe(ownBuffer);
+    expect(result.anchors).toEqual([]);
   });
 
   it('pulls a late, uniformly-slower take back onto the melody\'s onset times', async () => {
@@ -161,7 +176,7 @@ describe('alignOwnTakeToMelody', () => {
     const setupCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, raw.length, SR);
     const ownBuffer = toAudioBuffer(setupCtx, raw, SR);
 
-    const aligned = await alignOwnTakeToMelody(ownBuffer, melodyNotes, totalDur);
+    const { buffer: aligned } = await alignOwnTakeToMelody(ownBuffer, melodyNotes, totalDur);
     expect(aligned.length).toBe(Math.round(totalDur * SR));
 
     const alignedSegments = detectOnsetSegments(aligned.getChannelData(0), SR);
@@ -201,7 +216,7 @@ describe('alignOwnTakeToMelody', () => {
     const setupCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, raw.length, SR);
     const ownBuffer = toAudioBuffer(setupCtx, raw, SR);
 
-    const aligned = await alignOwnTakeToMelody(ownBuffer, melodyNotes, outputDuration);
+    const { buffer: aligned } = await alignOwnTakeToMelody(ownBuffer, melodyNotes, outputDuration);
     expect(aligned.length).toBe(Math.round(outputDuration * SR));
 
     const out = aligned.getChannelData(0);
@@ -212,5 +227,54 @@ describe('alignOwnTakeToMelody', () => {
     // some leftover/glitched signal.
     const tailRms = rmsOf(out, out.length - SR, out.length);
     expect(tailRms).toBeLessThan(0.01);
+  });
+
+  it('detectAlignmentAnchors composed with renderAlignmentFromAnchors matches alignOwnTakeToMelody directly', async () => {
+    // alignOwnTakeToMelody is just this pair of calls glued together — the
+    // manual marker editor calls them separately (detect once, let the
+    // user edit, render again on demand), so the two paths must agree.
+    const melodyNotes = makeNoteList([220, 247, 262, 294, 330]);
+    const totalDur = melodyNotes[melodyNotes.length - 1].end + 0.6;
+    const raw = synthesizeVoice(
+      melodyNotes.map((n) => ({ ...n, freq: n.freq * 1.5 })),
+      totalDur, SR, { gapNoiseAmp: 0 },
+    );
+    const setupCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, raw.length, SR);
+    const ownBuffer = toAudioBuffer(setupCtx, raw, SR);
+
+    const anchors = detectAlignmentAnchors(ownBuffer, melodyNotes, 0.5);
+    expect(anchors.length).toBeGreaterThan(2);
+    const rendered = await renderAlignmentFromAnchors(ownBuffer, anchors, totalDur, 0.5);
+    const { buffer: viaTopLevel } = await alignOwnTakeToMelody(ownBuffer, melodyNotes, totalDur, 0.5);
+
+    expect(Array.from(rendered.getChannelData(0))).toEqual(Array.from(viaTopLevel.getChannelData(0)));
+  });
+
+  it('a manually-edited anchor\'s own-time reaches the actual render as the exact input position for its output time', async () => {
+    // Verifies the "drag a marker" path end to end: buildAlignmentKeyframes
+    // always lands input/output exactly on an anchor's own values (see its
+    // own comment on why), so an edited anchor should produce a keyframe
+    // carrying the *edited* number, not the originally-detected one.
+    const melodyNotes = makeNoteList([220, 247, 262, 294, 330]);
+    const totalDur = melodyNotes[melodyNotes.length - 1].end + 0.6;
+    const raw = synthesizeVoice(
+      melodyNotes.map((n) => ({ ...n, freq: n.freq * 1.5 })),
+      totalDur, SR, { gapNoiseAmp: 0 },
+    );
+    const setupCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, raw.length, SR);
+    const ownBuffer = toAudioBuffer(setupCtx, raw, SR);
+
+    const anchors = detectAlignmentAnchors(ownBuffer, melodyNotes, 0.5);
+    expect(anchors.length).toBeGreaterThan(2);
+
+    const editedOwnTime = anchors[1].ownTime + 0.15;
+    const edited = anchors.map((a, i) => (i === 1 ? { ...a, ownTime: editedOwnTime } : a));
+    const keyframes = buildAlignmentKeyframes(edited);
+    const editedKeyframe = keyframes.find((k) => k.output === edited[1].melodyTime);
+    expect(editedKeyframe.input).toBe(editedOwnTime);
+
+    // And the render itself doesn't reject/ignore the edited anchor list.
+    const rendered = await renderAlignmentFromAnchors(ownBuffer, edited, totalDur, 0.5);
+    expect(rendered.length).toBe(Math.round(totalDur * SR));
   });
 });

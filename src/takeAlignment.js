@@ -106,9 +106,10 @@ export function estimateCoarseOffset(ownStarts, melodyStarts) {
 // melody. Standard weighted-alignment DP (bounded reward for a close-enough
 // pair, free to skip either side), sized for a ≤10s clip's handful of
 // onsets so the O(M×N) table is trivial. Returns anchors sorted by time;
-// empty if nothing in either list ever came within MATCH_WINDOW_SEC of the
-// coarse-offset prediction.
-export function matchOnsetsToMelody(ownStarts, melodyStarts) {
+// empty if nothing in either list ever came within `matchWindowSec` of the
+// coarse-offset prediction. `matchWindowSec` (see MATCH_WINDOW_SEC) is the
+// "Styrka"/strength dial's main lever — wider accepts shakier matches too.
+export function matchOnsetsToMelody(ownStarts, melodyStarts, matchWindowSec = MATCH_WINDOW_SEC) {
   if (!ownStarts.length || !melodyStarts.length) return [];
   const coarseOffset = estimateCoarseOffset(ownStarts, melodyStarts);
 
@@ -127,8 +128,8 @@ export function matchOnsetsToMelody(ownStarts, melodyStarts) {
       }
       const predicted = ownStarts[i - 1] + coarseOffset;
       const diff = Math.abs(predicted - melodyStarts[j - 1]);
-      if (diff <= MATCH_WINDOW_SEC) {
-        const reward = dp[i - 1][j - 1] + (1 - diff / MATCH_WINDOW_SEC);
+      if (diff <= matchWindowSec) {
+        const reward = dp[i - 1][j - 1] + (1 - diff / matchWindowSec);
         if (reward > best) {
           best = reward;
           choice = 0;
@@ -182,14 +183,14 @@ const MAX_STRETCH_RATE = 2.5;
 // exactly whatever's needed to make that stretch of the take span the gap
 // between them, clamped to a plausible range (see above). Returns null
 // (meaning "leave the take untouched") if there are no anchors at all.
-export function buildAlignmentKeyframes(anchors) {
+export function buildAlignmentKeyframes(anchors, minRate = MIN_STRETCH_RATE, maxRate = MAX_STRETCH_RATE) {
   if (!anchors.length) return null;
   const first = anchors[0];
   const keyframes = [{ output: 0, input: Math.max(0, first.ownTime - first.melodyTime), rate: 1 }];
   anchors.forEach((a, idx) => {
     const next = anchors[idx + 1];
     const rate = next
-      ? Math.min(MAX_STRETCH_RATE, Math.max(MIN_STRETCH_RATE, (next.ownTime - a.ownTime) / Math.max(1e-6, next.melodyTime - a.melodyTime)))
+      ? Math.min(maxRate, Math.max(minRate, (next.ownTime - a.ownTime) / Math.max(1e-6, next.melodyTime - a.melodyTime)))
       : 1;
     keyframes.push({ output: a.melodyTime, input: a.ownTime, rate });
   });
@@ -269,18 +270,56 @@ async function renderTimeWarp(ownBuffer, keyframes, outputDuration) {
   return offlineCtx.startRendering();
 }
 
-// Top-level entry point: aligns a user's own harmony take to the melody's
-// timing, returning a new AudioBuffer exactly `outputDuration` long (the
-// shared mix/recording timeline). Falls back to returning `ownBuffer`
-// itself, completely untouched, whenever there isn't at least one confident
-// onset match to anchor a warp to — recorded before any singing happened,
-// too sparse a melody, or a take that just doesn't line up with it at all.
-export async function alignOwnTakeToMelody(ownBuffer, melodyNotes, outputDuration) {
-  if (!melodyNotes || !melodyNotes.length) return ownBuffer;
+// The manual "Styrka"/strength control (0-1, UI shows 0-100%) scales both
+// how loose the onset match is allowed to be and how far a matched segment
+// may stretch — interpolating between a near-inert setting (0: a tight
+// match window, almost no stretch permitted — MTrackAlign/VocALign call
+// this end "Precision"/"Rigidity") and this module's original, most
+// aggressive fixed behavior (1). 0.5 is a moderate middle default.
+function paramsForStrength(strength) {
+  const s = Math.max(0, Math.min(1, strength));
+  return {
+    matchWindowSec: 0.12 + (0.55 - 0.12) * s,
+    minRate: 0.9 - (0.9 - MIN_STRETCH_RATE) * s,
+    maxRate: 1.15 + (MAX_STRETCH_RATE - 1.15) * s,
+  };
+}
+
+// Detects and matches onsets only — no rendering. Split out from
+// alignOwnTakeToMelody so a manual marker editor (see App.jsx) can show the
+// detected sync points and let the user drag one before anything gets
+// rendered, rather than only ever seeing the fully-automatic result.
+export function detectAlignmentAnchors(ownBuffer, melodyNotes, strength = 0.5) {
+  if (!melodyNotes || !melodyNotes.length) return [];
+  const { matchWindowSec } = paramsForStrength(strength);
   const ownStarts = detectOnsetSegments(ownBuffer.getChannelData(0), ownBuffer.sampleRate).map((s) => s.start);
   const melodyStarts = melodyNotes.map((n) => n.start);
-  const anchors = matchOnsetsToMelody(ownStarts, melodyStarts);
-  const keyframes = buildAlignmentKeyframes(anchors);
+  return matchOnsetsToMelody(ownStarts, melodyStarts, matchWindowSec);
+}
+
+// Renders from an already-decided anchor list — used both by
+// alignOwnTakeToMelody below (anchors fresh off detectAlignmentAnchors) and
+// by the manual marker editor (anchors the user has just dragged one point
+// of, re-rendering *without* re-detecting and so without discarding that
+// edit). `strength` only affects the stretch-rate clamp here, since the
+// match-window side of it already happened at detection time.
+export async function renderAlignmentFromAnchors(ownBuffer, anchors, outputDuration, strength = 0.5) {
+  const { minRate, maxRate } = paramsForStrength(strength);
+  const keyframes = buildAlignmentKeyframes(anchors, minRate, maxRate);
   if (!keyframes) return ownBuffer;
   return renderTimeWarp(ownBuffer, keyframes, outputDuration);
+}
+
+// Top-level entry point: aligns a user's own harmony take to the melody's
+// timing. Returns { buffer, anchors } — `buffer` is a new AudioBuffer
+// exactly `outputDuration` long (the shared mix/recording timeline), or
+// `ownBuffer` itself, completely untouched, whenever there isn't at least
+// one confident onset match to anchor a warp to (recorded before any
+// singing happened, too sparse a melody, or a take that just doesn't line
+// up with it at all); `anchors` is returned either way, for the manual
+// marker editor to start from (empty when there's nothing to show).
+export async function alignOwnTakeToMelody(ownBuffer, melodyNotes, outputDuration, strength = 0.5) {
+  const anchors = detectAlignmentAnchors(ownBuffer, melodyNotes, strength);
+  const buffer = await renderAlignmentFromAnchors(ownBuffer, anchors, outputDuration, strength);
+  return { buffer, anchors };
 }
