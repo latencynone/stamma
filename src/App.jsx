@@ -542,7 +542,21 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
   }, []);
 
   return (
-    <div ref={outerRef} className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: 'var(--bg)' } : undefined}>
+    <div
+      ref={outerRef}
+      className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''}
+      style={isFullscreen ? {
+        backgroundColor: 'var(--bg)',
+        // p-4 alone lets the header/close button sit under the iPhone
+        // status bar/notch in fullscreen (this overlay is `fixed inset-0`,
+        // outside whatever safe-area room the normal page layout gets) —
+        // pad by the real inset when there is one, same 1rem otherwise.
+        paddingTop: 'max(1rem, env(safe-area-inset-top))',
+        paddingBottom: 'max(1rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(1rem, env(safe-area-inset-left))',
+        paddingRight: 'max(1rem, env(safe-area-inset-right))',
+      } : undefined}
+    >
       <div className="flex flex-wrap items-center gap-2 mb-2 font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>
         <button
           onClick={() => setZoom((z) => Math.max(1, +(z - 0.5).toFixed(1)))}
@@ -1071,7 +1085,20 @@ function WaveformTrimmer({
   );
 
   return (
-    <div className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: 'var(--bg)' } : undefined}>
+    <div
+      className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''}
+      style={isFullscreen ? {
+        backgroundColor: 'var(--bg)',
+        // Same reasoning as PitchCanvas's fullscreen overlay above — p-4
+        // alone lets the header/close button sit under the iPhone status
+        // bar/notch, since this is `fixed inset-0` and gets none of the
+        // normal page layout's safe-area room.
+        paddingTop: 'max(1rem, env(safe-area-inset-top))',
+        paddingBottom: 'max(1rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(1rem, env(safe-area-inset-left))',
+        paddingRight: 'max(1rem, env(safe-area-inset-right))',
+      } : undefined}
+    >
       <div className="flex items-center justify-between mb-2 font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>
         <span>Vågform — beskär &amp; tona in/ut</span>
         <button
