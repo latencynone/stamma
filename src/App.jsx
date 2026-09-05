@@ -817,11 +817,46 @@ function WaveformTrimmer({
     return () => ro.disconnect();
   }, []);
 
+  // Shared cleanup for every drag-handle below — the drag must end no
+  // matter *how* pointer capture ends: a plain pointerup, an iOS touch
+  // that turns into a scroll/other gesture and fires pointercancel
+  // instead, or the browser force-releasing capture some other way.
+  // Relying on pointerup alone (the previous version of every handle
+  // below) misses pointercancel — when that happens instead, the
+  // `pointermove` listener is left on `window` forever, so the handle
+  // keeps "following" every later pointer move anywhere on the page, even
+  // after releasing and clicking elsewhere in the app entirely.
+  // `lostpointercapture` fires unconditionally whenever capture ends, so
+  // it's the one listener guaranteed to run; pointerup/pointercancel stay
+  // alongside it belt-and-suspenders. `cleanup` is idempotent since more
+  // than one of these can fire for the same drag.
+  function trackPointerDrag(e, onMove, onEnd) {
+    const handle = e.currentTarget;
+    const pointerId = e.pointerId;
+    handle.setPointerCapture(pointerId);
+    let done = false;
+    const move = (ev) => onMove(ev);
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', cleanup);
+      window.removeEventListener('pointercancel', cleanup);
+      handle.removeEventListener('lostpointercapture', cleanup);
+      if (handle.hasPointerCapture(pointerId)) {
+        try { handle.releasePointerCapture(pointerId); } catch (err) { /* already released */ }
+      }
+      if (onEnd) onEnd();
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', cleanup);
+    window.addEventListener('pointercancel', cleanup);
+    handle.addEventListener('lostpointercapture', cleanup);
+  }
+
   function beginDrag(which) {
     return (e) => {
-      const handle = e.currentTarget;
-      handle.setPointerCapture(e.pointerId);
-      const move = (ev) => {
+      trackPointerDrag(e, (ev) => {
         const rect = wrapRef.current.getBoundingClientRect();
         const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
         const t = frac * duration;
@@ -830,22 +865,13 @@ function WaveformTrimmer({
         } else {
           onTrimChange(trimStart, Math.max(t, trimStart + TRIM_HANDLE_MIN_GAP));
         }
-      };
-      const up = () => {
-        handle.releasePointerCapture(e.pointerId);
-        window.removeEventListener('pointermove', move);
-        window.removeEventListener('pointerup', up);
-      };
-      window.addEventListener('pointermove', move);
-      window.addEventListener('pointerup', up);
+      });
     };
   }
 
   function beginFadeDrag(which) {
     return (e) => {
-      const handle = e.currentTarget;
-      handle.setPointerCapture(e.pointerId);
-      const move = (ev) => {
+      trackPointerDrag(e, (ev) => {
         const rect = wrapRef.current.getBoundingClientRect();
         const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
         const t = frac * duration;
@@ -857,14 +883,7 @@ function WaveformTrimmer({
           const next = Math.min(Math.max(0, trimEnd - t), windowDur - fadeIn - FADE_MIN_GAP);
           onFadeChange(fadeIn, Math.max(0, next));
         }
-      };
-      const up = () => {
-        handle.releasePointerCapture(e.pointerId);
-        window.removeEventListener('pointermove', move);
-        window.removeEventListener('pointerup', up);
-      };
-      window.addEventListener('pointermove', move);
-      window.addEventListener('pointerup', up);
+      });
     };
   }
 
@@ -875,9 +894,7 @@ function WaveformTrimmer({
   const NOISE_MIN_GAP = 0.1;
   function beginNoiseDrag(which) {
     return (e) => {
-      const handle = e.currentTarget;
-      handle.setPointerCapture(e.pointerId);
-      const move = (ev) => {
+      trackPointerDrag(e, (ev) => {
         const rect = wrapRef.current.getBoundingClientRect();
         const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
         const t = frac * duration;
@@ -886,14 +903,7 @@ function WaveformTrimmer({
         } else {
           onNoiseSampleChange(noiseSampleStart, Math.max(t, noiseSampleStart + NOISE_MIN_GAP));
         }
-      };
-      const up = () => {
-        handle.releasePointerCapture(e.pointerId);
-        window.removeEventListener('pointermove', move);
-        window.removeEventListener('pointerup', up);
-      };
-      window.addEventListener('pointermove', move);
-      window.addEventListener('pointerup', up);
+      });
     };
   }
 
@@ -912,33 +922,29 @@ function WaveformTrimmer({
 
   function beginAnchorDrag(index) {
     return (e) => {
-      const handle = e.currentTarget;
-      handle.setPointerCapture(e.pointerId);
       const [lo, hi] = anchorBounds(index);
-      const move = (ev) => {
-        const rect = wrapRef.current.getBoundingClientRect();
-        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
-        const t = Math.min(hi, Math.max(lo, frac * duration));
-        dragAnchorLiveRef.current = t;
-        setDragAnchor({ index, time: t });
-      };
-      const up = () => {
-        handle.releasePointerCapture(e.pointerId);
-        window.removeEventListener('pointermove', move);
-        window.removeEventListener('pointerup', up);
-        // Read the live value from the ref, not from a setDragAnchor
-        // updater — calling onAlignAnchorDrag (which updates state on the
-        // *parent*, App) from inside a setState updater for *this*
-        // component triggers React's "Cannot update a component while
-        // rendering a different component" warning, since updaters can run
-        // during render. Plain sequential calls avoid that entirely.
-        const finalTime = dragAnchorLiveRef.current;
-        dragAnchorLiveRef.current = null;
-        setDragAnchor(null);
-        if (finalTime !== null && onAlignAnchorDrag) onAlignAnchorDrag(index, finalTime);
-      };
-      window.addEventListener('pointermove', move);
-      window.addEventListener('pointerup', up);
+      trackPointerDrag(
+        e,
+        (ev) => {
+          const rect = wrapRef.current.getBoundingClientRect();
+          const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+          const t = Math.min(hi, Math.max(lo, frac * duration));
+          dragAnchorLiveRef.current = t;
+          setDragAnchor({ index, time: t });
+        },
+        () => {
+          // Read the live value from the ref, not from a setDragAnchor
+          // updater — calling onAlignAnchorDrag (which updates state on
+          // the *parent*, App) from inside a setState updater for *this*
+          // component triggers React's "Cannot update a component while
+          // rendering a different component" warning, since updaters can
+          // run during render. Plain sequential calls avoid that entirely.
+          const finalTime = dragAnchorLiveRef.current;
+          dragAnchorLiveRef.current = null;
+          setDragAnchor(null);
+          if (finalTime !== null && onAlignAnchorDrag) onAlignAnchorDrag(index, finalTime);
+        },
+      );
     };
   }
 
