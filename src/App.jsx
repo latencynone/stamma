@@ -613,7 +613,12 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
         ref={scrollWrapRef}
         className={isFullscreen ? 'flex-1 overflow-x-auto' : 'w-full h-48 md:h-56 overflow-x-auto rounded-xl'}
       >
-        <canvas ref={canvasRef} className="block rounded-xl" />
+        <canvas
+          ref={canvasRef}
+          className="block rounded-xl"
+          role="img"
+          aria-label={`Tonhöjdskurva${keyLabel ? ` i ${keyLabel}` : ''} — visar melodins${harmonyLayers.length ? ' och stämmornas' : ''} toner över tid`}
+        />
       </div>
     </div>
   );
@@ -927,7 +932,12 @@ function WaveformTrimmer({
         ref={wrapRef}
         className={isFullscreen ? 'flex-1 relative rounded-xl' : 'relative w-full h-24 rounded-xl'}
       >
-        <canvas ref={canvasRef} className="block rounded-xl absolute inset-0" />
+        <canvas
+          ref={canvasRef}
+          className="block rounded-xl absolute inset-0"
+          role="img"
+          aria-label="Vågform av inspelningen, med hantag för att beskära start och slut och tona in/ut"
+        />
         <div onPointerDown={beginDrag('start')} style={handleStyle(startPct)}>
           <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: '#55D6C0' }} />
           <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: '#55D6C0' }} />
@@ -984,7 +994,7 @@ function WaveformTrimmer({
                 Markera en del med bara brus — resten av inspelningen renas utifrån den
               </div>
             </div>
-            <ToggleSwitch checked={noiseReductionMode} onChange={onToggleNoiseReductionMode} accentColor={NOISE_COLOR} />
+            <ToggleSwitch checked={noiseReductionMode} onChange={onToggleNoiseReductionMode} accentColor={NOISE_COLOR} ariaLabel="Brusreducering" />
           </div>
           {noiseReductionMode && (
             <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
@@ -4084,7 +4094,7 @@ export default function App() {
                           <button
                             onClick={() => adjustMetronomeBpm(-1)}
                             className="stamma-btn rounded-md flex items-center justify-center"
-                            style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                            style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                             aria-label="Sänk takt"
                           >
                             −
@@ -4098,7 +4108,7 @@ export default function App() {
                           <button
                             onClick={() => adjustMetronomeBpm(1)}
                             className="stamma-btn rounded-md flex items-center justify-center"
-                            style={{ width: 30, height: 30, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                            style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                             aria-label="Höj takt"
                           >
                             +
@@ -4176,7 +4186,7 @@ export default function App() {
                 <MetronomeIcon size={16} />
                 <span className="text-sm font-medium">Metronom</span>
                 <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Klick vid inspelning</span>
-                <ToggleSwitch checked={metronomeEnabled} onChange={() => setMetronomeEnabled((v) => !v)} accentColor="#55D6C0" />
+                <ToggleSwitch checked={metronomeEnabled} onChange={() => setMetronomeEnabled((v) => !v)} accentColor="#55D6C0" ariaLabel="Metronom vid inspelning" />
               </div>
               <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
                 <button
@@ -4193,7 +4203,7 @@ export default function App() {
                       <button
                         onClick={() => adjustMetronomeBpm(-1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
-                        style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                        style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                         aria-label="Sänk takt"
                       >
                         −
@@ -4210,7 +4220,7 @@ export default function App() {
                       <button
                         onClick={() => adjustMetronomeBpm(1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
-                        style={{ width: 34, height: 34, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                        style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
                         aria-label="Höj takt"
                       >
                         +
@@ -4413,6 +4423,7 @@ export default function App() {
                           checked={autotuneOn}
                           onChange={() => { setAutotuneOn((v) => !v); if (isPlaying) stopPlayback(); }}
                           accentColor="#55D6C0"
+                          ariaLabel="Autotune"
                         />
                       </div>
                       {autotuneOn && (
@@ -4460,6 +4471,7 @@ export default function App() {
                         checked={reverbOn}
                         onChange={() => { setReverbOn((v) => !v); if (isPlaying) stopPlayback(); }}
                         accentColor="#55D6C0"
+                        ariaLabel="Reverb"
                       />
                     </div>
                     {reverbOn && (
@@ -4507,6 +4519,7 @@ export default function App() {
                           checked={humanizeOn}
                           onChange={() => { setHumanizeOn((v) => !v); if (isPlaying) stopPlayback(); }}
                           accentColor="#55D6C0"
+                          ariaLabel="Humanisera stämmor"
                         />
                       </div>
                     </div>
@@ -4921,7 +4934,7 @@ function ProjectRow({ project, active, onOpen, onRename, onDelete }) {
       <button
         onClick={() => { if (window.confirm(`Radera "${project.name}"? Går inte att ångra.`)) onDelete(); }}
         className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
-        style={{ width: 30, height: 30, color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.15)' }}
+        style={{ width: 44, height: 44, color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.15)' }}
         aria-label={`Radera ${project.name}`}
         title={`Radera ${project.name}`}
       >
@@ -4931,35 +4944,49 @@ function ProjectRow({ project, active, onOpen, onRename, onDelete }) {
   );
 }
 
-function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled }) {
+function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled, ariaLabel }) {
   return (
+    // The visible track stays the standard 40x24 switch size — the button
+    // itself is padded out to Apple's 44x44pt minimum tap target (HIG),
+    // centered around that track, so the hit area grows without changing
+    // how the control looks.
     <button
       onClick={onChange}
       disabled={disabled}
-      className="stamma-btn shrink-0"
+      className="stamma-btn shrink-0 flex items-center justify-center"
       style={{
-        width: 40,
-        height: 24,
-        borderRadius: 12,
-        backgroundColor: checked ? accentColor : 'rgba(241,237,228,0.15)',
-        position: 'relative',
+        width: 44,
+        height: 44,
         opacity: disabled ? 0.4 : 1,
         cursor: disabled ? 'not-allowed' : 'pointer',
       }}
-      aria-pressed={checked}
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
     >
       <span
         style={{
-          position: 'absolute',
-          top: 2.5,
-          left: checked ? 18 : 2.5,
-          width: 19,
-          height: 19,
-          borderRadius: 10,
-          backgroundColor: '#10131A',
-          transition: 'left 150ms ease',
+          width: 40,
+          height: 24,
+          borderRadius: 12,
+          backgroundColor: checked ? accentColor : 'rgba(241,237,228,0.15)',
+          position: 'relative',
+          transition: 'background-color 150ms ease',
         }}
-      />
+      >
+        <span
+          style={{
+            position: 'absolute',
+            top: 2.5,
+            left: checked ? 18 : 2.5,
+            width: 19,
+            height: 19,
+            borderRadius: 10,
+            backgroundColor: '#10131A',
+            transition: 'left 150ms ease',
+          }}
+        />
+      </span>
     </button>
   );
 }
@@ -5036,40 +5063,53 @@ function MixerChannel({
     >
       <div className="flex items-center gap-2">
         <div className="flex flex-col items-center gap-1">
-          <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} />
+          <ToggleSwitch checked={enabled} onChange={onToggle} accentColor={accentColor} ariaLabel={`Aktivera ${label}`} />
           {onDelete && (
+            // Outer button is a full 44x44pt tap target (Apple HIG minimum);
+            // the visible chip inside stays the original small size — see
+            // the same pattern on ToggleSwitch above.
             <button
               onClick={onDelete}
-              className="stamma-btn shrink-0 rounded-full flex items-center justify-center"
-              style={{
-                width: 20,
-                height: 20,
-                backgroundColor: 'transparent',
-                color: '#C7CBDA',
-                border: '1px solid rgba(241,237,228,0.15)',
-              }}
+              className="stamma-btn shrink-0 flex items-center justify-center"
+              style={{ width: 44, height: 44 }}
               aria-label={`Radera ${label.toLowerCase()}`}
               title={`Radera ${label.toLowerCase()}`}
             >
-              <TrashIcon size={11} />
+              <span
+                className="rounded-full flex items-center justify-center"
+                style={{
+                  width: 20,
+                  height: 20,
+                  backgroundColor: 'transparent',
+                  color: '#C7CBDA',
+                  border: '1px solid rgba(241,237,228,0.15)',
+                }}
+              >
+                <TrashIcon size={11} />
+              </span>
             </button>
           )}
         </div>
         <button
           onClick={onToggleSolo}
-          className="stamma-btn shrink-0 rounded-md font-mono-ui text-xs font-semibold"
-          style={{
-            width: 24,
-            height: 24,
-            backgroundColor: solo ? SOLO_COLOR : 'transparent',
-            color: solo ? '#10131A' : '#C7CBDA',
-            border: solo ? `1px solid ${SOLO_COLOR}` : '1px solid rgba(241,237,228,0.15)',
-          }}
+          className="stamma-btn shrink-0 flex items-center justify-center"
+          style={{ width: 44, height: 44 }}
           aria-pressed={solo}
           aria-label="Solo"
           title="Solo"
         >
-          S
+          <span
+            className="rounded-md font-mono-ui text-xs font-semibold flex items-center justify-center"
+            style={{
+              width: 24,
+              height: 24,
+              backgroundColor: solo ? SOLO_COLOR : 'transparent',
+              color: solo ? '#10131A' : '#C7CBDA',
+              border: solo ? `1px solid ${SOLO_COLOR}` : '1px solid rgba(241,237,228,0.15)',
+            }}
+          >
+            S
+          </span>
         </button>
         <span className="flex-1 text-sm font-medium truncate">
           {label}
@@ -5078,19 +5118,23 @@ function MixerChannel({
         <button
           onClick={onPreview}
           disabled={busy}
-          className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
-          style={{
-            width: 24,
-            height: 24,
-            backgroundColor: previewing ? `${accentColor}26` : 'transparent',
-            color: busy ? 'rgba(241,237,228,0.25)' : accentColor,
-            border: `1px solid ${previewing ? `${accentColor}66` : 'rgba(241,237,228,0.15)'}`,
-            cursor: busy ? 'not-allowed' : 'pointer',
-          }}
+          className="stamma-btn shrink-0 flex items-center justify-center"
+          style={{ width: 44, height: 44, cursor: busy ? 'not-allowed' : 'pointer' }}
           aria-label={previewing ? 'Pausa' : 'Spela upp bara den här kanalen'}
           title={previewing ? 'Pausa' : 'Spela upp bara den här kanalen'}
         >
-          {previewing ? <PauseIcon size={12} /> : <PlayIcon size={12} />}
+          <span
+            className="rounded-md flex items-center justify-center"
+            style={{
+              width: 24,
+              height: 24,
+              backgroundColor: previewing ? `${accentColor}26` : 'transparent',
+              color: busy ? 'rgba(241,237,228,0.25)' : accentColor,
+              border: `1px solid ${previewing ? `${accentColor}66` : 'rgba(241,237,228,0.15)'}`,
+            }}
+          >
+            {previewing ? <PauseIcon size={12} /> : <PlayIcon size={12} />}
+          </span>
         </button>
       </div>
 
@@ -5100,30 +5144,38 @@ function MixerChannel({
             <button
               onClick={recording ? onStopRecordEarly : onRecord}
               disabled={recordDisabled && !recording}
-              className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
+              className="stamma-btn shrink-0 flex items-center justify-center"
               style={{
-                width: 40,
-                height: 28,
-                backgroundColor: recordCountingIn ? 'rgba(255,180,84,0.15)' : recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
-                color: recordCountingIn ? '#FFB454' : recording ? '#10131A' : '#FF6B6B',
-                border: `1px solid ${recordCountingIn ? 'rgba(255,180,84,0.6)' : 'rgba(255,107,107,0.5)'}`,
+                width: 44,
+                height: 44,
                 opacity: (recordDisabled && !recording) ? 0.4 : 1,
                 cursor: (recordDisabled && !recording) ? 'not-allowed' : 'pointer',
               }}
               aria-label={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
               title={recording ? 'Stoppa inspelningen' : `Spela in egen ${label.toLowerCase()}`}
             >
-              {recordCountingIn ? (
-                <span className="font-mono-ui" style={{ fontSize: 11, fontWeight: 700 }}>
-                  {COUNT_IN_BEATS - (recordCountInBeat || 0)}
-                </span>
-              ) : recording ? (
-                <span className="rec-dot font-mono-ui" style={{ fontSize: 9, fontWeight: 700 }}>
-                  {Math.ceil(recordCountdown)}
-                </span>
-              ) : (
-                <RecordIcon size={12} />
-              )}
+              <span
+                className="rounded-md flex items-center justify-center"
+                style={{
+                  width: 40,
+                  height: 28,
+                  backgroundColor: recordCountingIn ? 'rgba(255,180,84,0.15)' : recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
+                  color: recordCountingIn ? '#FFB454' : recording ? '#10131A' : '#FF6B6B',
+                  border: `1px solid ${recordCountingIn ? 'rgba(255,180,84,0.6)' : 'rgba(255,107,107,0.5)'}`,
+                }}
+              >
+                {recordCountingIn ? (
+                  <span className="font-mono-ui" style={{ fontSize: 11, fontWeight: 700 }}>
+                    {COUNT_IN_BEATS - (recordCountInBeat || 0)}
+                  </span>
+                ) : recording ? (
+                  <span className="rec-dot font-mono-ui" style={{ fontSize: 9, fontWeight: 700 }}>
+                    {Math.ceil(recordCountdown)}
+                  </span>
+                ) : (
+                  <RecordIcon size={12} />
+                )}
+              </span>
             </button>
           )}
           {[{ v: -1, label: 'Understämma' }, { v: 1, label: 'Överstämma' }].map((opt) => (
@@ -5132,7 +5184,7 @@ function MixerChannel({
               onClick={() => onSetDirection(opt.v)}
               className="stamma-btn flex-1 rounded-md text-[10px] font-medium leading-tight"
               style={{
-                height: 28,
+                height: 44,
                 backgroundColor: direction === opt.v ? `${accentColor}26` : 'transparent',
                 color: direction === opt.v ? accentColor : '#C7CBDA',
                 border: direction === opt.v ? `1px solid ${accentColor}66` : '1px solid rgba(241,237,228,0.12)',
@@ -5302,7 +5354,7 @@ function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyI
         <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
           {starting ? 'Startar …' : following ? 'Följer inspelningen' : on && latencyMs != null ? `${latencyMs} ms` : 'Kräver hörlurar'}
         </span>
-        <ToggleSwitch checked={on || following} onChange={onToggle} disabled={starting || following} accentColor="#55D6C0" />
+        <ToggleSwitch checked={on || following} onChange={onToggle} disabled={starting || following} accentColor="#55D6C0" ariaLabel="Live-förhandslyssning" />
       </div>
       {(on || following) && (
         <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
