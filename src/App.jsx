@@ -1638,7 +1638,6 @@ export default function App() {
   const [metronomeExpanded, setMetronomeExpanded] = useState(false);
   const [tempoDetected, setTempoDetected] = useState(false);
   const [micPermission, setMicPermission] = useState('unknown');
-  const [introExpanded, setIntroExpanded] = useState(false);
   const [showAbout, setShowAbout] = useState(() => window.location.hash === '#om');
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(null); // null = full recordingDuration
@@ -4243,31 +4242,10 @@ export default function App() {
           </div>
           <p className="mt-2 text-base leading-relaxed" style={{ color: 'var(--text-muted)' }}>
             Sjung in eller ladda upp en melodi (max 10s).
-            {!introExpanded && (
-              <>
-                {' '}
-                <button
-                  onClick={() => setIntroExpanded(true)}
-                  className="stamma-btn font-mono-ui text-xs align-middle"
-                  style={{ color: 'var(--teal)' }}
-                >
-                  Läs mer <span style={{ fontSize: 15 }}>▾</span>
-                </button>
-              </>
-            )}
           </p>
-          {introExpanded && (
-            <p className="mt-1 text-base leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-              Appen känner av tonarten och bygger stämmor i ters, kvint och sext som du kan mixa och träna in.{' '}
-              <button
-                onClick={() => setIntroExpanded(false)}
-                className="stamma-btn font-mono-ui text-xs align-middle"
-                style={{ color: 'var(--teal)' }}
-              >
-                Visa mindre <span style={{ fontSize: 15 }}>▴</span>
-              </button>
-            </p>
-          )}
+          <p className="mt-1 text-base leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+            Appen känner av tonarten och bygger stämmor i ters, kvint och sext som du kan mixa och träna in.
+          </p>
         </header>
 
         {/* Sessioner — saved projects, see indexedDb.js */}
