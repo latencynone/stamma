@@ -1,11 +1,73 @@
 @import "tailwindcss";
 
+/* ---------- Theme tokens ----------
+ * Dark is the default/original palette (bare :root). Light overrides live
+ * under [data-theme="light"], set on <html> by the in-app toggle (see
+ * useTheme in App.jsx) — manual, not tied to the OS's prefers-color-scheme,
+ * per how this app's toggle works. `-rgb` tokens hold bare "R, G, B"
+ * triplets (no rgba() wrapper) so call sites can drop them into
+ * rgba(var(--x-rgb), <alpha>) and keep whatever alpha they already had
+ * while the base color still themes correctly.
+ */
 :root {
   color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  --bg: #10131A;
+  --bg-rgb: 16, 19, 26;
+  --card-bg: #171B26;
+  --text: #F1EDE4;
+  --text-muted: #C7CBDA;
+  --ink-rgb: 241, 237, 228;
+
+  --teal: #55D6C0;
+  --teal-rgb: 85, 214, 192;
+  --orange: #FFB454;
+  --orange-rgb: 255, 180, 84;
+  --red: #FF6B6B;
+  --red-rgb: 255, 107, 107;
+  --red-soft: #FF9B9B;
+  --red-softer: #FFB4B4;
+  --purple: #A78BFA;
+  --purple-rgb: 167, 139, 250;
+  --rose: #FB7185;
+  --rose-rgb: 251, 113, 133;
+  --gold: #FFD84D;
+  --noise-orange: #FF9F5A;
+  --noise-orange-rgb: 255, 159, 90;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #F5F1E8;
+  --bg-rgb: 245, 241, 232;
+  --card-bg: #FFFFFF;
+  --text: #14181F;
+  --text-muted: #5B6172;
+  --ink-rgb: 20, 24, 31;
+
+  /* Every accent below is a darkened variant of its dark-mode value —
+   * the originals are tuned to pop on a near-black background and fall
+   * well under WCAG AA (4.5:1) as text/icon color on this light one. */
+  --teal: #2E7569;
+  --teal-rgb: 46, 117, 105;
+  --orange: #8C632E;
+  --orange-rgb: 140, 99, 46;
+  --red: #A54545;
+  --red-rgb: 165, 69, 69;
+  --red-soft: #A54545;
+  --red-softer: #A54545;
+  --purple: #6C5AA2;
+  --purple-rgb: 108, 90, 162;
+  --rose: #A34956;
+  --rose-rgb: 163, 73, 86;
+  --gold: #7F6C26;
+  --noise-orange: #A5673A;
+  --noise-orange-rgb: 165, 103, 58;
 }
 
 * {
@@ -15,6 +77,7 @@
 body {
   margin: 0;
   min-height: 100svh;
+  background: var(--bg);
 }
 
 #root {

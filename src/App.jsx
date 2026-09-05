@@ -36,11 +36,25 @@ const HARMONY_KEYS = Object.keys(HARMONY_TYPES);
 // graph and the mixer channel rows, so the same color always means the same
 // interval — needed now that more than one can be on screen/audible at once.
 const HARMONY_COLORS = {
-  ters: { line: '#55D6C0', glow: 'rgba(85,214,192,0.65)' },
-  kvint: { line: '#A78BFA', glow: 'rgba(167,139,250,0.65)' },
-  sext: { line: '#FB7185', glow: 'rgba(251,113,133,0.65)' },
+  ters: { line: 'var(--teal)', glow: 'rgba(var(--teal-rgb),0.65)' },
+  kvint: { line: 'var(--purple)', glow: 'rgba(var(--purple-rgb),0.65)' },
+  sext: { line: 'var(--rose)', glow: 'rgba(var(--rose-rgb),0.65)' },
 };
-const MELODY_COLOR = { line: '#FFB454', glow: 'rgba(255,180,84,0.65)' };
+const MELODY_COLOR = { line: 'var(--orange)', glow: 'rgba(var(--orange-rgb),0.65)' };
+
+// Canvas 2D can't resolve CSS custom properties itself (unlike DOM/inline
+// styles) — a color string handed to ctx.fillStyle/strokeStyle has to
+// already be a literal. Every canvas-drawn color in this file is still
+// authored as a var(--token) (or an rgba(...) wrapping one), same as every
+// other themed color, so draw code runs it through this first: replaces
+// each var(--x) with its current live value (picking up whichever theme
+// is active) before handing it to canvas. A plain literal with no var()
+// in it (rare, but e.g. a fixed white) passes through untouched.
+function resolveThemeColor(str) {
+  if (typeof str !== 'string' || !str.includes('var(')) return str;
+  const styles = getComputedStyle(document.documentElement);
+  return str.replace(/var\((--[\w-]+)\)/g, (_, name) => styles.getPropertyValue(name).trim());
+}
 
 // Schedules a channel's fade-in/fade-out gain envelope starting from an
 // arbitrary point mid-window rather than always from the window's start —
@@ -341,7 +355,7 @@ function createFormantSum(ctx, source) {
 
 // `harmonyLayers`: array of { key, notes, color, glow } — one per currently
 // active (mixer-enabled) harmony type, drawn simultaneously in its own color.
-function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, playheadTime, onKeyChange, onResetKey, keyIsManual }) {
+function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, playheadTime, onKeyChange, onResetKey, keyIsManual, theme }) {
   const canvasRef = useRef(null);
   const scrollWrapRef = useRef(null);
   const outerRef = useRef(null);
@@ -396,7 +410,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
       ctx.scale(dpr, dpr);
       ctx.clearRect(0, 0, width, height);
 
-      ctx.strokeStyle = 'rgba(241,237,228,0.06)';
+      ctx.strokeStyle = resolveThemeColor('rgba(var(--ink-rgb),0.06)');
       ctx.lineWidth = 1;
       for (let i = 1; i < duration; i++) {
         const x = (i / duration) * width;
@@ -407,7 +421,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
       }
 
       if (!melodyNotes || melodyNotes.length === 0 || !keyInfo) {
-        ctx.fillStyle = 'rgba(241,237,228,0.55)';
+        ctx.fillStyle = resolveThemeColor('rgba(var(--ink-rgb),0.55)');
         ctx.font = '14px "Space Grotesk", sans-serif';
         ctx.fillText('Din tonhöjdskurva ritas upp här efter inspelning', 14, height / 2);
         return;
@@ -428,15 +442,19 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
       const xFor = (t) => (t / duration) * width;
 
       const drawLine = (notes, midis, color, glow, labelDy) => {
+        // Resolved once per call (not per note) — same color/glow for
+        // every segment this call draws.
+        const resolvedColor = resolveThemeColor(color);
+        const resolvedGlow = resolveThemeColor(glow);
         ctx.lineCap = 'round';
         notes.forEach((n, i) => {
           const y = yFor(midis[i]);
           ctx.beginPath();
           ctx.moveTo(xFor(n.start), y);
           ctx.lineTo(xFor(Math.max(n.end, n.start + 0.04)), y);
-          ctx.strokeStyle = color;
+          ctx.strokeStyle = resolvedColor;
           ctx.lineWidth = 4;
-          ctx.shadowColor = glow;
+          ctx.shadowColor = resolvedGlow;
           ctx.shadowBlur = 8;
           ctx.stroke();
         });
@@ -448,7 +466,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
         // still get labeled whenever there's room.
         ctx.font = '600 9.5px "JetBrains Mono", monospace';
         ctx.textAlign = 'center';
-        ctx.fillStyle = color;
+        ctx.fillStyle = resolvedColor;
         let lastLabelRight = -Infinity;
         notes.forEach((n, i) => {
           const segStart = xFor(n.start);
@@ -474,15 +492,20 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
         // Wide soft highlight band so the position reads at a glance, not
         // just a thin line that can get lost among the note colors.
         const bandGrad = ctx.createLinearGradient(x - 10, 0, x + 10, 0);
-        bandGrad.addColorStop(0, 'rgba(241,237,228,0)');
-        bandGrad.addColorStop(0.5, 'rgba(241,237,228,0.16)');
-        bandGrad.addColorStop(1, 'rgba(241,237,228,0)');
+        bandGrad.addColorStop(0, resolveThemeColor('rgba(var(--ink-rgb),0)'));
+        bandGrad.addColorStop(0.5, resolveThemeColor('rgba(var(--ink-rgb),0.16)'));
+        bandGrad.addColorStop(1, resolveThemeColor('rgba(var(--ink-rgb),0)'));
         ctx.fillStyle = bandGrad;
         ctx.fillRect(x - 10, 0, 20, height);
 
-        ctx.strokeStyle = '#FFFFFF';
+        // The playhead line/marker itself is always the theme's primary
+        // "ink" tone (near-white in dark mode, near-black in light) rather
+        // than a fixed white — a literal white marker would disappear
+        // against a light-mode background.
+        const playheadColor = resolveThemeColor('rgba(var(--ink-rgb),1)');
+        ctx.strokeStyle = playheadColor;
         ctx.lineWidth = 2.5;
-        ctx.shadowColor = 'rgba(255,255,255,0.85)';
+        ctx.shadowColor = resolveThemeColor('rgba(var(--ink-rgb),0.85)');
         ctx.shadowBlur = 10;
         ctx.beginPath();
         ctx.moveTo(x, 0);
@@ -495,14 +518,14 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
         ctx.lineTo(x + 5, 0);
         ctx.lineTo(x, 8);
         ctx.closePath();
-        ctx.fillStyle = '#FFFFFF';
+        ctx.fillStyle = playheadColor;
         ctx.fill();
       }
     };
 
     drawRef.current = draw;
     draw();
-  }, [melodyNotes, harmonyLayers, keyInfo, duration, playheadTime, zoom, isFullscreen]);
+  }, [melodyNotes, harmonyLayers, keyInfo, duration, playheadTime, zoom, isFullscreen, theme]);
 
   // A layout change can arrive later than the props/state change that
   // triggered it — most notably entering the CSS-driven fullscreen overlay
@@ -519,12 +542,12 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
   }, []);
 
   return (
-    <div ref={outerRef} className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
-      <div className="flex flex-wrap items-center gap-2 mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+    <div ref={outerRef} className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: 'var(--bg)' } : undefined}>
+      <div className="flex flex-wrap items-center gap-2 mb-2 font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>
         <button
           onClick={() => setZoom((z) => Math.max(1, +(z - 0.5).toFixed(1)))}
           className="stamma-btn px-2.5 py-1 rounded-md"
-          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+          style={{ border: '1px solid rgba(var(--ink-rgb),0.15)' }}
           aria-label="Zooma ut"
         >
           −
@@ -533,7 +556,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
         <button
           onClick={() => setZoom((z) => Math.min(4, +(z + 0.5).toFixed(1)))}
           className="stamma-btn px-2.5 py-1 rounded-md"
-          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+          style={{ border: '1px solid rgba(var(--ink-rgb),0.15)' }}
           aria-label="Zooma in"
         >
           +
@@ -543,7 +566,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
             <button
               onClick={() => setKeyPickerOpen((v) => !v)}
               className="stamma-btn px-2.5 py-1 rounded-md flex items-center gap-1"
-              style={{ color: '#FFB454', border: '1px solid rgba(255,180,84,0.3)', whiteSpace: 'nowrap' }}
+              style={{ color: 'var(--orange)', border: '1px solid rgba(var(--orange-rgb),0.3)', whiteSpace: 'nowrap' }}
             >
               Tonart: {keyLabel}
               <span style={{ fontSize: 13, display: 'inline-block', transform: keyPickerOpen ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
@@ -551,9 +574,9 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
             {keyPickerOpen && (
               <div
                 className="absolute z-20 mt-2 rounded-xl p-3"
-                style={{ width: 240, backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
+                style={{ width: 240, backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--ink-rgb),0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
               >
-                <div className="font-mono-ui text-[10px] mb-2" style={{ color: '#C7CBDA' }}>
+                <div className="font-mono-ui text-[10px] mb-2" style={{ color: 'var(--text-muted)' }}>
                   Rätta tonarten manuellt
                 </div>
                 <div className="grid grid-cols-4 gap-1.5">
@@ -563,9 +586,9 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
                       onClick={() => onKeyChange(pc, keyInfo.mode)}
                       className="stamma-btn rounded-md py-1.5 text-xs font-medium"
                       style={{
-                        backgroundColor: keyInfo.tonic === pc ? 'rgba(255,180,84,0.15)' : 'transparent',
-                        color: keyInfo.tonic === pc ? '#FFB454' : '#F1EDE4',
-                        border: keyInfo.tonic === pc ? '1px solid rgba(255,180,84,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                        backgroundColor: keyInfo.tonic === pc ? 'rgba(var(--orange-rgb),0.15)' : 'transparent',
+                        color: keyInfo.tonic === pc ? 'var(--orange)' : 'var(--text)',
+                        border: keyInfo.tonic === pc ? '1px solid rgba(var(--orange-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                       }}
                     >
                       {name}
@@ -579,9 +602,9 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
                       onClick={() => onKeyChange(keyInfo.tonic, m)}
                       className="stamma-btn flex-1 rounded-md py-1.5 text-xs font-medium"
                       style={{
-                        backgroundColor: keyInfo.mode === m ? 'rgba(255,180,84,0.15)' : 'transparent',
-                        color: keyInfo.mode === m ? '#FFB454' : '#F1EDE4',
-                        border: keyInfo.mode === m ? '1px solid rgba(255,180,84,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                        backgroundColor: keyInfo.mode === m ? 'rgba(var(--orange-rgb),0.15)' : 'transparent',
+                        color: keyInfo.mode === m ? 'var(--orange)' : 'var(--text)',
+                        border: keyInfo.mode === m ? '1px solid rgba(var(--orange-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                       }}
                     >
                       {label}
@@ -592,7 +615,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
                   <button
                     onClick={() => { onResetKey(); setKeyPickerOpen(false); }}
                     className="stamma-btn w-full mt-2.5 rounded-lg py-1.5 font-mono-ui text-[10px]"
-                    style={{ color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.12)' }}
+                    style={{ color: 'var(--text-muted)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
                   >
                     ↺ Återställ till upptäckt tonart
                   </button>
@@ -604,7 +627,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
         <button
           onClick={toggleFullscreen}
           className="stamma-btn ml-auto px-2.5 py-1 rounded-md"
-          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+          style={{ border: '1px solid rgba(var(--ink-rgb),0.15)' }}
         >
           {isFullscreen ? 'Stäng helskärm' : 'Helskärm'}
         </button>
@@ -628,7 +651,7 @@ function PitchCanvas({ melodyNotes, harmonyLayers, keyInfo, keyLabel, duration, 
 
 const TRIM_HANDLE_MIN_GAP = 0.15;
 const FADE_MIN_GAP = 0.05;
-const FADE_COLOR = '#FFD84D';
+const FADE_COLOR = 'var(--gold)';
 
 // A waveform of the raw recording with two draggable handles marking the
 // [trimStart, trimEnd) window every mixer channel's playback gets clipped
@@ -640,7 +663,7 @@ const FADE_COLOR = '#FFD84D';
 // from the centerline rather than from one corner.
 // Not zoomable like PitchCanvas — fullscreen here is purely about giving
 // the drag handles more pixels to land precisely on.
-const NOISE_COLOR = '#FF9F5A';
+const NOISE_COLOR = 'var(--noise-orange)';
 
 function WaveformTrimmer({
   peaks, duration, trimStart, trimEnd, onTrimChange, fadeIn, fadeOut, onFadeChange, playheadTime,
@@ -648,7 +671,7 @@ function WaveformTrimmer({
   onStop, loopEnabled, onToggleLoop, busy,
   noiseReductionMode, onToggleNoiseReductionMode, noiseSampleStart, noiseSampleEnd, onNoiseSampleChange,
   onApplyNoiseReduction, denoising, denoiseError, noiseReductionApplied,
-  metronomeEnabled, onToggleMetronome,
+  metronomeEnabled, onToggleMetronome, theme,
 }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
@@ -675,7 +698,7 @@ function WaveformTrimmer({
       const n = peaks.length;
       const midY = height / 2;
       const barW = width / n;
-      ctx.fillStyle = 'rgba(241,237,228,0.4)';
+      ctx.fillStyle = resolveThemeColor('rgba(var(--ink-rgb),0.4)');
       for (let i = 0; i < n; i++) {
         const x = (i / n) * width;
         const h = Math.max(1.5, peaks[i] * (height - 10));
@@ -683,7 +706,10 @@ function WaveformTrimmer({
       }
 
       const xFor = (t) => (duration > 0 ? (t / duration) * width : 0);
-      ctx.fillStyle = 'rgba(16,19,26,0.72)';
+      // Dims a deselected (trimmed-out) region by blending it back toward
+      // the page background — so this tracks --bg, not a fixed dark tone,
+      // to still read as "fades into the background" in light mode.
+      ctx.fillStyle = resolveThemeColor('rgba(var(--bg-rgb),0.72)');
       if (trimStart > 0) ctx.fillRect(0, 0, xFor(trimStart), height);
       if (trimEnd < duration) ctx.fillRect(xFor(trimEnd), 0, width - xFor(trimEnd), height);
 
@@ -695,12 +721,12 @@ function WaveformTrimmer({
         const x0 = xFor(trimStart);
         const x1 = xFor(trimStart + fi);
         const grad = ctx.createLinearGradient(x0, 0, x1, 0);
-        grad.addColorStop(0, 'rgba(16,19,26,0.65)');
-        grad.addColorStop(1, 'rgba(16,19,26,0)');
+        grad.addColorStop(0, resolveThemeColor('rgba(var(--bg-rgb),0.65)'));
+        grad.addColorStop(1, resolveThemeColor('rgba(var(--bg-rgb),0)'));
         ctx.fillStyle = grad;
         ctx.fillRect(x0, 0, x1 - x0, height);
 
-        ctx.strokeStyle = FADE_COLOR;
+        ctx.strokeStyle = resolveThemeColor(FADE_COLOR);
         ctx.lineWidth = 1.75;
         ctx.beginPath();
         ctx.moveTo(x0, midY);
@@ -713,12 +739,12 @@ function WaveformTrimmer({
         const x1 = xFor(trimEnd);
         const x0 = xFor(trimEnd - fo);
         const grad = ctx.createLinearGradient(x0, 0, x1, 0);
-        grad.addColorStop(0, 'rgba(16,19,26,0)');
-        grad.addColorStop(1, 'rgba(16,19,26,0.65)');
+        grad.addColorStop(0, resolveThemeColor('rgba(var(--bg-rgb),0)'));
+        grad.addColorStop(1, resolveThemeColor('rgba(var(--bg-rgb),0.65)'));
         ctx.fillStyle = grad;
         ctx.fillRect(x0, 0, x1 - x0, height);
 
-        ctx.strokeStyle = FADE_COLOR;
+        ctx.strokeStyle = resolveThemeColor(FADE_COLOR);
         ctx.lineWidth = 1.75;
         ctx.beginPath();
         ctx.moveTo(x0, 0);
@@ -731,9 +757,9 @@ function WaveformTrimmer({
       if (noiseReductionMode) {
         const nx0 = xFor(Math.max(0, noiseSampleStart));
         const nx1 = xFor(Math.min(duration, noiseSampleEnd));
-        ctx.fillStyle = 'rgba(255,159,90,0.18)';
+        ctx.fillStyle = resolveThemeColor('rgba(var(--noise-orange-rgb),0.18)');
         ctx.fillRect(nx0, 0, nx1 - nx0, height);
-        ctx.strokeStyle = NOISE_COLOR;
+        ctx.strokeStyle = resolveThemeColor(NOISE_COLOR);
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 3]);
         ctx.strokeRect(nx0 + 0.75, 0.75, Math.max(0, nx1 - nx0 - 1.5), height - 1.5);
@@ -742,9 +768,9 @@ function WaveformTrimmer({
 
       if (playheadTime !== null && playheadTime !== undefined) {
         const x = xFor(Math.min(playheadTime, duration));
-        ctx.strokeStyle = '#FFFFFF';
+        ctx.strokeStyle = resolveThemeColor('rgba(var(--ink-rgb),1)');
         ctx.lineWidth = 2;
-        ctx.shadowColor = 'rgba(255,255,255,0.85)';
+        ctx.shadowColor = resolveThemeColor('rgba(var(--ink-rgb),0.85)');
         ctx.shadowBlur = 6;
         ctx.beginPath();
         ctx.moveTo(x, 0);
@@ -756,7 +782,7 @@ function WaveformTrimmer({
 
     drawRef.current = draw;
     draw();
-  }, [peaks, duration, trimStart, trimEnd, fadeIn, fadeOut, playheadTime, isFullscreen, noiseReductionMode, noiseSampleStart, noiseSampleEnd]);
+  }, [peaks, duration, trimStart, trimEnd, fadeIn, fadeOut, playheadTime, isFullscreen, noiseReductionMode, noiseSampleStart, noiseSampleEnd, theme]);
 
   // Same reasoning as PitchCanvas's ResizeObserver: the fullscreen overlay's
   // real size settles a moment after isFullscreen flips, so redraw on
@@ -849,6 +875,69 @@ function WaveformTrimmer({
     };
   }
 
+  // Keyboard equivalent of the pointer-drag handlers above, for VoiceOver
+  // and keyboard users — the canvas itself has no way to drag with either.
+  // ArrowLeft/Right nudge by STEP_SEC (STEP_SEC_LARGE with Shift held);
+  // Home/End (trim handles only) jump to that handle's natural extreme.
+  // Mirrors each drag handler's own clamping and, for the fade-out handle,
+  // its inverted direction (dragging right *shrinks* the fade-out region).
+  const STEP_SEC = 0.1;
+  const STEP_SEC_LARGE = 1.0;
+
+  function trimKeyDown(which) {
+    return (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      e.preventDefault();
+      const step = e.shiftKey ? STEP_SEC_LARGE : STEP_SEC;
+      if (which === 'start') {
+        let next = trimStart;
+        if (e.key === 'ArrowLeft') next -= step;
+        else if (e.key === 'ArrowRight') next += step;
+        else if (e.key === 'Home') next = 0;
+        else if (e.key === 'End') next = trimEnd - TRIM_HANDLE_MIN_GAP;
+        onTrimChange(Math.min(Math.max(0, next), trimEnd - TRIM_HANDLE_MIN_GAP), trimEnd);
+      } else {
+        let next = trimEnd;
+        if (e.key === 'ArrowLeft') next -= step;
+        else if (e.key === 'ArrowRight') next += step;
+        else if (e.key === 'Home') next = trimStart + TRIM_HANDLE_MIN_GAP;
+        else if (e.key === 'End') next = duration;
+        onTrimChange(trimStart, Math.max(Math.min(duration, next), trimStart + TRIM_HANDLE_MIN_GAP));
+      }
+    };
+  }
+
+  function fadeKeyDown(which) {
+    return (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const delta = (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? STEP_SEC_LARGE : STEP_SEC);
+      const windowDur = Math.max(0.001, trimEnd - trimStart);
+      if (which === 'in') {
+        const next = Math.min(Math.max(0, fadeIn + delta), windowDur - fadeOut - FADE_MIN_GAP);
+        onFadeChange(Math.max(0, next), fadeOut);
+      } else {
+        const next = Math.min(Math.max(0, fadeOut - delta), windowDur - fadeIn - FADE_MIN_GAP);
+        onFadeChange(fadeIn, Math.max(0, next));
+      }
+    };
+  }
+
+  function noiseKeyDown(which) {
+    return (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const delta = (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? STEP_SEC_LARGE : STEP_SEC);
+      if (which === 'start') {
+        const next = Math.min(Math.max(0, noiseSampleStart + delta), noiseSampleEnd - NOISE_MIN_GAP);
+        onNoiseSampleChange(next, noiseSampleEnd);
+      } else {
+        const next = Math.max(Math.min(duration, noiseSampleEnd + delta), noiseSampleStart + NOISE_MIN_GAP);
+        onNoiseSampleChange(noiseSampleStart, next);
+      }
+    };
+  }
+
   const startPct = duration > 0 ? Math.min(100, (trimStart / duration) * 100) : 0;
   const endPct = duration > 0 ? Math.min(100, (trimEnd / duration) * 100) : 100;
   const windowDurForHandles = Math.max(0.001, trimEnd - trimStart);
@@ -917,13 +1006,13 @@ function WaveformTrimmer({
   );
 
   return (
-    <div className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: '#10131A' } : undefined}>
-      <div className="flex items-center justify-between mb-2 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+    <div className={isFullscreen ? 'fixed inset-0 z-50 flex flex-col p-4' : ''} style={isFullscreen ? { backgroundColor: 'var(--bg)' } : undefined}>
+      <div className="flex items-center justify-between mb-2 font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>
         <span>Vågform — beskär &amp; tona in/ut</span>
         <button
           onClick={() => setIsFullscreen((v) => !v)}
           className="stamma-btn px-2.5 py-1 rounded-md"
-          style={{ border: '1px solid rgba(241,237,228,0.15)' }}
+          style={{ border: '1px solid rgba(var(--ink-rgb),0.15)' }}
         >
           {isFullscreen ? 'Stäng helskärm' : 'Helskärm'}
         </button>
@@ -938,35 +1027,111 @@ function WaveformTrimmer({
           role="img"
           aria-label="Vågform av inspelningen, med hantag för att beskära start och slut och tona in/ut"
         />
-        <div onPointerDown={beginDrag('start')} style={handleStyle(startPct)}>
-          <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: '#55D6C0' }} />
-          <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: '#55D6C0' }} />
+        <div
+          onPointerDown={beginDrag('start')}
+          onKeyDown={trimKeyDown('start')}
+          style={handleStyle(startPct)}
+          className="stamma-btn"
+          role="slider"
+          tabIndex={0}
+          aria-label="Beskär start"
+          aria-valuemin={0}
+          aria-valuemax={Math.max(0, trimEnd - TRIM_HANDLE_MIN_GAP)}
+          aria-valuenow={Math.round(trimStart * 10) / 10}
+          aria-valuetext={`${trimStart.toFixed(1)} sekunder`}
+        >
+          <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: 'var(--teal)' }} />
+          <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: 'var(--teal)' }} />
         </div>
-        <div onPointerDown={beginDrag('end')} style={handleStyle(endPct)}>
-          <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: '#FB7185' }} />
-          <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: '#FB7185' }} />
+        <div
+          onPointerDown={beginDrag('end')}
+          onKeyDown={trimKeyDown('end')}
+          style={handleStyle(endPct)}
+          className="stamma-btn"
+          role="slider"
+          tabIndex={0}
+          aria-label="Beskär slut"
+          aria-valuemin={Math.min(duration, trimStart + TRIM_HANDLE_MIN_GAP)}
+          aria-valuemax={duration}
+          aria-valuenow={Math.round(trimEnd * 10) / 10}
+          aria-valuetext={`${trimEnd.toFixed(1)} sekunder`}
+        >
+          <div style={{ position: 'absolute', left: 9, top: 0, bottom: 0, width: 2, backgroundColor: 'var(--rose)' }} />
+          <div style={{ position: 'absolute', left: 0, top: '50%', transform: 'translateY(-50%)', width: 20, height: 34, borderRadius: 7, backgroundColor: 'var(--rose)' }} />
         </div>
-        <div onPointerDown={beginFadeDrag('in')} style={fadeHandleStyle(fadeInPct)} title="Tona in">
+        <div
+          onPointerDown={beginFadeDrag('in')}
+          onKeyDown={fadeKeyDown('in')}
+          style={fadeHandleStyle(fadeInPct)}
+          className="stamma-btn"
+          title="Tona in"
+          role="slider"
+          tabIndex={0}
+          aria-label="Tona in-längd"
+          aria-valuemin={0}
+          aria-valuemax={Math.max(0, windowDurForHandles - fadeOutClamped - FADE_MIN_GAP)}
+          aria-valuenow={Math.round(fadeInClamped * 10) / 10}
+          aria-valuetext={`${fadeInClamped.toFixed(1)} sekunder`}
+        >
           {fadeFlag(true)}
         </div>
-        <div onPointerDown={beginFadeDrag('out')} style={fadeHandleStyle(fadeOutPct)} title="Tona ut">
+        <div
+          onPointerDown={beginFadeDrag('out')}
+          onKeyDown={fadeKeyDown('out')}
+          style={fadeHandleStyle(fadeOutPct)}
+          className="stamma-btn"
+          title="Tona ut"
+          role="slider"
+          tabIndex={0}
+          aria-label="Tona ut-längd"
+          aria-valuemin={0}
+          aria-valuemax={Math.max(0, windowDurForHandles - fadeInClamped - FADE_MIN_GAP)}
+          aria-valuenow={Math.round(fadeOutClamped * 10) / 10}
+          aria-valuetext={`${fadeOutClamped.toFixed(1)} sekunder`}
+        >
           {fadeFlag(false)}
         </div>
         {isFullscreen && noiseReductionMode && (
           <>
-            <div onPointerDown={beginNoiseDrag('start')} style={noiseHandleStyle(noiseStartPct)} title="Brusprov start">
+            <div
+              onPointerDown={beginNoiseDrag('start')}
+              onKeyDown={noiseKeyDown('start')}
+              style={noiseHandleStyle(noiseStartPct)}
+              className="stamma-btn"
+              title="Brusprov start"
+              role="slider"
+              tabIndex={0}
+              aria-label="Brusprov start"
+              aria-valuemin={0}
+              aria-valuemax={Math.max(0, noiseSampleEnd - NOISE_MIN_GAP)}
+              aria-valuenow={Math.round(Math.max(0, noiseSampleStart) * 10) / 10}
+              aria-valuetext={`${Math.max(0, noiseSampleStart).toFixed(1)} sekunder`}
+            >
               {noiseFlag}
             </div>
-            <div onPointerDown={beginNoiseDrag('end')} style={noiseHandleStyle(noiseEndPct)} title="Brusprov slut">
+            <div
+              onPointerDown={beginNoiseDrag('end')}
+              onKeyDown={noiseKeyDown('end')}
+              style={noiseHandleStyle(noiseEndPct)}
+              className="stamma-btn"
+              title="Brusprov slut"
+              role="slider"
+              tabIndex={0}
+              aria-label="Brusprov slut"
+              aria-valuemin={Math.min(duration, noiseSampleStart + NOISE_MIN_GAP)}
+              aria-valuemax={duration}
+              aria-valuenow={Math.round(Math.min(duration, noiseSampleEnd) * 10) / 10}
+              aria-valuetext={`${Math.min(duration, noiseSampleEnd).toFixed(1)} sekunder`}
+            >
               {noiseFlag}
             </div>
           </>
         )}
       </div>
-      <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>
-        <span style={{ color: '#55D6C0' }}>{trimStart.toFixed(1)}s</span>
+      <div className="flex justify-between mt-1.5 font-mono-ui text-[10px]" style={{ color: 'var(--text-muted)' }}>
+        <span style={{ color: 'var(--teal)' }}>{trimStart.toFixed(1)}s</span>
         <span>{(trimEnd - trimStart).toFixed(1)}s vald</span>
-        <span style={{ color: '#FB7185' }}>{trimEnd.toFixed(1)}s</span>
+        <span style={{ color: 'var(--rose)' }}>{trimEnd.toFixed(1)}s</span>
       </div>
       <div className="flex justify-between mt-1 font-mono-ui text-[10px]" style={{ color: FADE_COLOR }}>
         <span>Tona in: {fadeInClamped.toFixed(1)}s</span>
@@ -976,7 +1141,7 @@ function WaveformTrimmer({
       {/* Fullscreen only, per request — precise placement of the noise
           sample needs the extra room the compact view doesn't have. */}
       {isFullscreen && onToggleNoiseReductionMode && (
-        <div className="mt-4 rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: `1px solid ${noiseReductionMode ? `${NOISE_COLOR}55` : 'rgba(241,237,228,0.1)'}` }}>
+        <div className="mt-4 rounded-xl p-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: `1px solid ${noiseReductionMode ? `${NOISE_COLOR}55` : 'rgba(var(--ink-rgb),0.1)'}` }}>
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="flex items-center gap-1.5">
@@ -990,14 +1155,14 @@ function WaveformTrimmer({
                   </span>
                 )}
               </div>
-              <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+              <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                 Markera en del med bara brus — resten av inspelningen renas utifrån den
               </div>
             </div>
             <ToggleSwitch checked={noiseReductionMode} onChange={onToggleNoiseReductionMode} accentColor={NOISE_COLOR} ariaLabel="Brusreducering" />
           </div>
           {noiseReductionMode && (
-            <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+            <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
               <div className="flex justify-between font-mono-ui text-[10px] mb-2" style={{ color: NOISE_COLOR }}>
                 <span>Brusprov: {noiseSampleStart.toFixed(2)}s – {noiseSampleEnd.toFixed(2)}s</span>
                 <span>({(noiseSampleEnd - noiseSampleStart).toFixed(2)}s)</span>
@@ -1007,8 +1172,8 @@ function WaveformTrimmer({
                 disabled={denoising}
                 className="stamma-btn w-full rounded-xl py-2.5 flex items-center justify-center gap-2 font-body font-medium text-sm"
                 style={{
-                  backgroundColor: denoising ? 'rgba(241,237,228,0.06)' : NOISE_COLOR,
-                  color: denoising ? 'rgba(241,237,228,0.3)' : '#10131A',
+                  backgroundColor: denoising ? 'rgba(var(--ink-rgb),0.06)' : NOISE_COLOR,
+                  color: denoising ? 'rgba(var(--ink-rgb),0.3)' : 'var(--bg)',
                   cursor: denoising ? 'not-allowed' : 'pointer',
                 }}
               >
@@ -1021,7 +1186,7 @@ function WaveformTrimmer({
                 </div>
               )}
               {denoiseError && (
-                <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{denoiseError}</div>
+                <div className="mt-2 text-xs" style={{ color: 'var(--red-softer)' }}>{denoiseError}</div>
               )}
             </div>
           )}
@@ -1045,7 +1210,7 @@ function WaveformTrimmer({
             onToggleMetronome={onToggleMetronome}
           />
           <div className="flex items-center gap-2 mt-2">
-            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>
               {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
             </span>
             <input
@@ -1056,10 +1221,10 @@ function WaveformTrimmer({
               value={playheadTime !== null ? playheadTime : trimStart}
               onChange={(e) => onSeek(parseFloat(e.target.value))}
               className="stamma-fader w-full"
-              style={{ accentColor: '#FFB454' }}
+              style={{ accentColor: 'var(--orange)' }}
               aria-label="Spola i vågformen"
             />
-            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{trimEnd.toFixed(1)}s</span>
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>{trimEnd.toFixed(1)}s</span>
           </div>
         </div>
       )}
@@ -1226,35 +1391,35 @@ function AboutPage() {
   }
 
   return (
-    <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
+    <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: 'var(--bg)', color: 'var(--text)' }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
         .font-display { font-family: 'Fraunces', serif; }
         .font-body { font-family: 'Space Grotesk', sans-serif; }
         .font-mono-ui { font-family: 'JetBrains Mono', monospace; }
-        .stamma-btn:focus-visible { outline: 2px solid #FFB454; outline-offset: 2px; }
+        .stamma-btn:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
       `}</style>
       <div className="w-full max-w-md px-5 py-8 font-body">
         <a
           href="#"
           className="stamma-btn font-mono-ui text-xs"
-          style={{ color: '#55D6C0' }}
+          style={{ color: 'var(--teal)' }}
         >
           ← Tillbaka
         </a>
-        <h1 className="mt-3 font-display text-3xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
+        <h1 className="mt-3 font-display text-3xl font-semibold tracking-tight" style={{ color: 'var(--text)' }}>
           Om Stämifier
         </h1>
-        <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
+        <p className="mt-2 text-base leading-relaxed" style={{ color: 'var(--text-muted)' }}>
           Så fungerar appens olika delar, rent praktiskt.
         </p>
 
         <nav
           className="mt-5 rounded-xl p-3"
-          style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}
+          style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}
           aria-label="Innehåll"
         >
-          <div className="font-mono-ui text-xs font-medium" style={{ color: '#C7CBDA' }}>
+          <div className="font-mono-ui text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
             Innehåll
           </div>
           <ul className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5">
@@ -1264,7 +1429,7 @@ function AboutPage() {
                   href={`#${s.id}`}
                   onClick={(e) => scrollToSection(e, s.id)}
                   className="stamma-btn text-sm leading-snug"
-                  style={{ color: '#55D6C0' }}
+                  style={{ color: 'var(--teal)' }}
                 >
                   {s.title}
                 </a>
@@ -1276,10 +1441,10 @@ function AboutPage() {
         <div className="mt-6 space-y-5">
           {sections.map((s) => (
             <div key={s.id} id={s.id} style={{ scrollMarginTop: 16 }}>
-              <h2 className="font-display text-lg font-semibold" style={{ color: '#F1EDE4' }}>
+              <h2 className="font-display text-lg font-semibold" style={{ color: 'var(--text)' }}>
                 {s.title}
               </h2>
-              <p className="mt-1 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
+              <p className="mt-1 text-sm leading-relaxed" style={{ color: 'var(--text-muted)' }}>
                 {s.body}
               </p>
             </div>
@@ -1289,7 +1454,7 @@ function AboutPage() {
         <a
           href="#"
           className="stamma-btn mt-8 inline-block font-mono-ui text-xs"
-          style={{ color: '#55D6C0' }}
+          style={{ color: 'var(--teal)' }}
         >
           ← Tillbaka
         </a>
@@ -1299,6 +1464,33 @@ function AboutPage() {
 }
 
 export default function App() {
+  // Manual light/dark toggle (not tied to the OS's prefers-color-scheme —
+  // see the theme tokens in index.css). Persisted so a reload keeps
+  // whatever the user last picked; defaults to dark, the app's original
+  // design. Applied as a data-theme attribute on <html> (read by
+  // index.css) rather than on the app's own root div, so it also covers
+  // the plain white flash a browser can paint before React mounts.
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem('stamma-theme') === 'light' ? 'light' : 'dark';
+    } catch {
+      return 'dark';
+    }
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeColorMeta) {
+      themeColorMeta.setAttribute('content', theme === 'light' ? '#F5F1E8' : '#10131A');
+    }
+    try {
+      localStorage.setItem('stamma-theme', theme);
+    } catch {
+      // Private browsing or storage disabled — theme just won't persist
+      // across reloads, which is a fine fallback rather than an error.
+    }
+  }, [theme]);
+
   const [phase, setPhase] = useState('idle'); // idle | countin | recording | analyzing | ready | error
   const [errorMsg, setErrorMsg] = useState('');
   const [countdown, setCountdown] = useState(DURATION);
@@ -3838,7 +4030,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: '#10131A', color: '#F1EDE4' }}>
+    <div className="min-h-screen w-full flex justify-center" style={{ backgroundColor: 'var(--bg)', color: 'var(--text)' }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
         .font-display { font-family: 'Fraunces', serif; }
@@ -3847,10 +4039,10 @@ export default function App() {
         @keyframes pulseRec { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(0.82); } }
         .rec-dot { animation: pulseRec 1.4s ease-in-out infinite; }
         @media (prefers-reduced-motion: reduce) { .rec-dot { animation: none; } }
-        .stamma-btn:focus-visible { outline: 2px solid #FFB454; outline-offset: 2px; }
-        .stamma-fader { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px; background: rgba(241,237,228,0.15); outline: none; }
-        .stamma-fader::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #F1EDE4; cursor: pointer; }
-        .stamma-fader::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #F1EDE4; border: none; cursor: pointer; }
+        .stamma-btn:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+        .stamma-fader { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px; background: rgba(var(--ink-rgb),0.15); outline: none; }
+        .stamma-fader::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--text); cursor: pointer; }
+        .stamma-fader::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--text); border: none; cursor: pointer; }
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
       `}</style>
 
@@ -3867,10 +4059,26 @@ export default function App() {
 
         {/* Header */}
         <header className="mb-6">
-          <h1 className="font-display text-4xl font-semibold tracking-tight" style={{ color: '#F1EDE4' }}>
-            Stämifier
-          </h1>
-          <p className="mt-2 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
+          <div className="flex items-center justify-between gap-2">
+            <h1 className="font-display text-4xl font-semibold tracking-tight" style={{ color: 'var(--text)' }}>
+              Stämifier
+            </h1>
+            <button
+              onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+              className="stamma-btn shrink-0 rounded-full flex items-center justify-center"
+              style={{
+                width: 44,
+                height: 44,
+                color: 'var(--text-muted)',
+                border: '1px solid rgba(var(--ink-rgb),0.15)',
+              }}
+              aria-label={theme === 'dark' ? 'Byt till ljust tema' : 'Byt till mörkt tema'}
+              title={theme === 'dark' ? 'Byt till ljust tema' : 'Byt till mörkt tema'}
+            >
+              {theme === 'dark' ? <SunIcon size={18} /> : <MoonIcon size={18} />}
+            </button>
+          </div>
+          <p className="mt-2 text-base leading-relaxed" style={{ color: 'var(--text-muted)' }}>
             Sjung in eller ladda upp en melodi (max 10s).
             {!introExpanded && (
               <>
@@ -3878,7 +4086,7 @@ export default function App() {
                 <button
                   onClick={() => setIntroExpanded(true)}
                   className="stamma-btn font-mono-ui text-xs align-middle"
-                  style={{ color: '#55D6C0' }}
+                  style={{ color: 'var(--teal)' }}
                 >
                   Läs mer <span style={{ fontSize: 15 }}>▾</span>
                 </button>
@@ -3886,12 +4094,12 @@ export default function App() {
             )}
           </p>
           {introExpanded && (
-            <p className="mt-1 text-base leading-relaxed" style={{ color: '#C7CBDA' }}>
+            <p className="mt-1 text-base leading-relaxed" style={{ color: 'var(--text-muted)' }}>
               Appen känner av tonarten och bygger stämmor i ters, kvint och sext som du kan mixa och träna in.{' '}
               <button
                 onClick={() => setIntroExpanded(false)}
                 className="stamma-btn font-mono-ui text-xs align-middle"
-                style={{ color: '#55D6C0' }}
+                style={{ color: 'var(--teal)' }}
               >
                 Visa mindre <span style={{ fontSize: 15 }}>▴</span>
               </button>
@@ -3901,13 +4109,13 @@ export default function App() {
 
         {/* Sessioner — saved projects, see indexedDb.js */}
         {projects.length > 0 && phase !== 'recording' && phase !== 'countin' && (
-          <div className="rounded-xl p-3 mb-5" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+          <div className="rounded-xl p-3 mb-5" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
             <button
               onClick={() => setProjectsExpanded((v) => !v)}
               className="stamma-btn w-full flex items-center justify-between"
             >
               <span className="text-sm font-medium">Sessioner ({projects.length})</span>
-              <span style={{ display: 'inline-block', fontSize: 15, color: '#C7CBDA', transform: projectsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+              <span style={{ display: 'inline-block', fontSize: 15, color: 'var(--text-muted)', transform: projectsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
             </button>
             {projectsExpanded && (
               <div className="mt-3 space-y-2">
@@ -3930,13 +4138,13 @@ export default function App() {
             actually produced melody notes/a waveform, so this stays hidden
             through idle and error rather than rendering an empty shell. */}
         {phase === 'ready' && (
-        <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
+        <div className="rounded-2xl p-3 mb-5" style={{ backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--ink-rgb),0.08)' }}>
           <button
             onClick={() => setNoteViewExpanded((v) => !v)}
             className="stamma-btn w-full flex items-center justify-between"
           >
             <h2 className="font-display text-lg font-semibold">Tonhöjdskurva &amp; Vågform</h2>
-            <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: noteViewExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+            <span style={{ display: 'inline-block', fontSize: 17, color: 'var(--text-muted)', transform: noteViewExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
           </button>
           {noteViewExpanded && (
             <>
@@ -3951,10 +4159,11 @@ export default function App() {
                   onKeyChange={overrideKey}
                   onResetKey={resetKeyToDetected}
                   keyIsManual={keyIsManual}
+                  theme={theme}
                 />
               </div>
               {melodyNotes.length > 0 && (
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: '#C7CBDA' }}>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 px-1 font-mono-ui text-sm" style={{ color: 'var(--text-muted)' }}>
                   <span className="flex items-center gap-1.5">
                     <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: MELODY_COLOR.line }} />
                     melodi
@@ -3966,14 +4175,14 @@ export default function App() {
                     </span>
                   ))}
                   {playheadTime !== null && (
-                    <span className="ml-auto" style={{ color: '#F1EDE4' }}>
+                    <span className="ml-auto" style={{ color: 'var(--text)' }}>
                       {playheadTime.toFixed(1)}s / {recordingDuration.toFixed(1)}s
                     </span>
                   )}
                 </div>
               )}
               {voiceReady && soundType === 'recording' && waveformPeaks && (
-                <div className="mt-3 rounded-2xl p-3" style={{ backgroundColor: '#10131A', border: '1px solid rgba(241,237,228,0.08)' }}>
+                <div className="mt-3 rounded-2xl p-3" style={{ backgroundColor: 'var(--bg)', border: '1px solid rgba(var(--ink-rgb),0.08)' }}>
                   <WaveformTrimmer
                     peaks={waveformPeaks}
                     duration={recordingDuration}
@@ -4011,6 +4220,7 @@ export default function App() {
                     denoising={denoising}
                     denoiseError={denoiseError}
                     noiseReductionApplied={noiseReductionApplied}
+                    theme={theme}
                   />
 
                   <div className="flex items-center gap-2 mt-3">
@@ -4019,9 +4229,9 @@ export default function App() {
                       disabled={normalizing}
                       className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
                       style={{
-                        backgroundColor: 'rgba(241,237,228,0.06)',
-                        color: normalizing ? 'rgba(241,237,228,0.3)' : '#F1EDE4',
-                        border: '1px solid rgba(241,237,228,0.12)',
+                        backgroundColor: 'rgba(var(--ink-rgb),0.06)',
+                        color: normalizing ? 'rgba(var(--ink-rgb),0.3)' : 'var(--text)',
+                        border: '1px solid rgba(var(--ink-rgb),0.12)',
                         cursor: normalizing ? 'not-allowed' : 'pointer',
                       }}
                     >
@@ -4031,14 +4241,14 @@ export default function App() {
                       <button
                         onClick={revertToOriginalRecording}
                         className="stamma-btn flex-1 rounded-xl py-2 font-body font-medium text-xs"
-                        style={{ backgroundColor: 'rgba(255,107,107,0.1)', color: '#FFB4B4', border: '1px solid rgba(255,107,107,0.3)' }}
+                        style={{ backgroundColor: 'rgba(var(--red-rgb),0.1)', color: 'var(--red-softer)', border: '1px solid rgba(var(--red-rgb),0.3)' }}
                       >
                         Återställ till original
                       </button>
                     )}
                   </div>
                   {normalizeError && (
-                    <div className="mt-2 text-xs" style={{ color: '#FFB4B4' }}>{normalizeError}</div>
+                    <div className="mt-2 text-xs" style={{ color: 'var(--red-softer)' }}>{normalizeError}</div>
                   )}
 
                   <div className="mt-3">
@@ -4056,7 +4266,7 @@ export default function App() {
                   </div>
 
                   <div className="flex items-center gap-2 mt-2">
-                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>
+                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>
                       {(playheadTime !== null ? playheadTime : trimStart).toFixed(1)}s
                     </span>
                     <input
@@ -4067,19 +4277,19 @@ export default function App() {
                       value={playheadTime !== null ? playheadTime : trimStart}
                       onChange={(e) => seekTo(parseFloat(e.target.value))}
                       className="stamma-fader w-full"
-                      style={{ accentColor: '#FFB454' }}
+                      style={{ accentColor: 'var(--orange)' }}
                       aria-label="Spola i vågformen"
                     />
-                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>{effectiveTrimEnd.toFixed(1)}s</span>
+                    <span className="font-mono-ui text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>{effectiveTrimEnd.toFixed(1)}s</span>
                   </div>
 
-                  <div className="mt-3 pt-3 relative" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                  <div className="mt-3 pt-3 relative" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
                     <div className="flex items-center gap-1.5">
                       <MetronomeIcon size={14} />
                       <button
                         onClick={() => setMetronomeExpanded((v) => !v)}
                         className="stamma-btn flex items-center gap-1 font-mono-ui text-xs"
-                        style={{ color: '#C7CBDA' }}
+                        style={{ color: 'var(--text-muted)' }}
                       >
                         {metronomeBpm} BPM
                         <span style={{ display: 'inline-block', fontSize: 15, transform: metronomeExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
@@ -4088,13 +4298,13 @@ export default function App() {
                     {metronomeExpanded && (
                       <div
                         className="absolute z-10 mt-2 rounded-xl p-3"
-                        style={{ width: 220, backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
+                        style={{ width: 220, backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--ink-rgb),0.12)', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}
                       >
                         <div className="flex items-center justify-center gap-4">
                           <button
                             onClick={() => adjustMetronomeBpm(-1)}
                             className="stamma-btn rounded-md flex items-center justify-center"
-                            style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                            style={{ width: 44, height: 44, backgroundColor: 'rgba(var(--ink-rgb),0.06)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
                             aria-label="Sänk takt"
                           >
                             −
@@ -4103,19 +4313,19 @@ export default function App() {
                             value={metronomeBpm}
                             onCommit={setMetronomeBpmTo}
                             className="font-mono-ui text-lg"
-                            style={{ minWidth: 56, color: '#F1EDE4' }}
+                            style={{ minWidth: 56, color: 'var(--text)' }}
                           />
                           <button
                             onClick={() => adjustMetronomeBpm(1)}
                             className="stamma-btn rounded-md flex items-center justify-center"
-                            style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                            style={{ width: 44, height: 44, backgroundColor: 'rgba(var(--ink-rgb),0.06)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
                             aria-label="Höj takt"
                           >
                             +
                           </button>
                         </div>
                         {tempoDetected && (
-                          <div className="mt-1.5 text-center font-mono-ui text-[10px]" style={{ color: '#55D6C0' }}>
+                          <div className="mt-1.5 text-center font-mono-ui text-[10px]" style={{ color: 'var(--teal)' }}>
                             Upptäckt från inspelningen
                           </div>
                         )}
@@ -4123,9 +4333,9 @@ export default function App() {
                           onClick={toggleMetronomeListen}
                           className="stamma-btn w-full mt-3 rounded-lg py-1.5 flex items-center justify-center gap-1.5 font-body font-medium text-xs"
                           style={{
-                            backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                            color: metronomeListening ? '#55D6C0' : '#F1EDE4',
-                            border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                            backgroundColor: metronomeListening ? 'rgba(var(--teal-rgb),0.15)' : 'rgba(var(--ink-rgb),0.06)',
+                            color: metronomeListening ? 'var(--teal)' : 'var(--text)',
+                            border: metronomeListening ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                           }}
                         >
                           {metronomeListening ? <PauseIcon size={13} /> : <PlayIcon size={13} />}
@@ -4158,22 +4368,22 @@ export default function App() {
 
         {/* Error banner */}
         {errorMsg && (
-          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(var(--red-rgb),0.1)', border: '1px solid rgba(var(--red-rgb),0.3)', color: 'var(--red-softer)' }}>
             {errorMsg}
           </div>
         )}
         {autotuneRenderError && (
-          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(var(--red-rgb),0.1)', border: '1px solid rgba(var(--red-rgb),0.3)', color: 'var(--red-softer)' }}>
             {autotuneRenderError}
           </div>
         )}
         {Object.entries(harmonyRenderErrorsByType).map(([type, msg]) => msg && (
-          <div key={type} className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+          <div key={type} className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(var(--red-rgb),0.1)', border: '1px solid rgba(var(--red-rgb),0.3)', color: 'var(--red-softer)' }}>
             {msg}
           </div>
         ))}
         {ownTakeError && (
-          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(255,107,107,0.1)', border: '1px solid rgba(255,107,107,0.3)', color: '#FFB4B4' }}>
+          <div className="rounded-xl p-4 mb-5 text-sm" style={{ backgroundColor: 'rgba(var(--red-rgb),0.1)', border: '1px solid rgba(var(--red-rgb),0.3)', color: 'var(--red-softer)' }}>
             {ownTakeError}
           </div>
         )}
@@ -4181,18 +4391,18 @@ export default function App() {
         {/* Idle: start button + upload */}
         {(phase === 'idle' || phase === 'error') && (
           <div className="space-y-3">
-            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+            <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
               <div className="flex items-center gap-2">
                 <MetronomeIcon size={16} />
                 <span className="text-sm font-medium">Metronom</span>
-                <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Klick vid inspelning</span>
-                <ToggleSwitch checked={metronomeEnabled} onChange={() => setMetronomeEnabled((v) => !v)} accentColor="#55D6C0" ariaLabel="Metronom vid inspelning" />
+                <span className="ml-auto font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>Klick vid inspelning</span>
+                <ToggleSwitch checked={metronomeEnabled} onChange={() => setMetronomeEnabled((v) => !v)} accentColor="var(--teal)" ariaLabel="Metronom vid inspelning" />
               </div>
-              <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+              <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
                 <button
                   onClick={() => setMetronomeExpanded((v) => !v)}
                   className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
-                  style={{ color: '#55D6C0' }}
+                  style={{ color: 'var(--teal)' }}
                 >
                   <span>Takt: {metronomeBpm} BPM</span>
                   <span style={{ display: 'inline-block', fontSize: 15, transform: metronomeExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
@@ -4203,7 +4413,7 @@ export default function App() {
                       <button
                         onClick={() => adjustMetronomeBpm(-1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
-                        style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                        style={{ width: 44, height: 44, backgroundColor: 'rgba(var(--ink-rgb),0.06)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
                         aria-label="Sänk takt"
                       >
                         −
@@ -4213,14 +4423,14 @@ export default function App() {
                           value={metronomeBpm}
                           onCommit={setMetronomeBpmTo}
                           className="font-mono-ui text-xl"
-                          style={{ width: 46, color: '#F1EDE4' }}
+                          style={{ width: 46, color: 'var(--text)' }}
                         />
-                        <span className="font-mono-ui text-xl" style={{ color: '#F1EDE4' }}>BPM</span>
+                        <span className="font-mono-ui text-xl" style={{ color: 'var(--text)' }}>BPM</span>
                       </span>
                       <button
                         onClick={() => adjustMetronomeBpm(1)}
                         className="stamma-btn rounded-md flex items-center justify-center"
-                        style={{ width: 44, height: 44, backgroundColor: 'rgba(241,237,228,0.06)', border: '1px solid rgba(241,237,228,0.12)' }}
+                        style={{ width: 44, height: 44, backgroundColor: 'rgba(var(--ink-rgb),0.06)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
                         aria-label="Höj takt"
                       >
                         +
@@ -4230,9 +4440,9 @@ export default function App() {
                       onClick={toggleMetronomeListen}
                       className="stamma-btn w-full mt-3 rounded-lg py-2 flex items-center justify-center gap-1.5 font-body font-medium text-sm"
                       style={{
-                        backgroundColor: metronomeListening ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                        color: metronomeListening ? '#55D6C0' : '#F1EDE4',
-                        border: metronomeListening ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                        backgroundColor: metronomeListening ? 'rgba(var(--teal-rgb),0.15)' : 'rgba(var(--ink-rgb),0.06)',
+                        color: metronomeListening ? 'var(--teal)' : 'var(--text)',
+                        border: metronomeListening ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                       }}
                     >
                       {metronomeListening ? <PauseIcon size={15} /> : <PlayIcon size={15} />}
@@ -4257,14 +4467,14 @@ export default function App() {
             <button
               onClick={startRecording}
               className="stamma-btn w-full rounded-2xl py-4 font-body font-medium text-base transition-transform active:scale-[0.98]"
-              style={{ backgroundColor: '#FFB454', color: '#10131A' }}
+              style={{ backgroundColor: 'var(--orange)', color: 'var(--bg)' }}
             >
               Spela in (max 10s)
             </button>
             <button
               onClick={() => fileInputRef.current?.click()}
               className="stamma-btn w-full rounded-xl py-3 font-body font-medium text-sm"
-              style={{ backgroundColor: 'rgba(241,237,228,0.06)', color: '#F1EDE4', border: '1px solid rgba(241,237,228,0.12)' }}
+              style={{ backgroundColor: 'rgba(var(--ink-rgb),0.06)', color: 'var(--text)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
             >
               Ladda upp ljudfil
             </button>
@@ -4294,15 +4504,15 @@ export default function App() {
 
         {/* Count-in — plays before the mic actually starts recording */}
         {phase === 'countin' && (
-          <div className="rounded-2xl p-5 flex flex-col items-center" style={{ backgroundColor: '#171B26', border: '1px solid rgba(255,180,84,0.3)' }}>
-            <span className="font-mono-ui text-sm" style={{ color: '#FFB454' }}>GÖR DIG REDO</span>
-            <span className="font-display text-6xl font-semibold mt-2 tabular-nums" style={{ color: '#F1EDE4' }}>
+          <div className="rounded-2xl p-5 flex flex-col items-center" style={{ backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--orange-rgb),0.3)' }}>
+            <span className="font-mono-ui text-sm" style={{ color: 'var(--orange)' }}>GÖR DIG REDO</span>
+            <span className="font-display text-6xl font-semibold mt-2 tabular-nums" style={{ color: 'var(--text)' }}>
               {COUNT_IN_BEATS - countInBeat}
             </span>
             <button
               onClick={cancelCountIn}
               className="stamma-btn mt-4 rounded-xl py-2 px-5 font-body font-medium text-sm"
-              style={{ backgroundColor: 'rgba(241,237,228,0.06)', color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.12)' }}
+              style={{ backgroundColor: 'rgba(var(--ink-rgb),0.06)', color: 'var(--text-muted)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
             >
               Avbryt
             </button>
@@ -4311,23 +4521,23 @@ export default function App() {
 
         {/* Recording */}
         {phase === 'recording' && (
-          <div className="rounded-2xl p-5" style={{ backgroundColor: '#171B26', border: '1px solid rgba(255,107,107,0.3)' }}>
+          <div className="rounded-2xl p-5" style={{ backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--red-rgb),0.3)' }}>
             <div className="flex items-center gap-2 mb-3">
-              <span className="rec-dot inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: '#FF6B6B' }} />
-              <span className="font-mono-ui text-sm" style={{ color: '#FF6B6B' }}>SPELAR IN</span>
-              <span className="ml-auto font-mono-ui text-2xl" style={{ color: '#F1EDE4' }}>{Math.ceil(countdown)}s</span>
+              <span className="rec-dot inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: 'var(--red)' }} />
+              <span className="font-mono-ui text-sm" style={{ color: 'var(--red)' }}>SPELAR IN</span>
+              <span className="ml-auto font-mono-ui text-2xl" style={{ color: 'var(--text)' }}>{Math.ceil(countdown)}s</span>
             </div>
-            <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.1)' }}>
+            <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.1)' }}>
               <div
                 className="h-full rounded-full"
-                style={{ width: `${((DURATION - countdown) / DURATION) * 100}%`, backgroundColor: '#FF6B6B', transition: 'width 80ms linear' }}
+                style={{ width: `${((DURATION - countdown) / DURATION) * 100}%`, backgroundColor: 'var(--red)', transition: 'width 80ms linear' }}
               />
             </div>
-            <p className="mt-3 text-base" style={{ color: '#C7CBDA' }}>Sjung en enkel melodislinga, gärna med tydliga toner.</p>
+            <p className="mt-3 text-base" style={{ color: 'var(--text-muted)' }}>Sjung en enkel melodislinga, gärna med tydliga toner.</p>
             <button
               onClick={stopRecordingEarly}
               className="stamma-btn w-full mt-4 rounded-xl py-3 font-body font-medium text-base transition-transform active:scale-[0.98]"
-              style={{ backgroundColor: 'rgba(255,107,107,0.15)', color: '#FF9B9B', border: '1px solid rgba(255,107,107,0.4)' }}
+              style={{ backgroundColor: 'rgba(var(--red-rgb),0.15)', color: 'var(--red-soft)', border: '1px solid rgba(var(--red-rgb),0.4)' }}
             >
               Stoppa inspelning nu
             </button>
@@ -4336,12 +4546,12 @@ export default function App() {
 
         {/* Analyzing */}
         {phase === 'analyzing' && (
-          <div className="rounded-2xl p-5 flex items-center gap-3" style={{ backgroundColor: '#171B26', border: '1px solid rgba(241,237,228,0.08)' }}>
+          <div className="rounded-2xl p-5 flex items-center gap-3" style={{ backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--ink-rgb),0.08)' }}>
             <span
               className="inline-block w-5 h-5 rounded-full animate-spin"
-              style={{ border: '2px solid rgba(241,237,228,0.15)', borderTopColor: '#FFB454' }}
+              style={{ border: '2px solid rgba(var(--ink-rgb),0.15)', borderTopColor: 'var(--orange)' }}
             />
-            <span className="text-base" style={{ color: '#C7CBDA' }}>Analyserar tonart och melodi …</span>
+            <span className="text-base" style={{ color: 'var(--text-muted)' }}>Analyserar tonart och melodi …</span>
           </div>
         )}
 
@@ -4367,7 +4577,7 @@ export default function App() {
                 className="stamma-btn w-full flex items-center justify-between mb-2"
               >
                 <h2 className="font-display text-lg font-semibold">Röst</h2>
-                <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: ljudExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                <span style={{ display: 'inline-block', fontSize: 17, color: 'var(--text-muted)', transform: ljudExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
               </button>
               {ljudExpanded && (
                 <>
@@ -4382,9 +4592,9 @@ export default function App() {
                           disabled={disabled}
                           className="stamma-btn rounded-xl py-3 font-body font-medium text-sm transition-colors"
                           style={{
-                            backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : active ? '#FFB454' : 'rgba(241,237,228,0.06)',
-                            color: disabled ? 'rgba(241,237,228,0.25)' : active ? '#10131A' : '#F1EDE4',
-                            border: active ? '1px solid #FFB454' : '1px solid rgba(241,237,228,0.12)',
+                            backgroundColor: disabled ? 'rgba(var(--ink-rgb),0.03)' : active ? 'var(--orange)' : 'rgba(var(--ink-rgb),0.06)',
+                            color: disabled ? 'rgba(var(--ink-rgb),0.25)' : active ? 'var(--bg)' : 'var(--text)',
+                            border: active ? '1px solid var(--orange)' : '1px solid rgba(var(--ink-rgb),0.12)',
                             cursor: disabled ? 'not-allowed' : 'pointer',
                           }}
                         >
@@ -4393,7 +4603,7 @@ export default function App() {
                       );
                     })}
                   </div>
-                  <p className="mt-3 text-sm leading-relaxed" style={{ color: '#C7CBDA' }}>
+                  <p className="mt-3 text-sm leading-relaxed" style={{ color: 'var(--text-muted)' }}>
                     {SOUND_TYPES[soundType].description}
                   </p>
                 </>
@@ -4406,32 +4616,32 @@ export default function App() {
                 className="stamma-btn w-full flex items-center justify-between mb-2"
               >
                 <h2 className="font-display text-lg font-semibold">Effekter</h2>
-                <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: effectsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                <span style={{ display: 'inline-block', fontSize: 17, color: 'var(--text-muted)', transform: effectsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
               </button>
               {effectsExpanded && (
                 <div className="space-y-3">
                   {soundType === 'recording' && (
-                    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <div className="text-sm font-medium">Autotune</div>
-                          <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                          <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                             Rättar falska toner i din inspelning{autotuneRendering ? ' (bygger …)' : ''}
                           </div>
                         </div>
                         <ToggleSwitch
                           checked={autotuneOn}
                           onChange={() => { setAutotuneOn((v) => !v); if (isPlaying) stopPlayback(); }}
-                          accentColor="#55D6C0"
+                          accentColor="var(--teal)"
                           ariaLabel="Autotune"
                         />
                       </div>
                       {autotuneOn && (
-                        <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                        <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
                           <button
                             onClick={() => setAutotuneStrengthExpanded((v) => !v)}
                             className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
-                            style={{ color: '#55D6C0' }}
+                            style={{ color: 'var(--teal)' }}
                           >
                             <span>Styrka: {AUTOTUNE_LEVELS[autotuneLevelIndex].label}</span>
                             <span style={{ display: 'inline-block', fontSize: 15, transform: autotuneStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
@@ -4444,9 +4654,9 @@ export default function App() {
                                   onClick={() => { setAutotuneLevelIndex(i); if (isPlaying) stopPlayback(); }}
                                   className="stamma-btn rounded-md py-1.5 text-xs font-medium"
                                   style={{
-                                    backgroundColor: autotuneLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
-                                    color: autotuneLevelIndex === i ? '#55D6C0' : '#C7CBDA',
-                                    border: autotuneLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                                    backgroundColor: autotuneLevelIndex === i ? 'rgba(var(--teal-rgb),0.15)' : 'transparent',
+                                    color: autotuneLevelIndex === i ? 'var(--teal)' : 'var(--text-muted)',
+                                    border: autotuneLevelIndex === i ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                                   }}
                                 >
                                   {lvl.label}
@@ -4459,27 +4669,27 @@ export default function App() {
                     </div>
                   )}
 
-                  <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                  <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <div className="text-sm font-medium">Reverb</div>
-                        <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                        <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                           Lägger på lite rymd på hela mixen
                         </div>
                       </div>
                       <ToggleSwitch
                         checked={reverbOn}
                         onChange={() => { setReverbOn((v) => !v); if (isPlaying) stopPlayback(); }}
-                        accentColor="#55D6C0"
+                        accentColor="var(--teal)"
                         ariaLabel="Reverb"
                       />
                     </div>
                     {reverbOn && (
-                      <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+                      <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
                         <button
                           onClick={() => setReverbStrengthExpanded((v) => !v)}
                           className="stamma-btn w-full flex items-center justify-between font-mono-ui text-xs"
-                          style={{ color: '#55D6C0' }}
+                          style={{ color: 'var(--teal)' }}
                         >
                           <span>Storlek: {REVERB_LEVELS[reverbLevelIndex].label}</span>
                           <span style={{ display: 'inline-block', fontSize: 15, transform: reverbStrengthExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
@@ -4492,9 +4702,9 @@ export default function App() {
                                 onClick={() => { setReverbLevelIndex(i); if (isPlaying) stopPlayback(); }}
                                 className="stamma-btn rounded-md py-1.5 text-xs font-medium"
                                 style={{
-                                  backgroundColor: reverbLevelIndex === i ? 'rgba(85,214,192,0.15)' : 'transparent',
-                                  color: reverbLevelIndex === i ? '#55D6C0' : '#C7CBDA',
-                                  border: reverbLevelIndex === i ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                                  backgroundColor: reverbLevelIndex === i ? 'rgba(var(--teal-rgb),0.15)' : 'transparent',
+                                  color: reverbLevelIndex === i ? 'var(--teal)' : 'var(--text-muted)',
+                                  border: reverbLevelIndex === i ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                                 }}
                               >
                                 {lvl.label}
@@ -4507,18 +4717,18 @@ export default function App() {
                   </div>
 
                   {soundType === 'recording' && (
-                    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+                    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <div className="text-sm font-medium">Humanisera stämmor</div>
-                          <div className="text-xs mt-0.5" style={{ color: '#C7CBDA' }}>
+                          <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                             Ger ters/kvint/sext egen vibrato, formant och tonhöjdskaraktär istället för att låta som en klonad kopia av din röst
                           </div>
                         </div>
                         <ToggleSwitch
                           checked={humanizeOn}
                           onChange={() => { setHumanizeOn((v) => !v); if (isPlaying) stopPlayback(); }}
-                          accentColor="#55D6C0"
+                          accentColor="var(--teal)"
                           ariaLabel="Humanisera stämmor"
                         />
                       </div>
@@ -4535,17 +4745,17 @@ export default function App() {
                   className="stamma-btn flex-1 flex items-center justify-between min-w-0"
                 >
                   <h2 className="font-display text-lg font-semibold">Mixer</h2>
-                  <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: mixerExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                  <span style={{ display: 'inline-block', fontSize: 17, color: 'var(--text-muted)', transform: mixerExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
                 </button>
                 {isPlaying && (
-                  <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline shrink-0" style={{ color: '#C7CBDA' }}>
+                  <button onClick={() => stopPlayback()} className="stamma-btn text-xs underline shrink-0" style={{ color: 'var(--text-muted)' }}>
                     Stoppa
                   </button>
                 )}
               </div>
               {mixerExpanded && (
                 <>
-              <p className="text-sm leading-relaxed mb-3" style={{ color: '#C7CBDA' }}>
+              <p className="text-sm leading-relaxed mb-3" style={{ color: 'var(--text-muted)' }}>
                 Slå på de kanaler du vill höra, ställ nivåerna, och tryck play — allt aktiverat spelas samtidigt.
               </p>
 
@@ -4553,7 +4763,7 @@ export default function App() {
                 <button
                   onClick={toggleAllChannelsExpanded}
                   className="stamma-btn flex items-center gap-1 font-mono-ui text-xs shrink-0"
-                  style={{ color: '#C7CBDA' }}
+                  style={{ color: 'var(--text-muted)' }}
                 >
                   {allChannelsExpanded ? 'Göm alla' : 'Expandera alla'}
                   <span style={{ display: 'inline-block', fontSize: 15, transform: allChannelsExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
@@ -4632,7 +4842,7 @@ export default function App() {
                           onToggleExpanded={() => toggleChannelExpanded(ownKey)}
                           onDelete={() => deleteOwnTake(type)}
                           waveform={ownTakeWaveformPeaksByType[type] && (
-                            <div className="mt-3 rounded-xl p-3" style={{ backgroundColor: '#10131A', border: '1px solid rgba(241,237,228,0.08)' }}>
+                            <div className="mt-3 rounded-xl p-3" style={{ backgroundColor: 'var(--bg)', border: '1px solid rgba(var(--ink-rgb),0.08)' }}>
                               <WaveformTrimmer
                                 peaks={ownTakeWaveformPeaksByType[type]}
                                 duration={recordingDuration}
@@ -4651,6 +4861,7 @@ export default function App() {
                                 loopEnabled={loopEnabled}
                                 onToggleLoop={() => setLoopEnabled((v) => !v)}
                                 busy={ownTakeAligningByType[type]}
+                                theme={theme}
                               />
                             </div>
                           )}
@@ -4678,14 +4889,14 @@ export default function App() {
             <button
               onClick={resetAll}
               className="stamma-btn w-full rounded-xl py-3 font-body font-medium text-base transition-transform active:scale-[0.98]"
-              style={{ backgroundColor: '#FF6B6B', color: '#10131A' }}
+              style={{ backgroundColor: 'var(--red)', color: 'var(--bg)' }}
             >
               Spela in ny melodi
             </button>
             <button
               onClick={() => fileInputRef.current?.click()}
               className="stamma-btn w-full mt-2 rounded-xl py-3 font-body font-medium text-sm"
-              style={{ backgroundColor: 'rgba(241,237,228,0.06)', color: '#F1EDE4', border: '1px solid rgba(241,237,228,0.12)' }}
+              style={{ backgroundColor: 'rgba(var(--ink-rgb),0.06)', color: 'var(--text)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
             >
               Ladda upp ny ljudfil
             </button>
@@ -4696,11 +4907,11 @@ export default function App() {
                 className="stamma-btn w-full flex items-center justify-between mb-2"
               >
                 <h2 className="font-display text-lg font-semibold">Exportera</h2>
-                <span style={{ display: 'inline-block', fontSize: 17, color: '#C7CBDA', transform: exportExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
+                <span style={{ display: 'inline-block', fontSize: 17, color: 'var(--text-muted)', transform: exportExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 150ms ease' }}>▾</span>
               </button>
               {exportExpanded && (
                 <>
-                  <p className="text-sm leading-relaxed mb-2" style={{ color: '#C7CBDA' }}>
+                  <p className="text-sm leading-relaxed mb-2" style={{ color: 'var(--text-muted)' }}>
                     Ladda ner hela mixen som den låter nu, eller sång och stämmor var för sig som separata WAV-filer, t.ex. för att jobba vidare i Waveform.
                   </p>
                   <div className="grid grid-cols-1 gap-2">
@@ -4746,7 +4957,7 @@ export default function App() {
           <a
             href="#om"
             className="stamma-btn font-mono-ui text-xs"
-            style={{ color: '#C7CBDA' }}
+            style={{ color: 'var(--text-muted)' }}
           >
             Om Stämifier
           </a>
@@ -4769,9 +4980,9 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
         style={{
           width: 44,
           height: 44,
-          backgroundColor: 'rgba(241,237,228,0.06)',
-          color: disabled ? 'rgba(241,237,228,0.25)' : '#C7CBDA',
-          border: '1px solid rgba(241,237,228,0.12)',
+          backgroundColor: 'rgba(var(--ink-rgb),0.06)',
+          color: disabled ? 'rgba(var(--ink-rgb),0.25)' : 'var(--text-muted)',
+          border: '1px solid rgba(var(--ink-rgb),0.12)',
           cursor: disabled ? 'not-allowed' : 'pointer',
         }}
         aria-label="Stoppa och gå till start"
@@ -4786,9 +4997,9 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
           style={{
             width: 44,
             height: 44,
-            backgroundColor: metronomeEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-            color: metronomeEnabled ? '#55D6C0' : '#C7CBDA',
-            border: metronomeEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+            backgroundColor: metronomeEnabled ? 'rgba(var(--teal-rgb),0.15)' : 'rgba(var(--ink-rgb),0.06)',
+            color: metronomeEnabled ? 'var(--teal)' : 'var(--text-muted)',
+            border: metronomeEnabled ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
           }}
           aria-pressed={metronomeEnabled}
           aria-label="Metronom vid inspelning och uppspelning"
@@ -4802,9 +5013,9 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
         disabled={disabled || busy}
         className="stamma-btn flex-1 rounded-xl py-3 flex items-center justify-center gap-2 font-body font-medium text-sm transition-transform active:scale-[0.98]"
         style={{
-          backgroundColor: 'rgba(241,237,228,0.06)',
-          color: (disabled || busy) ? 'rgba(241,237,228,0.3)' : '#C7CBDA',
-          border: '1px solid rgba(241,237,228,0.12)',
+          backgroundColor: 'rgba(var(--ink-rgb),0.06)',
+          color: (disabled || busy) ? 'rgba(var(--ink-rgb),0.3)' : 'var(--text-muted)',
+          border: '1px solid rgba(var(--ink-rgb),0.12)',
           cursor: (disabled || busy) ? 'not-allowed' : 'pointer',
         }}
       >
@@ -4817,9 +5028,9 @@ function TransportButtons({ loopEnabled, onToggleLoop, onStop, isPlaying, onPlay
         style={{
           width: 44,
           height: 44,
-          backgroundColor: loopEnabled ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-          color: loopEnabled ? '#55D6C0' : '#C7CBDA',
-          border: loopEnabled ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+          backgroundColor: loopEnabled ? 'rgba(var(--teal-rgb),0.15)' : 'rgba(var(--ink-rgb),0.06)',
+          color: loopEnabled ? 'var(--teal)' : 'var(--text-muted)',
+          border: loopEnabled ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
         }}
         aria-pressed={loopEnabled}
         aria-label="Loopa uppspelning"
@@ -4844,16 +5055,16 @@ function RestoreBanner({ name, savedAt, onRestore, onDismiss, restoring }) {
   return (
     <div
       className="rounded-xl p-4 mb-5 text-sm"
-      style={{ backgroundColor: 'rgba(85,214,192,0.08)', border: '1px solid rgba(85,214,192,0.3)', color: '#F1EDE4' }}
+      style={{ backgroundColor: 'rgba(var(--teal-rgb),0.08)', border: '1px solid rgba(var(--teal-rgb),0.3)', color: 'var(--text)' }}
     >
       <p className="leading-relaxed font-medium">Återställ "{name}"?</p>
-      <p className="mt-0.5 font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>Sparad {label}</p>
+      <p className="mt-0.5 font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>Sparad {label}</p>
       <div className="mt-3 flex gap-3">
         <button
           onClick={onRestore}
           disabled={restoring}
           className="stamma-btn rounded-lg py-2 px-4 font-body font-medium text-sm"
-          style={{ backgroundColor: '#55D6C0', color: '#10131A', opacity: restoring ? 0.7 : 1 }}
+          style={{ backgroundColor: 'var(--teal)', color: 'var(--bg)', opacity: restoring ? 0.7 : 1 }}
         >
           {restoring ? 'Återställer…' : 'Återställ'}
         </button>
@@ -4861,7 +5072,7 @@ function RestoreBanner({ name, savedAt, onRestore, onDismiss, restoring }) {
           onClick={onDismiss}
           disabled={restoring}
           className="stamma-btn font-mono-ui text-xs"
-          style={{ color: '#C7CBDA' }}
+          style={{ color: 'var(--text-muted)' }}
         >
           Avfärda
         </button>
@@ -4877,6 +5088,7 @@ function RestoreBanner({ name, savedAt, onRestore, onDismiss, restoring }) {
 function ProjectRow({ project, active, onOpen, onRename, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(project.name);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const dateLabel = new Date(project.savedAt).toLocaleString('sv-SE', {
     day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
   });
@@ -4892,8 +5104,8 @@ function ProjectRow({ project, active, onOpen, onRename, onDelete }) {
     <div
       className="rounded-lg p-2.5 flex items-center gap-2"
       style={{
-        backgroundColor: active ? 'rgba(85,214,192,0.08)' : 'rgba(241,237,228,0.03)',
-        border: active ? '1px solid rgba(85,214,192,0.35)' : '1px solid rgba(241,237,228,0.08)',
+        backgroundColor: active ? 'rgba(var(--teal-rgb),0.08)' : 'rgba(var(--ink-rgb),0.03)',
+        border: active ? '1px solid rgba(var(--teal-rgb),0.35)' : '1px solid rgba(var(--ink-rgb),0.08)',
       }}
     >
       <div className="flex-1 min-w-0">
@@ -4909,42 +5121,110 @@ function ProjectRow({ project, active, onOpen, onRename, onDelete }) {
               else if (e.key === 'Escape') { setDraft(project.name); setEditing(false); }
             }}
             className="w-full bg-transparent text-sm font-medium"
-            style={{ color: '#F1EDE4', border: 'none', borderBottom: '1px solid rgba(85,214,192,0.5)', outline: 'none' }}
+            style={{ color: 'var(--text)', border: 'none', borderBottom: '1px solid rgba(var(--teal-rgb),0.5)', outline: 'none' }}
           />
         ) : (
           <button
             onClick={() => setEditing(true)}
             className="stamma-btn block w-full text-left text-sm font-medium truncate"
-            style={{ color: '#F1EDE4' }}
+            style={{ color: 'var(--text)' }}
             title="Byt namn"
           >
             {project.name}
-            {active && <span style={{ color: '#55D6C0' }}> · aktiv</span>}
+            {active && <span style={{ color: 'var(--teal)' }}> · aktiv</span>}
           </button>
         )}
-        <div className="font-mono-ui text-[10px]" style={{ color: '#C7CBDA' }}>{dateLabel}</div>
+        <div className="font-mono-ui text-[10px]" style={{ color: 'var(--text-muted)' }}>{dateLabel}</div>
       </div>
       <button
         onClick={onOpen}
         className="stamma-btn shrink-0 rounded-md px-2.5 py-1.5 font-mono-ui text-xs font-medium"
-        style={{ color: '#55D6C0', border: '1px solid rgba(85,214,192,0.4)' }}
+        style={{ color: 'var(--teal)', border: '1px solid rgba(var(--teal-rgb),0.4)' }}
       >
         Öppna
       </button>
       <button
-        onClick={() => { if (window.confirm(`Radera "${project.name}"? Går inte att ångra.`)) onDelete(); }}
+        onClick={() => setConfirmingDelete(true)}
         className="stamma-btn shrink-0 rounded-md flex items-center justify-center"
-        style={{ width: 44, height: 44, color: '#C7CBDA', border: '1px solid rgba(241,237,228,0.15)' }}
+        style={{ width: 44, height: 44, color: 'var(--text-muted)', border: '1px solid rgba(var(--ink-rgb),0.15)' }}
         aria-label={`Radera ${project.name}`}
         title={`Radera ${project.name}`}
       >
         <TrashIcon size={13} />
       </button>
+      {confirmingDelete && (
+        <ConfirmDialog
+          title="Radera session?"
+          message={`"${project.name}" tas bort permanent. Går inte att ångra.`}
+          confirmLabel="Radera"
+          onCancel={() => setConfirmingDelete(false)}
+          onConfirm={() => { setConfirmingDelete(false); onDelete(); }}
+        />
+      )}
     </div>
   );
 }
 
-function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled, ariaLabel }) {
+// Themed stand-in for window.confirm() — a native browser dialog can't
+// pick up the app's own dark/light theme (see the theme toggle) and looks
+// jarringly out of place next to it. `destructive` (the default) styles
+// the confirm button as a warning (red); pass false for a neutral
+// confirmation that isn't undoing/deleting anything.
+function ConfirmDialog({ title, message, confirmLabel = 'Radera', cancelLabel = 'Avbryt', destructive = true, onConfirm, onCancel }) {
+  useEffect(() => {
+    const handler = (e) => { if (e.key === 'Escape') onCancel(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-5"
+      style={{ backgroundColor: 'rgba(var(--bg-rgb),0.7)' }}
+      onClick={onCancel}
+    >
+      <div
+        className="rounded-2xl p-5 w-full"
+        style={{ maxWidth: 320, backgroundColor: 'var(--card-bg)', border: '1px solid rgba(var(--ink-rgb),0.12)', boxShadow: '0 12px 32px rgba(0,0,0,0.4)' }}
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        aria-describedby="confirm-dialog-message"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="confirm-dialog-title" className="font-display text-lg font-semibold" style={{ color: 'var(--text)' }}>
+          {title}
+        </h2>
+        <p id="confirm-dialog-message" className="mt-2 text-sm leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+          {message}
+        </p>
+        <div className="mt-4 flex gap-2">
+          <button
+            onClick={onCancel}
+            autoFocus
+            className="stamma-btn flex-1 rounded-xl py-2.5 font-body font-medium text-sm"
+            style={{ backgroundColor: 'rgba(var(--ink-rgb),0.06)', color: 'var(--text)', border: '1px solid rgba(var(--ink-rgb),0.12)' }}
+          >
+            {cancelLabel}
+          </button>
+          <button
+            onClick={onConfirm}
+            className="stamma-btn flex-1 rounded-xl py-2.5 font-body font-medium text-sm"
+            style={
+              destructive
+                ? { backgroundColor: 'rgba(var(--red-rgb),0.15)', color: 'var(--red)', border: '1px solid rgba(var(--red-rgb),0.5)' }
+                : { backgroundColor: 'var(--teal)', color: 'var(--bg)', border: 'none' }
+            }
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ToggleSwitch({ checked, onChange, accentColor = 'var(--teal)', disabled, ariaLabel }) {
   return (
     // The visible track stays the standard 40x24 switch size — the button
     // itself is padded out to Apple's 44x44pt minimum tap target (HIG),
@@ -4969,7 +5249,7 @@ function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled, ar
           width: 40,
           height: 24,
           borderRadius: 12,
-          backgroundColor: checked ? accentColor : 'rgba(241,237,228,0.15)',
+          backgroundColor: checked ? accentColor : 'rgba(var(--ink-rgb),0.15)',
           position: 'relative',
           transition: 'background-color 150ms ease',
         }}
@@ -4982,7 +5262,7 @@ function ToggleSwitch({ checked, onChange, accentColor = '#55D6C0', disabled, ar
             width: 19,
             height: 19,
             borderRadius: 10,
-            backgroundColor: '#10131A',
+            backgroundColor: 'var(--bg)',
             transition: 'left 150ms ease',
           }}
         />
@@ -5043,7 +5323,7 @@ function BpmInput({ value, onCommit, className, style }) {
   );
 }
 
-const SOLO_COLOR = '#FFD84D';
+const SOLO_COLOR = 'var(--gold)';
 
 function MixerChannel({
   label, accentColor, enabled, onToggle, volume, onVolumeChange, meterRef, busy,
@@ -5057,8 +5337,8 @@ function MixerChannel({
     <div
       className="rounded-xl p-3"
       style={{
-        backgroundColor: 'rgba(241,237,228,0.04)',
-        border: solo ? `1px solid ${SOLO_COLOR}88` : enabled ? `1px solid ${accentColor}55` : '1px solid rgba(241,237,228,0.1)',
+        backgroundColor: 'rgba(var(--ink-rgb),0.04)',
+        border: solo ? `1px solid ${SOLO_COLOR}88` : enabled ? `1px solid ${accentColor}55` : '1px solid rgba(var(--ink-rgb),0.1)',
       }}
     >
       <div className="flex items-center gap-2">
@@ -5081,8 +5361,8 @@ function MixerChannel({
                   width: 20,
                   height: 20,
                   backgroundColor: 'transparent',
-                  color: '#C7CBDA',
-                  border: '1px solid rgba(241,237,228,0.15)',
+                  color: 'var(--text-muted)',
+                  border: '1px solid rgba(var(--ink-rgb),0.15)',
                 }}
               >
                 <TrashIcon size={11} />
@@ -5104,8 +5384,8 @@ function MixerChannel({
               width: 24,
               height: 24,
               backgroundColor: solo ? SOLO_COLOR : 'transparent',
-              color: solo ? '#10131A' : '#C7CBDA',
-              border: solo ? `1px solid ${SOLO_COLOR}` : '1px solid rgba(241,237,228,0.15)',
+              color: solo ? 'var(--bg)' : 'var(--text-muted)',
+              border: solo ? `1px solid ${SOLO_COLOR}` : '1px solid rgba(var(--ink-rgb),0.15)',
             }}
           >
             S
@@ -5113,7 +5393,7 @@ function MixerChannel({
         </button>
         <span className="flex-1 text-sm font-medium truncate">
           {label}
-          {busy ? <span style={{ color: '#C7CBDA' }}> (bygger …)</span> : null}
+          {busy ? <span style={{ color: 'var(--text-muted)' }}> (bygger …)</span> : null}
         </span>
         <button
           onClick={onPreview}
@@ -5129,8 +5409,8 @@ function MixerChannel({
               width: 24,
               height: 24,
               backgroundColor: previewing ? `${accentColor}26` : 'transparent',
-              color: busy ? 'rgba(241,237,228,0.25)' : accentColor,
-              border: `1px solid ${previewing ? `${accentColor}66` : 'rgba(241,237,228,0.15)'}`,
+              color: busy ? 'rgba(var(--ink-rgb),0.25)' : accentColor,
+              border: `1px solid ${previewing ? `${accentColor}66` : 'rgba(var(--ink-rgb),0.15)'}`,
             }}
           >
             {previewing ? <PauseIcon size={12} /> : <PlayIcon size={12} />}
@@ -5159,9 +5439,9 @@ function MixerChannel({
                 style={{
                   width: 40,
                   height: 28,
-                  backgroundColor: recordCountingIn ? 'rgba(255,180,84,0.15)' : recording ? '#FF6B6B' : 'rgba(255,107,107,0.12)',
-                  color: recordCountingIn ? '#FFB454' : recording ? '#10131A' : '#FF6B6B',
-                  border: `1px solid ${recordCountingIn ? 'rgba(255,180,84,0.6)' : 'rgba(255,107,107,0.5)'}`,
+                  backgroundColor: recordCountingIn ? 'rgba(var(--orange-rgb),0.15)' : recording ? 'var(--red)' : 'rgba(var(--red-rgb),0.12)',
+                  color: recordCountingIn ? 'var(--orange)' : recording ? 'var(--bg)' : 'var(--red)',
+                  border: `1px solid ${recordCountingIn ? 'rgba(var(--orange-rgb),0.6)' : 'rgba(var(--red-rgb),0.5)'}`,
                 }}
               >
                 {recordCountingIn ? (
@@ -5186,8 +5466,8 @@ function MixerChannel({
               style={{
                 height: 44,
                 backgroundColor: direction === opt.v ? `${accentColor}26` : 'transparent',
-                color: direction === opt.v ? accentColor : '#C7CBDA',
-                border: direction === opt.v ? `1px solid ${accentColor}66` : '1px solid rgba(241,237,228,0.12)',
+                color: direction === opt.v ? accentColor : 'var(--text-muted)',
+                border: direction === opt.v ? `1px solid ${accentColor}66` : '1px solid rgba(var(--ink-rgb),0.12)',
               }}
             >
               {opt.label}
@@ -5197,13 +5477,13 @@ function MixerChannel({
       )}
 
       <div className="flex items-center gap-2 mt-2.5 ml-[64px]">
-        <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(241,237,228,0.08)' }}>
+        <div className="flex-1 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.08)' }}>
           <div ref={meterRef} style={{ width: '0%', height: '100%', backgroundColor: accentColor, transition: 'width 60ms linear' }} />
         </div>
         <button
           onClick={onToggleExpanded}
           className="stamma-btn shrink-0 flex items-center gap-1 font-mono-ui text-[11px]"
-          style={{ color: enabled ? accentColor : '#C7CBDA' }}
+          style={{ color: enabled ? accentColor : 'var(--text-muted)' }}
           aria-expanded={expanded}
           aria-label="Visa volym och panorering"
         >
@@ -5226,7 +5506,7 @@ function MixerChannel({
           />
 
           <div className="flex items-center gap-2 mt-1.5">
-            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>L</span>
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>L</span>
             <input
               type="range"
               min="-1"
@@ -5238,8 +5518,8 @@ function MixerChannel({
               style={{ accentColor, height: 3 }}
               aria-label="Panorering"
             />
-            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: '#C7CBDA' }}>R</span>
-            <span className="font-mono-ui text-[10px] shrink-0 w-6 text-right" style={{ color: '#C7CBDA' }}>{panLabel}</span>
+            <span className="font-mono-ui text-[10px] shrink-0" style={{ color: 'var(--text-muted)' }}>R</span>
+            <span className="font-mono-ui text-[10px] shrink-0 w-6 text-right" style={{ color: 'var(--text-muted)' }}>{panLabel}</span>
           </div>
           {waveform}
         </>
@@ -5254,6 +5534,23 @@ function DownloadIcon({ size = 16 }) {
       <path d="M12 3.5v11.5" />
       <path d="M7.5 11l4.5 4.5L16.5 11" />
       <path d="M4.5 18.5h15" />
+    </svg>
+  );
+}
+
+function SunIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2.5v2.5M12 19v2.5M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2.5 12H5M19 12h2.5M4.2 19.8 6 18M18 6l1.8-1.8" />
+    </svg>
+  );
+}
+
+function MoonIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor">
+      <path d="M20.4 14.7A8.5 8.5 0 1 1 9.3 3.6a7 7 0 0 0 11.1 11.1Z" />
     </svg>
   );
 }
@@ -5347,17 +5644,17 @@ function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyI
   const anyActive = HARMONY_KEYS.some((t) => types[t]);
   const following = !!followingOwnTake;
   return (
-    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(241,237,228,0.04)', border: '1px solid rgba(241,237,228,0.1)' }}>
+    <div className="rounded-xl p-3" style={{ backgroundColor: 'rgba(var(--ink-rgb),0.04)', border: '1px solid rgba(var(--ink-rgb),0.1)' }}>
       <div className="flex items-center gap-2">
         <HeadphonesIcon size={16} />
         <span className="text-sm font-medium">Live-förhandslyssning</span>
-        <span className="ml-auto font-mono-ui text-xs" style={{ color: '#C7CBDA' }}>
+        <span className="ml-auto font-mono-ui text-xs" style={{ color: 'var(--text-muted)' }}>
           {starting ? 'Startar …' : following ? 'Följer inspelningen' : on && latencyMs != null ? `${latencyMs} ms` : 'Kräver hörlurar'}
         </span>
-        <ToggleSwitch checked={on || following} onChange={onToggle} disabled={starting || following} accentColor="#55D6C0" ariaLabel="Live-förhandslyssning" />
+        <ToggleSwitch checked={on || following} onChange={onToggle} disabled={starting || following} accentColor="var(--teal)" ariaLabel="Live-förhandslyssning" />
       </div>
       {(on || following) && (
-        <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(241,237,228,0.08)' }}>
+        <div className="mt-3 pt-3" style={{ borderTop: '1px solid rgba(var(--ink-rgb),0.08)' }}>
           <div className="flex gap-2">
             {HARMONY_KEYS.map((t) => (
               <button
@@ -5367,9 +5664,9 @@ function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyI
                 aria-pressed={!!types[t]}
                 className="stamma-btn flex-1 rounded-lg py-2 font-body font-medium text-sm"
                 style={{
-                  backgroundColor: types[t] ? 'rgba(85,214,192,0.15)' : 'rgba(241,237,228,0.06)',
-                  color: types[t] ? '#55D6C0' : '#F1EDE4',
-                  border: types[t] ? '1px solid rgba(85,214,192,0.5)' : '1px solid rgba(241,237,228,0.12)',
+                  backgroundColor: types[t] ? 'rgba(var(--teal-rgb),0.15)' : 'rgba(var(--ink-rgb),0.06)',
+                  color: types[t] ? 'var(--teal)' : 'var(--text)',
+                  border: types[t] ? '1px solid rgba(var(--teal-rgb),0.5)' : '1px solid rgba(var(--ink-rgb),0.12)',
                   opacity: following && !types[t] ? 0.4 : 1,
                   cursor: following ? 'default' : 'pointer',
                 }}
@@ -5378,7 +5675,7 @@ function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyI
               </button>
             ))}
           </div>
-          <p className="mt-2 font-mono-ui text-[11px]" style={{ color: '#C7CBDA' }}>
+          <p className="mt-2 font-mono-ui text-[11px]" style={{ color: 'var(--text-muted)' }}>
             {following
               ? `Följer din inspelning av egen ${HARMONY_TYPES[followingOwnTake].label.toLowerCase()} — övriga stämmor pausade tills tagningen är klar.`
               : !anyActive
@@ -5389,7 +5686,7 @@ function LiveMonitorCard({ on, starting, error, types, latencyMs, keyAware, keyI
           </p>
         </div>
       )}
-      {error && <p className="mt-2 text-xs" style={{ color: '#FF9B9B' }}>{error}</p>}
+      {error && <p className="mt-2 text-xs" style={{ color: 'var(--red-soft)' }}>{error}</p>}
     </div>
   );
 }
@@ -5401,9 +5698,9 @@ function ExportButton({ label, onClick, disabled, busy }) {
       disabled={disabled}
       className="stamma-btn w-full rounded-xl py-3 px-4 flex items-center justify-between text-sm font-medium transition-colors"
       style={{
-        backgroundColor: disabled ? 'rgba(241,237,228,0.03)' : 'rgba(85,214,192,0.1)',
-        color: disabled ? 'rgba(241,237,228,0.25)' : '#55D6C0',
-        border: '1px solid rgba(241,237,228,0.1)',
+        backgroundColor: disabled ? 'rgba(var(--ink-rgb),0.03)' : 'rgba(var(--teal-rgb),0.1)',
+        color: disabled ? 'rgba(var(--ink-rgb),0.25)' : 'var(--teal)',
+        border: '1px solid rgba(var(--ink-rgb),0.1)',
         cursor: disabled ? 'not-allowed' : 'pointer',
       }}
     >
@@ -5411,7 +5708,7 @@ function ExportButton({ label, onClick, disabled, busy }) {
       {busy ? (
         <span
           className="inline-block w-4 h-4 rounded-full animate-spin shrink-0"
-          style={{ border: '2px solid rgba(85,214,192,0.25)', borderTopColor: 'currentColor' }}
+          style={{ border: '2px solid rgba(var(--teal-rgb),0.25)', borderTopColor: 'currentColor' }}
         />
       ) : (
         <DownloadIcon />
